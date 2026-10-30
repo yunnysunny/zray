@@ -149,7 +149,10 @@ pub fn setBufferSizes(fd: fd_t, rcv: i32, snd: i32) void {
 }
 
 pub fn bind(fd: fd_t, addr: *const SockAddr) Error!void {
-    _ = try check(linux.bind(fd, addr.ptr(), addr.len()));
+    const rc = linux.bind(fd, addr.ptr(), addr.len());
+    // Startup-only call; keep the raw errno visible since `check` folds it.
+    if (linux.errno(rc) != .SUCCESS) log("bind: {s}", .{errnoName(rc)});
+    _ = try check(rc);
 }
 
 pub fn listen(fd: fd_t, backlog: u32) Error!void {
