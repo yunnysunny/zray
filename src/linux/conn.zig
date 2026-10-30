@@ -30,7 +30,8 @@ const client_chunk = 8192;
 pub const Config = struct {
     server_addr: sys.SockAddr,
     sni: []const u8,
-    reality: reality.Config,
+    /// null: plain TLS 1.3 (SNI only, certificate chain not verified).
+    reality: ?reality.Config = null,
     uuid: [16]u8,
     handshake_timeout_s: u64 = 15,
     idle_timeout_s: u64 = 600,
@@ -581,27 +582,49 @@ pub const Loop = struct {
         c.state = .tls_handshake;
         var entropy: [128]u8 = undefined;
         sys.randomBytes(&entropy);
-        c.rl = reality.Reality.init(l.cfg.reality, sys.realtimeSeconds());
+
+        // REALITY: the hook back-fills session_id and the verifier checks the
+        // server's REALITY auth tag. Plain TLS: standard ClientHello with a
+        // random legacy_session_id and no chain verification (same posture as
+        // `allowInsecure`), which is what airport vless+TLS nodes need.
+        var sid: [32]u8 = undefined;
+        var verifier: client.Verifier = client.Verifier.insecure;
+        var hook: ?client.HelloHook = null;
+        if (l.cfg.reality) |rc| {
+            c.rl = reality.Reality.init(rc, sys.realtimeSeconds());
+            verifier = c.rl.verifier();
+            hook = c.rl.helloHook();
+            sid = @splat(0);
+        } else {
+            l.csprng.random().bytes(&sid);
+        }
+
         c.tls = client.Client.init(.{
             .entropy = entropy[0..64].*,
             .ml_kem_seed = entropy[64..128].*,
-            .verifier = c.rl.verifier(),
+            .verifier = verifier,
             .handshake_buf = &c.hs_buf,
         });
         c.vstate = vision.State.init(l.cfg.uuid);
         c.padder = vision.Padder.init(&c.vstate, l.csprng.random());
         c.unpadder = vision.Unpadder.init(&c.vstate);
 
-        const zero_sid: [32]u8 = @splat(0);
         var fp: fingerprint.Chrome = undefined;
-        fp.build(l.csprng.random(), .{ .sni = l.cfg.sni, .x25519_public = c.tls.publicKey(), .ml_kem_public = c.tls.mlKemPublicKey() });
+        fp.build(l.csprng.random(), .{
+            .sni = l.cfg.sni,
+            .x25519_public = c.tls.publicKey(),
+            .ml_kem_public = c.tls.mlKemPublicKey(),
+            // Only offer compressed certificates to REALITY servers; a plain
+            // TLS upstream may compress in a form this client does not parse.
+            .compress_certificate = l.cfg.reality != null,
+        });
         const first = c.tls.clientHello(&c.up_out, .{
             .random = undefined,
-            .session_id = &zero_sid,
+            .session_id = &sid,
             .cipher_suites = fp.cipherSuites(),
             .extensions = fp.extensions(),
-        }, c.rl.helloHook()) catch return error.ClientHello;
-        if (c.rl.err != null) return error.RealityHook;
+        }, hook) catch return error.ClientHello;
+        if (l.cfg.reality != null and c.rl.err != null) return error.RealityHook;
         c.up_out_off = 0;
         c.up_out_len = first.len;
         try l.flushUpstream(c);

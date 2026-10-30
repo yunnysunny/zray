@@ -27,7 +27,9 @@ const FileConfig = struct {
     /// two services wait on each other at boot. Empty: system resolver.
     bootstrap_dns: []const u8 = "",
     sni: []const u8 = "",
-    public_key: []const u8,
+    /// REALITY server public key (base64url). Empty or absent: plain TLS 1.3
+    /// (SNI only, certificate chain not verified) for ordinary vless+TLS nodes.
+    public_key: []const u8 = "",
     short_id: []const u8 = "",
     uuid: []const u8,
     max_connections: u32 = 128,
@@ -73,19 +75,22 @@ fn linuxMain(init: std.process.Init) !void {
         sys.log("cannot resolve {s}: {s}", .{ parsed.server, @errorName(e) });
         return e;
     };
+    // REALITY when a server public key is supplied, plain TLS otherwise.
+    const reality_cfg: ?reality.Config = if (parsed.public_key.len > 0) .{
+        .server_public_key = reality.Config.publicKeyFromBase64(parsed.public_key) catch |e| {
+            sys.log("bad public_key", .{});
+            return e;
+        },
+        .short_id = reality.Config.shortIdFromHex(parsed.short_id) catch |e| {
+            sys.log("bad short_id", .{});
+            return e;
+        },
+    } else null;
+
     const cfg: conn.Config = .{
         .server_addr = server_addr,
         .sni = if (parsed.sni.len > 0) parsed.sni else parsed.server,
-        .reality = .{
-            .server_public_key = reality.Config.publicKeyFromBase64(parsed.public_key) catch |e| {
-                sys.log("bad public_key", .{});
-                return e;
-            },
-            .short_id = reality.Config.shortIdFromHex(parsed.short_id) catch |e| {
-                sys.log("bad short_id", .{});
-                return e;
-            },
-        },
+        .reality = reality_cfg,
         .uuid = vless.parseUuid(parsed.uuid) catch |e| {
             sys.log("bad uuid", .{});
             return e;

@@ -97,11 +97,11 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `listen` | `127.0.0.1:1080` | SOCKS5 入口。`""` 关闭。 |
 | `redirect` | `""` | 接 `REDIRECT` 规则的透明入口。`""` 关闭。`listen` / `redirect` 至少设一个。 |
 | `sniff` | `true` | 有 TLS SNI / HTTP Host 时用它替换目标 IP。 |
-| `server` | — | REALITY 服务器域名或 IP。启动时解析一次。 |
+| `server` | — | 上游服务器域名或 IP（REALITY 或普通 VLESS+TLS）。启动时解析一次。 |
 | `port` | `443` | |
 | `bootstrap_dns` | `""` | 启动时用来解析 `server` 的 DNS 服务器（`ip` 或 `ip:port`），直接走 UDP 查询，绕过 `/etc/resolv.conf`。本地解析器自身要经过隧道时设置它，避免开机时两个服务互相等待。失败时回退到系统解析器。 |
 | `sni` | 同 `server` | ClientHello 里的 SNI（伪装站点）。 |
-| `public_key` | — | 服务端 `publicKey`（base64url，与分享链接一致）。 |
+| `public_key` | `""` | 服务端 `publicKey`（base64url，与分享链接一致）。留空则改用普通 VLESS+TLS，不做 REALITY 认证。 |
 | `short_id` | `""` | 十六进制，最多 8 字节。 |
 | `uuid` | — | VLESS 用户 id。 |
 | `max_connections` | `128` | 连接槽位数。每个槽位约 92 KiB，启动时分配。 |
@@ -111,6 +111,14 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 
 REALITY 服务端会校验客户端时钟（封在 `session_id` 里的时间戳）。路由器时间
 没同步时所有握手都会以 `CertificateRejected` 失败。
+
+### 普通 VLESS + TLS（非 REALITY）
+
+`public_key` 留空（或省略）时，客户端发起标准 TLS 1.3 握手：`session_id` 填
+随机数、不带 REALITY 的认证扩展、不校验证书链（等同 `allowInsecure`），因此
+可以用来连普通机场 / 自建的 VLESS + `xtls-rprx-vision` over TLS 节点。此模式
+下 `short_id` 无意义，`sni` 必须填成服务端证书对应的域名。REALITY 的
+`compress_certificate` 扩展不会发出，避免对端用本客户端不支持的方式压缩证书。
 
 ## 部署到 OpenWrt
 

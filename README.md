@@ -109,11 +109,11 @@ inner connection presents.
 | `listen` | `127.0.0.1:1080` | SOCKS5 inbound. `""` disables it. |
 | `redirect` | `""` | Transparent inbound for `REDIRECT` rules. `""` disables it. At least one of `listen` / `redirect` must be set. |
 | `sniff` | `true` | Replace the destination IP with the TLS SNI / HTTP Host when present. |
-| `server` | ? | REALITY server hostname or IP. Resolved once at startup. |
+| `server` | ? | Upstream server hostname or IP (REALITY or plain TLS). Resolved once at startup. |
 | `port` | `443` | |
 | `bootstrap_dns` | `""` | Nameserver (`ip` or `ip:port`) asked directly over UDP to resolve `server` at startup, bypassing `/etc/resolv.conf`. Set it when the local resolver itself goes through the tunnel, so the two services do not wait on each other at boot. Falls back to the system resolver on failure. |
 | `sni` | `server` | SNI sent in the ClientHello (the camouflage site). |
-| `public_key` | ? | Server `publicKey` (base64url, as in the share link). |
+| `public_key` | `""` | Server `publicKey` (base64url, as in the share link). Leave empty to speak plain VLESS+TLS instead of REALITY. |
 | `short_id` | `""` | Hex, up to 8 bytes. |
 | `uuid` | ? | VLESS user id. |
 | `max_connections` | `128` | Connection slots. Each slot is ~92 KiB, allocated at startup. |
@@ -124,6 +124,17 @@ inner connection presents.
 The REALITY server checks the client's clock (timestamp inside the sealed
 `session_id`). A router whose time is not synced will fail every handshake
 with `CertificateRejected`.
+
+### Plain VLESS + TLS (no REALITY)
+
+With `public_key` empty or absent, zray performs a standard TLS 1.3 handshake
+instead: a random `session_id`, no REALITY auth extension, and no certificate
+chain verification (equivalent to `allowInsecure`). That is enough to reach a
+plain VLESS + `xtls-rprx-vision` over TLS endpoint, as offered by most
+commercial providers. `short_id` is ignored in this mode and `sni` must match
+the name on the server certificate. The REALITY-only `compress_certificate`
+extension is suppressed so an upstream cannot compress certificates in a form
+this client does not parse.
 
 ## Deploying on OpenWrt
 
