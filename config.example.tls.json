@@ -1,0 +1,16 @@
+{
+  "listen": "127.0.0.1:1080",
+  "redirect": "",
+  "sniff": true,
+  "server": "node.example.com",
+  "port": 443,
+  "bootstrap_dns": "",
+  "sni": "node.example.com",
+  "security": "tls",
+  "tls_verify": "none",
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "max_connections": 64,
+  "handshake_timeout_s": 15,
+  "idle_timeout_s": 300,
+  "sock_buf": 0
+}

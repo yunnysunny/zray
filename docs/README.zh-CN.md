@@ -90,7 +90,8 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 ## 配置
 
 `zray [config.json]`（默认 `./config.json`）。参见
-[config.example.json](../config.example.json)。
+[config.example.json](../config.example.json)（REALITY）和
+[config.example.tls.json](../config.example.tls.json)（普通 TLS）。
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -101,8 +102,10 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `port` | `443` | |
 | `bootstrap_dns` | `""` | 启动时用来解析 `server` 的 DNS 服务器（`ip` 或 `ip:port`），直接走 UDP 查询，绕过 `/etc/resolv.conf`。本地解析器自身要经过隧道时设置它，避免开机时两个服务互相等待。失败时回退到系统解析器。 |
 | `sni` | 同 `server` | ClientHello 里的 SNI（伪装站点）。 |
-| `public_key` | `""` | 服务端 `publicKey`（base64url，与分享链接一致）。留空则改用普通 VLESS+TLS，不做 REALITY 认证。 |
-| `short_id` | `""` | 十六进制，最多 8 字节。 |
+| `security` | `"reality"` | `"reality"` 或 `"tls"`（普通 VLESS+TLS，见下文）。 |
+| `public_key` | — | 服务端 `publicKey`（base64url，与分享链接一致）。`security = "reality"` 时必填，`"tls"` 时不允许出现。 |
+| `short_id` | `""` | 十六进制，最多 8 字节。仅 REALITY。 |
+| `tls_verify` | — | 仅 `security = "tls"` 时使用，且必填。目前只实现了 `"none"`（不校验证书，等同 `allowInsecure`）；`"ca"`、`"pin"` 预留，暂时会被拒绝。 |
 | `uuid` | — | VLESS 用户 id。 |
 | `max_connections` | `128` | 连接槽位数。每个槽位约 92 KiB，启动时分配。 |
 | `handshake_timeout_s` | `15` | TCP 连接 + TLS 握手的总时限。 |
@@ -114,11 +117,32 @@ REALITY 服务端会校验客户端时钟（封在 `session_id` 里的时间戳�
 
 ### 普通 VLESS + TLS（非 REALITY）
 
-`public_key` 留空（或省略）时，客户端发起标准 TLS 1.3 握手：`session_id` 填
-随机数、不带 REALITY 的认证扩展、不校验证书链（等同 `allowInsecure`），因此
-可以用来连普通机场 / 自建的 VLESS + `xtls-rprx-vision` over TLS 节点。此模式
-下 `short_id` 无意义，`sni` 必须填成服务端证书对应的域名。REALITY 的
-`compress_certificate` 扩展不会发出，避免对端用本客户端不支持的方式压缩证书。
+```json
+{
+  "security": "tls",
+  "tls_verify": "none",
+  "server": "node.example.com",
+  "uuid": "00000000-0000-0000-0000-000000000000"
+}
+```
+
+`security = "tls"` 时，客户端发起标准 TLS 1.3 握手：`session_id` 填随机数、
+不带 REALITY 的认证扩展；`tls_verify = "none"` 时不校验证书链（等同
+`allowInsecure`），因此可以用来连普通机场 / 自建的 VLESS + `xtls-rprx-vision`
+over TLS 节点。此模式下不能出现 `public_key` 和 `short_id`，`sni` 必须填成服务端
+证书对应的域名。REALITY 的 `compress_certificate` 扩展不会发出，避免对端用本
+客户端不支持的方式压缩证书。
+
+模式不会自动推断：REALITY 配置里 `public_key` 缺失或键名拼错会在启动时直接
+报错，而不是悄悄变成普通 TLS；配置里出现未知键也会报错。启动日志会打印当前
+模式。
+
+**风险。** `tls_verify = "none"` 接受任何证书。链路上的任何一方（不可信的
+Wi-Fi、运营商中间设备、上游被入侵的路由器）都可以冒充服务器，拿到 VLESS
+`uuid`，并读取或篡改隧道内的全部流量。只在可信链路上使用，或者在接受该风险的
+前提下使用。路由器通常没有可用的 CA 证书链（`opkg install ca-bundle` 可以装
+一个），所以后续计划实现 CA 校验（`"ca"`）和 SPKI 固定（`"pin"`）作为更安全
+的选项。
 
 ## 部署到 OpenWrt
 

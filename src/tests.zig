@@ -15,6 +15,7 @@ comptime {
     _ = @import("proxy/sniff.zig");
     _ = @import("proxy/dns.zig");
     _ = @import("tls/fingerprint.zig");
+    _ = @import("main.zig");
 }
 
 test {
