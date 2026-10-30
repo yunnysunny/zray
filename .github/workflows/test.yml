@@ -23,3 +23,44 @@ jobs:
 
       - name: host build (debug, catches Linux-only code paths)
         run: zig build
+
+      - name: startup smoke test
+        run: sh .github/scripts/smoke.sh zig-out/bin/zray
+
+  # The same tests on the router targets, run through qemu-user. Static musl
+  # binaries need no foreign sysroot, so `-fqemu` is all the build needs.
+  qemu:
+    name: qemu ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mipsel-softfloat
+            target: mipsel-linux-musl
+            cpu: mips32r2+soft_float
+            qemu: qemu-mipsel
+          - name: mips-softfloat
+            target: mips-linux-musl
+            cpu: mips32r2+soft_float
+            qemu: qemu-mips
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: install qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+          ${{ matrix.qemu }} --version
+
+      - name: unit tests under qemu
+        run: zig build test --summary all -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -fqemu
+
+      - name: startup smoke test under qemu (ReleaseSmall, the shipped build)
+        run: |
+          zig build --release -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -p out
+          sh .github/scripts/smoke.sh out/bin/zray ${{ matrix.qemu }}
