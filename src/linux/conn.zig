@@ -184,7 +184,7 @@ pub const Loop = struct {
             switch (dst) {
                 .v4 => |a| {
                     c.target_kind = .ipv4;
-                    c.target_buf[0..4].* = @bitCast(a.addr);
+                    c.target_buf[0..4].* = sys.SockAddr.ipv4Bytes(&a);
                     c.target_len = 4;
                 },
                 .v6 => |a| {
@@ -450,7 +450,7 @@ pub const Loop = struct {
 
         var rb: [22]u8 = undefined;
         const addr: socks5.Address = switch (bound) {
-            .v4 => |a| .{ .ipv4 = @bitCast(a.addr) },
+            .v4 => |a| .{ .ipv4 = sys.SockAddr.ipv4Bytes(&a) },
             .v6 => |a| .{ .ipv6 = a.addr },
         };
         l.queueClient(c, socks5.replyBound(&rb, addr, bound.getPort()));

@@ -30,8 +30,18 @@ pub const SockAddr = union(enum) {
     v4: linux.sockaddr.in,
     v6: linux.sockaddr.in6,
 
+    /// `sin_addr` holds the four octets in memory order. Go through a pointer,
+    /// not `@bitCast`: an array <-> integer bitcast maps element 0 to the low
+    /// bits regardless of endianness, which reverses the address on
+    /// big-endian MIPS (127.0.0.1 became 1.0.0.127).
     pub fn fromIpv4(ip: [4]u8, port: u16) SockAddr {
-        return .{ .v4 = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ip) } };
+        const raw: *align(1) const u32 = @ptrCast(&ip);
+        return .{ .v4 = .{ .port = std.mem.nativeToBig(u16, port), .addr = raw.* } };
+    }
+    /// The IPv4 octets in memory order; the inverse of `fromIpv4`.
+    pub fn ipv4Bytes(a: *const linux.sockaddr.in) [4]u8 {
+        const raw: *const [4]u8 = @ptrCast(&a.addr);
+        return raw.*;
     }
     pub fn fromIpv6(ip: [16]u8, port: u16) SockAddr {
         return .{ .v6 = .{ .port = std.mem.nativeToBig(u16, port), .flowinfo = 0, .addr = ip, .scope_id = 0 } };
