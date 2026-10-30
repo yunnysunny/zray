@@ -6,6 +6,7 @@
   "port": 443,
   "bootstrap_dns": "",
   "sni": "example.com",
+  "security": "reality",
   "public_key": "<server publicKey, base64url>",
   "short_id": "",
   "uuid": "00000000-0000-0000-0000-000000000000",

@@ -8,8 +8,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const reality = @import("tls/reality.zig");
 
 pub const version = "0.2.0";
+
+/// How the upstream is authenticated. Chosen explicitly so a mistyped or
+/// missing `public_key` fails at startup instead of quietly downgrading a
+/// REALITY node to plain TLS.
+const Security = enum { reality, tls };
+
+/// Certificate check for `security = "tls"`. `ca` (system bundle) and `pin`
+/// (SPKI SHA-256) are reserved for a later release; until then plain TLS
+/// must opt into `none` explicitly.
+const TlsVerify = enum { ca, pin, none };
 
 const FileConfig = struct {
     /// SOCKS5 inbound; empty string disables it.
@@ -27,16 +38,73 @@ const FileConfig = struct {
     /// two services wait on each other at boot. Empty: system resolver.
     bootstrap_dns: []const u8 = "",
     sni: []const u8 = "",
-    /// REALITY server public key (base64url). Empty or absent: plain TLS 1.3
-    /// (SNI only, certificate chain not verified) for ordinary vless+TLS nodes.
+    /// "reality" (default; existing configs keep working) or "tls" for an
+    /// ordinary VLESS + TLS node.
+    security: Security = .reality,
+    /// REALITY server public key (base64url). Required with security =
+    /// "reality", rejected with "tls".
     public_key: []const u8 = "",
+    /// REALITY only.
     short_id: []const u8 = "",
+    /// security = "tls" only, and then mandatory: how the server certificate
+    /// is checked. Only "none" (equivalent to allowInsecure) is implemented.
+    tls_verify: ?TlsVerify = null,
     uuid: []const u8,
     max_connections: u32 = 128,
     handshake_timeout_s: u64 = 15,
     idle_timeout_s: u64 = 600,
     sock_buf: i32 = 0,
 };
+
+const Upstream = union(enum) {
+    reality: reality.Config,
+    /// Plain TLS 1.3; the payload is the certificate check in force.
+    tls: TlsVerify,
+};
+
+const UpstreamError = error{
+    MissingPublicKey,
+    RealityFieldsInTlsMode,
+    MissingTlsVerify,
+    TlsVerifyNotImplemented,
+    InvalidPublicKey,
+    InvalidShortId,
+};
+
+/// Pick the upstream mode from the config. Every misconfiguration is an
+/// error; it never falls through to a weaker mode than the one the config
+/// names (a REALITY config with a mistyped `public_key` must not become
+/// unverified plain TLS). Pure so it can be unit-tested on any host.
+fn selectUpstream(c: FileConfig) UpstreamError!Upstream {
+    switch (c.security) {
+        .reality => {
+            if (c.public_key.len == 0) return error.MissingPublicKey;
+            return .{ .reality = .{
+                .server_public_key = try reality.Config.publicKeyFromBase64(c.public_key),
+                .short_id = try reality.Config.shortIdFromHex(c.short_id),
+            } };
+        },
+        .tls => {
+            if (c.public_key.len != 0 or c.short_id.len != 0) return error.RealityFieldsInTlsMode;
+            const verify = c.tls_verify orelse return error.MissingTlsVerify;
+            return switch (verify) {
+                .none => .{ .tls = verify },
+                .ca, .pin => error.TlsVerifyNotImplemented,
+            };
+        },
+    }
+}
+
+fn upstreamErrorMessage(e: UpstreamError) []const u8 {
+    return switch (e) {
+        error.MissingPublicKey => "public_key is required with security = \"reality\" (use security = \"tls\" for a plain VLESS+TLS node)",
+        error.RealityFieldsInTlsMode => "public_key / short_id are only valid with security = \"reality\"",
+        error.MissingTlsVerify => "tls_verify is required with security = \"tls\"; set it to \"none\" to skip certificate verification (like allowInsecure)",
+        error.TlsVerifyNotImplemented => "tls_verify \"ca\" / \"pin\" are not implemented yet; only \"none\" is available",
+        error.InvalidPublicKey => "bad public_key",
+        error.InvalidShortId => "bad short_id",
+    };
+}
 
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .linux) {
@@ -52,7 +120,6 @@ pub fn main(init: std.process.Init) !void {
 fn linuxMain(init: std.process.Init) !void {
     const sys = @import("linux/sys.zig");
     const conn = @import("linux/conn.zig");
-    const reality = @import("tls/reality.zig");
     const vless = @import("proxy/vless.zig");
 
     const arena = init.arena.allocator();
@@ -65,7 +132,9 @@ fn linuxMain(init: std.process.Init) !void {
         sys.log("cannot read {s}: {s}", .{ cfg_path, @errorName(e) });
         return e;
     };
-    const parsed = std.json.parseFromSliceLeaky(FileConfig, arena, text, .{ .ignore_unknown_fields = true }) catch |e| {
+    // Unknown keys are an error: the config is small and a misspelled key
+    // must not silently fall back to a default.
+    const parsed = std.json.parseFromSliceLeaky(FileConfig, arena, text, .{}) catch |e| {
         sys.log("bad config: {s}", .{@errorName(e)});
         return e;
     };
@@ -75,17 +144,14 @@ fn linuxMain(init: std.process.Init) !void {
         sys.log("cannot resolve {s}: {s}", .{ parsed.server, @errorName(e) });
         return e;
     };
-    // REALITY when a server public key is supplied, plain TLS otherwise.
-    const reality_cfg: ?reality.Config = if (parsed.public_key.len > 0) .{
-        .server_public_key = reality.Config.publicKeyFromBase64(parsed.public_key) catch |e| {
-            sys.log("bad public_key", .{});
-            return e;
-        },
-        .short_id = reality.Config.shortIdFromHex(parsed.short_id) catch |e| {
-            sys.log("bad short_id", .{});
-            return e;
-        },
-    } else null;
+    const upstream = selectUpstream(parsed) catch |e| {
+        sys.log("bad config: {s}", .{upstreamErrorMessage(e)});
+        return e;
+    };
+    const reality_cfg: ?reality.Config = switch (upstream) {
+        .reality => |rc| rc,
+        .tls => null,
+    };
 
     const cfg: conn.Config = .{
         .server_addr = server_addr,
@@ -120,6 +186,10 @@ fn linuxMain(init: std.process.Init) !void {
         version,     parsed.listen, parsed.redirect,        parsed.sniff,              parsed.server,
         parsed.port, cfg.sni,       parsed.max_connections, @sizeOf(conn.Conn) / 1024, (@sizeOf(conn.Conn) * parsed.max_connections) / 1024,
     });
+    switch (upstream) {
+        .reality => sys.log("mode reality (short_id {s})", .{if (parsed.short_id.len > 0) parsed.short_id else "-"}),
+        .tls => sys.log("mode tls, verify NONE -- WARNING: server certificate not verified; an on-path attacker can impersonate the server, read the VLESS uuid and all tunnelled traffic", .{}),
+    }
 
     var events: [64]sys.Event = undefined;
     var last_sweep = sys.monotonicSeconds();
@@ -243,4 +313,53 @@ fn resolveSystem(io: Io, host: []const u8, port: u16) !@import("linux/sys.zig").
         .canonical_name => {},
     };
     return error.NoAddress;
+}
+
+// A valid base64url X25519 key: 32 zero bytes.
+const test_pk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+fn testConfig(overrides: anytype) FileConfig {
+    var c: FileConfig = .{ .server = "example.com", .uuid = "00000000-0000-0000-0000-000000000000" };
+    inline for (@typeInfo(@TypeOf(overrides)).@"struct".field_names) |name| @field(c, name) = @field(overrides, name);
+    return c;
+}
+
+test "reality is the default and needs public_key" {
+    const up = try selectUpstream(testConfig(.{ .public_key = test_pk, .short_id = "0123abcd" }));
+    try std.testing.expect(up == .reality);
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x23, 0xab, 0xcd, 0, 0, 0, 0 }, &up.reality.short_id);
+
+    // A missing (or mistyped) public_key must fail, never downgrade to plain TLS.
+    try std.testing.expectError(error.MissingPublicKey, selectUpstream(testConfig(.{})));
+    try std.testing.expectError(error.InvalidPublicKey, selectUpstream(testConfig(.{ .public_key = "nope" })));
+    try std.testing.expectError(error.InvalidShortId, selectUpstream(testConfig(.{ .public_key = test_pk, .short_id = "abc" })));
+}
+
+test "plain tls must opt into tls_verify explicitly" {
+    try std.testing.expectError(error.MissingTlsVerify, selectUpstream(testConfig(.{ .security = .tls })));
+    try std.testing.expectError(error.TlsVerifyNotImplemented, selectUpstream(testConfig(.{ .security = .tls, .tls_verify = .ca })));
+    try std.testing.expectError(error.TlsVerifyNotImplemented, selectUpstream(testConfig(.{ .security = .tls, .tls_verify = .pin })));
+    try std.testing.expectError(error.RealityFieldsInTlsMode, selectUpstream(testConfig(.{ .security = .tls, .tls_verify = .none, .public_key = test_pk })));
+    try std.testing.expectError(error.RealityFieldsInTlsMode, selectUpstream(testConfig(.{ .security = .tls, .tls_verify = .none, .short_id = "01" })));
+
+    const up = try selectUpstream(testConfig(.{ .security = .tls, .tls_verify = .none }));
+    try std.testing.expectEqual(Upstream{ .tls = .none }, up);
+}
+
+test "config json: enums parse from strings, unknown keys are rejected" {
+    const a = std.testing.allocator;
+    const ok = try std.json.parseFromSlice(FileConfig, a,
+        \\{"server":"x","uuid":"u","security":"tls","tls_verify":"none"}
+    , .{});
+    defer ok.deinit();
+    try std.testing.expectEqual(Security.tls, ok.value.security);
+    try std.testing.expectEqual(@as(?TlsVerify, .none), ok.value.tls_verify);
+
+    // The exact typo the review was worried about.
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(FileConfig, a,
+        \\{"server":"x","uuid":"u","publickey":"abc"}
+    , .{}));
+    try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(FileConfig, a,
+        \\{"server":"x","uuid":"u","security":"plain"}
+    , .{}));
 }

@@ -102,7 +102,8 @@ inner connection presents.
 ## Configuration
 
 `zray [config.json]` (default `./config.json`). See
-[config.example.json](config.example.json).
+[config.example.json](config.example.json) (REALITY) and
+[config.example.tls.json](config.example.tls.json) (plain TLS).
 
 | key | default | meaning |
 |---|---|---|
@@ -113,8 +114,10 @@ inner connection presents.
 | `port` | `443` | |
 | `bootstrap_dns` | `""` | Nameserver (`ip` or `ip:port`) asked directly over UDP to resolve `server` at startup, bypassing `/etc/resolv.conf`. Set it when the local resolver itself goes through the tunnel, so the two services do not wait on each other at boot. Falls back to the system resolver on failure. |
 | `sni` | `server` | SNI sent in the ClientHello (the camouflage site). |
-| `public_key` | `""` | Server `publicKey` (base64url, as in the share link). Leave empty to speak plain VLESS+TLS instead of REALITY. |
-| `short_id` | `""` | Hex, up to 8 bytes. |
+| `security` | `"reality"` | `"reality"` or `"tls"` (plain VLESS+TLS, see below). |
+| `public_key` | ? | Server `publicKey` (base64url, as in the share link). Required with `security = "reality"`, rejected with `"tls"`. |
+| `short_id` | `""` | Hex, up to 8 bytes. REALITY only. |
+| `tls_verify` | ? | `security = "tls"` only, and then mandatory. Only `"none"` (no certificate verification, like `allowInsecure`) is implemented; `"ca"` and `"pin"` are reserved and rejected for now. |
 | `uuid` | ? | VLESS user id. |
 | `max_connections` | `128` | Connection slots. Each slot is ~92 KiB, allocated at startup. |
 | `handshake_timeout_s` | `15` | TCP connect + TLS handshake deadline. |
@@ -127,14 +130,37 @@ with `CertificateRejected`.
 
 ### Plain VLESS + TLS (no REALITY)
 
-With `public_key` empty or absent, zray performs a standard TLS 1.3 handshake
-instead: a random `session_id`, no REALITY auth extension, and no certificate
-chain verification (equivalent to `allowInsecure`). That is enough to reach a
-plain VLESS + `xtls-rprx-vision` over TLS endpoint, as offered by most
-commercial providers. `short_id` is ignored in this mode and `sni` must match
-the name on the server certificate. The REALITY-only `compress_certificate`
-extension is suppressed so an upstream cannot compress certificates in a form
-this client does not parse.
+```json
+{
+  "security": "tls",
+  "tls_verify": "none",
+  "server": "node.example.com",
+  "uuid": "00000000-0000-0000-0000-000000000000"
+}
+```
+
+With `security = "tls"`, zray performs a standard TLS 1.3 handshake instead:
+a random `session_id`, no REALITY auth extension, and (with
+`tls_verify = "none"`) no certificate chain verification, equivalent to
+`allowInsecure`. That is enough to reach a plain VLESS + `xtls-rprx-vision`
+over TLS endpoint, as offered by most commercial providers. `public_key` and
+`short_id` must be absent in this mode and `sni` must match the name on the
+server certificate. The REALITY-only `compress_certificate` extension is
+suppressed so an upstream cannot compress certificates in a form this client
+does not parse.
+
+The mode is never inferred: a REALITY config with a missing or misspelled
+`public_key` fails at startup instead of silently becoming plain TLS, and
+unknown keys in the config are rejected. The startup log prints the mode in
+use.
+
+**Risk.** `tls_verify = "none"` accepts any certificate. Anyone on the path
+(a hostile Wi-Fi, an ISP middlebox, a compromised router upstream) can
+impersonate the server, obtain the VLESS `uuid`, and read or modify every
+byte inside the tunnel. Use it only on paths you trust, or when you accept
+that risk. Routers usually do not ship a usable CA bundle (`opkg install
+ca-bundle` adds one), so CA (`"ca"`) and SPKI pinning (`"pin"`) verification
+are planned as the safer alternatives.
 
 ## Deploying on OpenWrt
 
