@@ -144,6 +144,29 @@ Wi-Fi、运营商中间设备、上游被入侵的路由器）都可以冒充服
 一个），所以后续计划实现 CA 校验（`"ca"`）和 SPKI 固定（`"pin"`）作为更安全
 的选项。
 
+### 多节点、WebSocket、链式代理与按域名分流
+
+单个节点仍用顶层的 `server` / `uuid`。多个节点时改用 `outbounds`（不要与
+顶层 `server` / `uuid` 同时出现）。每个节点除原有字段外还有：
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `tag` | `""` | `dialer`、`rules`、`default` 引用的名字。 |
+| `network` | `"tcp"` | `"tcp"` 或 `"ws"`（TLS 里的 VLESS WebSocket）。 |
+| `ws_path` | `"/"` | Upgrade 路径，仅 `network` 为 `"ws"` 时使用。 |
+| `ws_host` | 同 `sni` | Upgrade 请求的 `Host`。 |
+| `flow` | tcp 为 vision，ws 为 `"none"` | `"xtls-rprx-vision"` 或 `"none"`。WebSocket 上的 Vision 会被拒绝。 |
+| `dialer` | `""` | 必须是排在前面的某个节点的 `tag`。本节点的 TCP 经该节点拨出，用来把干净出口挂在中继后面。 |
+| `bootstrap_dns` | 顶层的值 | 可按节点覆盖。 |
+
+`rules` 按顺序匹配。`domain_suffix` 是 ASCII 后缀（`example.com` 匹配自身和
+`a.example.com`，不匹配 `notexample.com`），`outbound` 是该组的 tag 列表。
+`default` 是都不匹配时使用的组，默认第一个节点。`fail_backoff_s`（默认 30）
+是某个成员连接失败后被跳过的秒数；只在**同一组**内换下一个，命中的规则不会
+退回到别的组或 `default`。最多 16 个节点。UDP 只走带 Vision 的 TCP 节点。
+目标是 IP 且可能命中规则时，最多等 1 秒嗅探 SNI / Host，否则用 `default`。
+示例见 [config.example.routing.json](../config.example.routing.json)。
+
 ## 部署到 OpenWrt
 
 [deploy/](../deploy/) 下有 procd init 脚本和配置模板。

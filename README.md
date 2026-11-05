@@ -57,6 +57,10 @@ by `net.core.rmem_max`.
 - **Zero-latency sniffing**: TLS SNI and HTTP `Host` are read from the first
   client bytes that arrive while the upstream handshake is still in flight,
   so the server sees a domain instead of an IP.
+- **WebSocket transport, chaining, and routing**: a VLESS node can ride
+  `network: "ws"` inside TLS; one outbound can dial through another
+  (`dialer`); `domain_suffix` rules send a name to an outbound group, which
+  fails over inside that group only.
 
 Not included, on purpose: TLS 1.2, session resumption, 0-RTT, certificate
 decompression (we only *offer* `compress_certificate`; Go servers never use
@@ -162,6 +166,63 @@ that risk. Routers usually do not ship a usable CA bundle (`opkg install
 ca-bundle` adds one), so CA (`"ca"`) and SPKI pinning (`"pin"`) verification
 are planned as the safer alternatives.
 
+### Several outbounds, WebSocket, chaining, routing
+
+A single node can still be written with the top-level `server` / `uuid`
+fields. More than one node uses `outbounds` in place of those fields (the
+config is rejected when both forms are present). Each entry takes the same
+node fields, plus:
+
+| key | default | meaning |
+|---|---|---|
+| `tag` | `""` | Name used by `dialer`, `rules`, and `default`. |
+| `network` | `"tcp"` | `"tcp"` or `"ws"` (VLESS over WebSocket, inside the TLS session). |
+| `ws_path` | `"/"` | HTTP Upgrade path. Used when `network` is `"ws"`. |
+| `ws_host` | `sni` | `Host` header on the Upgrade request. |
+| `flow` | vision on tcp, `"none"` on ws | `"xtls-rprx-vision"` or `"none"`. Vision over WebSocket is rejected. |
+| `dialer` | `""` | Tag of an earlier outbound. This node's TCP connection is opened through that outbound (a local hop), so a clean exit can sit behind a relay. |
+| `bootstrap_dns` | the top-level value | Optional per-node override. |
+
+| key | default | meaning |
+|---|---|---|
+| `rules` | `[]` | First match wins. `domain_suffix` is a list of ASCII suffixes (`example.com` matches that host and `a.example.com`). `outbound` is the group of tags to use. |
+| `default` | the first outbound | Group used when no rule matches. |
+| `fail_backoff_s` | `30` | After a member fails to connect, skip it for this many seconds and try the next member of that same group. If every member of the matched group fails, the connection closes. |
+
+At most 16 outbounds. A `dialer` tag must refer to an entry listed before
+it. UDP is only carried on a Vision TCP outbound. When the target is an IP
+and a rule might apply, zray waits up to one second for a TLS SNI or HTTP
+`Host` before using `default`. See
+[config.example.routing.json](config.example.routing.json).
+
+```json
+{
+  "outbounds": [
+    {
+      "tag": "relay",
+      "server": "relay.example.com",
+      "security": "reality",
+      "public_key": "<server publicKey, base64url>",
+      "uuid": "00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "tag": "exit-a",
+      "server": "exit-a.example.com",
+      "security": "tls",
+      "tls_verify": "none",
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "network": "ws",
+      "ws_path": "/vless-ws",
+      "dialer": "relay"
+    }
+  ],
+  "rules": [
+    { "domain_suffix": ["openai.com", "chatgpt.com"], "outbound": ["exit-a"] }
+  ],
+  "default": ["relay"]
+}
+```
+
 ## Deploying on OpenWrt
 
 See [deploy/](deploy/) for a procd init script and a config template.
@@ -216,6 +277,7 @@ src/
     mux.zig           XUDP (Mux.Cool) frames
     socks5.zig        SOCKS5 greeting / CONNECT / UDP ASSOCIATE
     sniff.zig         TLS SNI and HTTP Host extraction
+    ws.zig            WebSocket client framing (VLESS `ws` transport)
   linux/
     sys.zig           thin syscall wrappers (sockets, epoll, SO_ORIGINAL_DST)
     conn.zig          per-connection state machine and relay
@@ -228,8 +290,10 @@ Everything in `tls/` and `proxy/` is sans-I/O and unit tested
 
 ## Status and known limits
 
-- `server` is resolved once at startup; an IP change needs a restart. There is
-  no connect backoff yet. See [TODO.md](TODO.md).
+- Each outbound's `server` is resolved once at startup; an IP change needs a
+  restart. There is no connect backoff yet. See [TODO.md](TODO.md). A failed
+  member of a group is skipped for `fail_backoff_s`, but only in favour of
+  another member of that same group.
 - UDP payloads above roughly 600 bytes may be dropped depending on the server's
   outbound; DNS works, QUIC generally does not.
 - No log level control; every connection logs its lifecycle to stderr.

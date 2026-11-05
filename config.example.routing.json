@@ -1,0 +1,55 @@
+{
+  "listen": "127.0.0.1:1080",
+  "redirect": "",
+  "sniff": true,
+  "bootstrap_dns": "",
+  "outbounds": [
+    {
+      "tag": "relay",
+      "server": "relay.example.com",
+      "port": 443,
+      "security": "reality",
+      "sni": "example.com",
+      "public_key": "<server publicKey, base64url>",
+      "short_id": "",
+      "uuid": "00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "tag": "exit-a",
+      "server": "exit-a.example.com",
+      "port": 443,
+      "security": "tls",
+      "tls_verify": "none",
+      "sni": "exit-a.example.com",
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "network": "ws",
+      "ws_path": "/vless-ws",
+      "ws_host": "exit-a.example.com",
+      "flow": "none",
+      "dialer": "relay"
+    },
+    {
+      "tag": "exit-b",
+      "server": "exit-b.example.com",
+      "port": 443,
+      "security": "tls",
+      "tls_verify": "none",
+      "sni": "exit-b.example.com",
+      "uuid": "00000000-0000-0000-0000-000000000002",
+      "network": "ws",
+      "ws_path": "/vless-ws",
+      "ws_host": "exit-b.example.com",
+      "flow": "none",
+      "dialer": "relay"
+    }
+  ],
+  "rules": [
+    {
+      "domain_suffix": ["openai.com", "chatgpt.com", "anthropic.com", "claude.ai"],
+      "outbound": ["exit-a", "exit-b"]
+    }
+  ],
+  "default": ["relay"],
+  "fail_backoff_s": 30,
+  "max_connections": 64
+}

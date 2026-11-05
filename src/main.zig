@@ -22,14 +22,51 @@ const Security = enum { reality, tls };
 /// must opt into `none` explicitly.
 const TlsVerify = enum { ca, pin, none };
 
+const Network = enum { tcp, ws };
+const FlowName = enum { none, @"xtls-rprx-vision" };
+
+/// One entry of `outbounds`. Same meaning as the top-level node fields.
+const OutboundConfig = struct {
+    tag: []const u8 = "",
+    server: []const u8,
+    port: u16 = 443,
+    bootstrap_dns: ?[]const u8 = null,
+    sni: []const u8 = "",
+    security: Security = .reality,
+    public_key: []const u8 = "",
+    short_id: []const u8 = "",
+    tls_verify: ?TlsVerify = null,
+    uuid: []const u8,
+    /// Default: xtls-rprx-vision for tcp (original behaviour), none for ws.
+    flow: ?FlowName = null,
+    network: Network = .tcp,
+    ws_path: []const u8 = "/",
+    /// HTTP Host header; default: sni (or server).
+    ws_host: []const u8 = "",
+    /// Tag of another outbound to tunnel this one's TCP connection through.
+    dialer: []const u8 = "",
+};
+
+const RuleConfig = struct {
+    domain_suffix: []const []const u8,
+    /// Outbound tags, tried in order (failover).
+    outbound: []const []const u8,
+};
+
 const FileConfig = struct {
+    /// Multi-node form. When set, the top-level node fields must be absent.
+    outbounds: ?[]const OutboundConfig = null,
+    rules: []const RuleConfig = &.{},
+    /// Tags for traffic no rule matches; default: the first outbound.
+    default: []const []const u8 = &.{},
+    fail_backoff_s: u64 = 30,
     /// SOCKS5 inbound; empty string disables it.
     listen: []const u8 = "127.0.0.1:1080",
     /// Transparent inbound for netfilter REDIRECT (iptables -j REDIRECT /
     /// nft redirect to); empty string disables it.
     redirect: []const u8 = "",
     sniff: bool = true,
-    server: []const u8,
+    server: []const u8 = "",
     port: u16 = 443,
     /// Nameserver ("1.2.3.4", "1.2.3.4:53", "[2001:db8::1]:53") queried
     /// directly over UDP to resolve `server` at startup, bypassing
@@ -49,7 +86,11 @@ const FileConfig = struct {
     /// security = "tls" only, and then mandatory: how the server certificate
     /// is checked. Only "none" (equivalent to allowInsecure) is implemented.
     tls_verify: ?TlsVerify = null,
-    uuid: []const u8,
+    uuid: []const u8 = "",
+    flow: ?FlowName = null,
+    network: Network = .tcp,
+    ws_path: []const u8 = "/",
+    ws_host: []const u8 = "",
     max_connections: u32 = 128,
     handshake_timeout_s: u64 = 15,
     idle_timeout_s: u64 = 600,
@@ -75,7 +116,7 @@ const UpstreamError = error{
 /// error; it never falls through to a weaker mode than the one the config
 /// names (a REALITY config with a mistyped `public_key` must not become
 /// unverified plain TLS). Pure so it can be unit-tested on any host.
-fn selectUpstream(c: FileConfig) UpstreamError!Upstream {
+fn selectUpstream(c: anytype) UpstreamError!Upstream {
     switch (c.security) {
         .reality => {
             if (c.public_key.len == 0) return error.MissingPublicKey;
@@ -139,32 +180,97 @@ fn linuxMain(init: std.process.Init) !void {
         return e;
     };
 
-    // Resolve the server once at startup (routers rarely change upstreams).
-    const server_addr = resolveServer(init.io, parsed.server, parsed.port, parsed.bootstrap_dns) catch |e| {
-        sys.log("cannot resolve {s}: {s}", .{ parsed.server, @errorName(e) });
-        return e;
-    };
-    const upstream = selectUpstream(parsed) catch |e| {
-        sys.log("bad config: {s}", .{upstreamErrorMessage(e)});
-        return e;
-    };
-    const reality_cfg: ?reality.Config = switch (upstream) {
-        .reality => |rc| rc,
-        .tls => null,
-    };
+    const node_cfgs: []const OutboundConfig = parsed.outbounds orelse &.{.{
+        .server = parsed.server,
+        .port = parsed.port,
+        .sni = parsed.sni,
+        .security = parsed.security,
+        .public_key = parsed.public_key,
+        .short_id = parsed.short_id,
+        .tls_verify = parsed.tls_verify,
+        .uuid = parsed.uuid,
+        .flow = parsed.flow,
+        .network = parsed.network,
+        .ws_path = parsed.ws_path,
+        .ws_host = parsed.ws_host,
+    }};
+    if (parsed.outbounds != null and (parsed.server.len != 0 or parsed.uuid.len != 0)) {
+        sys.log("bad config: use either top-level server/uuid or outbounds, not both", .{});
+        return error.BadConfig;
+    }
+    if (node_cfgs.len == 0 or node_cfgs.len > conn.max_outbounds) {
+        sys.log("bad config: need 1..{d} outbounds", .{conn.max_outbounds});
+        return error.BadConfig;
+    }
+
+    const obs = try arena.alloc(conn.Outbound, node_cfgs.len);
+    // Hop listeners: one local SOCKS5 port per outbound used as a dialer.
+    var hop_fd: [conn.max_outbounds]?sys.fd_t = @splat(null);
+    for (node_cfgs, 0..) |oc, i| {
+        const upstream = selectUpstream(oc) catch |e| {
+            sys.log("bad config ({s}): {s}", .{ oc.tag, upstreamErrorMessage(e) });
+            return e;
+        };
+        if (oc.server.len == 0 or oc.server.len > 255) return error.BadConfig;
+        const vision_on = if (oc.flow) |f| f == .@"xtls-rprx-vision" else oc.network == .tcp;
+        if (vision_on and oc.network == .ws) {
+            sys.log("bad config ({s}): xtls-rprx-vision does not work over ws; set flow \"none\"", .{oc.tag});
+            return error.BadConfig;
+        }
+        const sni = if (oc.sni.len > 0) oc.sni else oc.server;
+        var ob: conn.Outbound = .{
+            .tag = oc.tag,
+            .addr = undefined,
+            .sni = sni,
+            .reality = switch (upstream) {
+                .reality => |rc| rc,
+                .tls => null,
+            },
+            .uuid = vless.parseUuid(oc.uuid) catch |e| {
+                sys.log("bad uuid ({s})", .{oc.tag});
+                return e;
+            },
+            .vision = vision_on,
+            .ws = oc.network == .ws,
+            .ws_path = oc.ws_path,
+            .ws_host = if (oc.ws_host.len > 0) oc.ws_host else sni,
+        };
+        if (oc.dialer.len > 0) {
+            const d = tagIndex(node_cfgs, oc.dialer) orelse {
+                sys.log("bad config ({s}): unknown dialer {s}", .{ oc.tag, oc.dialer });
+                return error.BadConfig;
+            };
+            if (d >= i) {
+                sys.log("bad config ({s}): dialer {s} must be listed before it", .{ oc.tag, oc.dialer });
+                return error.BadConfig;
+            }
+            if (hop_fd[d] == null) hop_fd[d] = try listenOn("127.0.0.1:0");
+            ob.addr = try sys.localAddr(hop_fd[d].?);
+            ob.hop_host = oc.server;
+            ob.hop_port = oc.port;
+        } else {
+            // Resolve once at startup (routers rarely change upstreams).
+            ob.addr = resolveServer(init.io, oc.server, oc.port, oc.bootstrap_dns orelse parsed.bootstrap_dns) catch |e| {
+                sys.log("cannot resolve {s}: {s}", .{ oc.server, @errorName(e) });
+                return e;
+            };
+        }
+        obs[i] = ob;
+    }
+
+    const rules = try arena.alloc(conn.Rule, parsed.rules.len);
+    for (parsed.rules, 0..) |r, i| rules[i] = .{ .suffixes = r.domain_suffix, .group = try tagsToGroup(arena, node_cfgs, r.outbound) };
+    const default_group: []const u8 = if (parsed.default.len > 0) try tagsToGroup(arena, node_cfgs, parsed.default) else &.{0};
 
     const cfg: conn.Config = .{
-        .server_addr = server_addr,
-        .sni = if (parsed.sni.len > 0) parsed.sni else parsed.server,
-        .reality = reality_cfg,
-        .uuid = vless.parseUuid(parsed.uuid) catch |e| {
-            sys.log("bad uuid", .{});
-            return e;
-        },
+        .outbounds = obs,
+        .rules = rules,
+        .default_group = default_group,
         .handshake_timeout_s = parsed.handshake_timeout_s,
         .idle_timeout_s = parsed.idle_timeout_s,
         .sock_buf = parsed.sock_buf,
         .sniff = parsed.sniff,
+        .fail_backoff_s = parsed.fail_backoff_s,
     };
 
     if (parsed.listen.len == 0 and parsed.redirect.len == 0) {
@@ -175,20 +281,45 @@ fn linuxMain(init: std.process.Init) !void {
     const ep = try sys.epollCreate();
     const socks_token: u64 = std.math.maxInt(u64);
     const redirect_token: u64 = std.math.maxInt(u64) - 1;
+    const hop_token_base: u64 = std.math.maxInt(u64) - 2;
     const socks_fd: ?sys.fd_t = if (parsed.listen.len > 0) try listenOn(parsed.listen) else null;
     const redirect_fd: ?sys.fd_t = if (parsed.redirect.len > 0) try listenOn(parsed.redirect) else null;
     if (socks_fd) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, socks_token);
+    for (hop_fd, 0..) |h, i| if (h) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, hop_token_base - i);
     if (redirect_fd) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, redirect_token);
 
     const conns = try std.heap.page_allocator.alloc(conn.Conn, parsed.max_connections);
     var loop = conn.Loop.init(ep, &cfg, conns);
-    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, upstream {s}:{d} (sni {s}), {d} slots x {d} KiB = {d} KiB", .{
-        version,     parsed.listen, parsed.redirect,        parsed.sniff,              parsed.server,
-        parsed.port, cfg.sni,       parsed.max_connections, @sizeOf(conn.Conn) / 1024, (@sizeOf(conn.Conn) * parsed.max_connections) / 1024,
+    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} slots x {d} KiB = {d} KiB", .{
+        version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, (@sizeOf(conn.Conn) * parsed.max_connections) / 1024,
     });
-    switch (upstream) {
-        .reality => sys.log("mode reality (short_id {s})", .{if (parsed.short_id.len > 0) parsed.short_id else "-"}),
-        .tls => sys.log("mode tls, verify NONE -- WARNING: server certificate not verified; an on-path attacker can impersonate the server, read the VLESS uuid and all tunnelled traffic", .{}),
+    for (obs, node_cfgs) |ob, oc| {
+        // Keep the "mode ..." phrases: the startup smoke test matches them,
+        // and the TLS line is the allowInsecure warning operators need.
+        if (ob.reality != null) {
+            sys.log("outbound {s}: {s}:{d} sni {s} mode reality (short_id {s}){s}{s}{s}{s}", .{
+                if (ob.tag.len > 0) ob.tag else "-",
+                oc.server,
+                oc.port,
+                ob.sni,
+                if (oc.short_id.len > 0) oc.short_id else "-",
+                if (ob.vision) " vision" else "",
+                if (ob.ws) " ws " else "",
+                if (ob.ws) ob.ws_path else "",
+                if (oc.dialer.len > 0) " via hop" else "",
+            });
+        } else {
+            sys.log("outbound {s}: {s}:{d} sni {s} mode tls, verify NONE -- WARNING: server certificate not verified; an on-path attacker can impersonate the server, read the VLESS uuid and all tunnelled traffic{s}{s}{s}{s}", .{
+                if (ob.tag.len > 0) ob.tag else "-",
+                oc.server,
+                oc.port,
+                ob.sni,
+                if (ob.vision) " vision" else "",
+                if (ob.ws) " ws " else "",
+                if (ob.ws) ob.ws_path else "",
+                if (oc.dialer.len > 0) " via hop" else "",
+            });
+        }
     }
 
     var events: [64]sys.Event = undefined;
@@ -204,7 +335,13 @@ fn linuxMain(init: std.process.Init) !void {
                 const lfd = if (is_socks) socks_fd.? else redirect_fd.?;
                 while (true) {
                     const fd = sys.accept(lfd) catch break;
-                    loop.accept(fd, if (is_socks) .socks5 else .redirect);
+                    loop.accept(fd, if (is_socks) .socks5 else .redirect, null);
+                }
+            } else if (ev.data.u64 > hop_token_base - conn.max_outbounds and ev.data.u64 <= hop_token_base) {
+                const i: u8 = @intCast(hop_token_base - ev.data.u64);
+                while (true) {
+                    const fd = sys.accept(hop_fd[i].?) catch break;
+                    loop.accept(fd, .socks5, i);
                 }
             } else {
                 loop.handle(ev.data.u64, ev.events);
@@ -216,6 +353,25 @@ fn linuxMain(init: std.process.Init) !void {
             loop.sweep();
         }
     }
+}
+
+fn tagIndex(nodes: []const OutboundConfig, tag: []const u8) ?u8 {
+    for (nodes, 0..) |n, i| if (std.mem.eql(u8, n.tag, tag)) return @intCast(i);
+    return null;
+}
+
+fn tagsToGroup(arena: std.mem.Allocator, nodes: []const OutboundConfig, tags: []const []const u8) ![]const u8 {
+    const max_outbounds = @import("linux/conn.zig").max_outbounds;
+    if (tags.len == 0 or tags.len > max_outbounds) {
+        @import("linux/sys.zig").log("bad config: an outbound group needs 1..{d} tags", .{max_outbounds});
+        return error.BadConfig;
+    }
+    const g = try arena.alloc(u8, tags.len);
+    for (tags, 0..) |t, i| g[i] = tagIndex(nodes, t) orelse {
+        @import("linux/sys.zig").log("bad config: unknown outbound tag {s}", .{t});
+        return error.BadConfig;
+    };
+    return g;
 }
 
 fn listenOn(spec: []const u8) !@import("linux/sys.zig").fd_t {
