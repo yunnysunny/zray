@@ -16,6 +16,7 @@ fi
 /bin/touch /mnt/zray/.scratch/ui-apply.log
 /bin/chmod 600 /mnt/zray/.scratch/ui-apply.log
 /usr/bin/ucode /usr/share/zray-ui/migrate.uc
+/usr/bin/ucode /usr/share/zray-ui/stop-legacy.uc
 for service in zray-transparent zray-ui https-dns-proxy; do
     if [ -x "/etc/init.d/$service" ]; then
         if "/etc/init.d/$service" running; then
