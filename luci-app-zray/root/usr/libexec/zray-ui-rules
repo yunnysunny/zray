@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+action="${1:-reload}"
+tables="$(/usr/sbin/nft --json list tables)"
+names="$(printf '%s' "$tables" | /usr/bin/jsonfilter -e '@.nftables[*].table.name')"
+
+remove_rules() {
+    if printf '%s\n' "$names" | /bin/grep -qx zray; then
+        /usr/sbin/nft delete table inet zray
+    fi
+}
+
+if [ "$action" = stop ]; then
+    remove_rules
+    exit 0
+fi
+
+state="$(/bin/ubus call service list '{"name":"zray-ui"}')"
+running="$(printf '%s' "$state" | /usr/bin/jsonfilter -e '@["zray-ui"].instances.proxy.running')"
+if [ "$running" != true ]; then
+    if [ "$action" = reload ]; then
+        remove_rules
+        exit 0
+    fi
+    echo '代理服务尚未运行，无法启用转发规则。' >&2
+    exit 1
+fi
+
+upstream4=''
+while IFS= read -r address; do
+    upstream4="${upstream4:+$upstream4, }$address"
+done < /mnt/zray/.scratch/ui-upstream4
+[ -n "$upstream4" ]
+lan="$(/bin/cat /mnt/zray/.scratch/ui-lan.txt)"
+/usr/sbin/nft --define "ZRAY_UPSTREAM4={ $upstream4 }" --define "ZRAY_LAN=\"$lan\"" --check --file /usr/share/zray-ui/transparent.nft
+/usr/sbin/nft --define "ZRAY_UPSTREAM4={ $upstream4 }" --define "ZRAY_LAN=\"$lan\"" --file /usr/share/zray-ui/transparent.nft

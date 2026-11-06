@@ -1,5 +1,7 @@
 # zray
 
+本 Fork 提供 OpenWrt 图形界面、节点链接导入和透明代理主开关。[安装与使用说明](docs/luci.md)。
+
 English | [简体中文](docs/README.zh-CN.md)
 
 A minimal [REALITY](https://github.com/XTLS/REALITY) client (VLESS +

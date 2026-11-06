@@ -1,3 +1,6 @@
 .zig-cache/
 zig-out/
 config.json
+.scratch/
+dist/
+node_modules/

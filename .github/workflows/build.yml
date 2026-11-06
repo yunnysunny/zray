@@ -8,25 +8,40 @@ on:
   workflow_dispatch:
 
 jobs:
+  luci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+
   build:
+    needs: luci
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: mipsel-softfloat
+            arch: mipsel_24kc
             target: mipsel-linux-musl
             cpu: mips32r2+soft_float
           - name: mips-softfloat
+            arch: mips_24kc
             target: mips-linux-musl
             cpu: mips32r2+soft_float
           - name: aarch64
+            arch: aarch64_generic
             target: aarch64-linux-musl
             cpu: baseline
           - name: arm-v7
+            arch: arm_cortex-a7_neon-vfpv4
             target: arm-linux-musleabihf
             cpu: generic+v7a
           - name: x86_64
+            arch: x86_64
             target: x86_64-linux-musl
             cpu: baseline
     steps:
@@ -43,12 +58,17 @@ jobs:
           mv out/bin/zray zray-${{ matrix.name }}
           sha256sum zray-${{ matrix.name }} > zray-${{ matrix.name }}.sha256
 
+      - name: package LuCI and transparent proxy
+        run: python3 tools/build_openwrt.py --binary zray-${{ matrix.name }} --arch ${{ matrix.arch }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: zray-${{ matrix.name }}
           path: |
             zray-${{ matrix.name }}
             zray-${{ matrix.name }}.sha256
+            dist/*.ipk
+            dist/*.ipk.sha256
           if-no-files-found: error
 
   release:

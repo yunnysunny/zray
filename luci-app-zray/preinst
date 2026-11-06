@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+umask 077
+/bin/mkdir -p /mnt/zray/.scratch
+/bin/chmod 700 /mnt/zray/.scratch
+if [ -f /mnt/zray/config.json ]; then
+    /bin/cp -p /mnt/zray/config.json /mnt/zray/.scratch/ui-migration.json
+    /bin/chmod 600 /mnt/zray/.scratch/ui-migration.json
+fi

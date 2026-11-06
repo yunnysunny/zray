@@ -1,0 +1,78 @@
+#!/usr/bin/ucode
+import * as fs from 'fs';
+import { cursor } from 'uci';
+import * as app from 'zray_ui';
+
+if (ARGV[0] == 'list') {
+    print({ status: {}, get_node: { id: '' }, logs: {}, save_nodes: { data: '' }, delete_node: { id: '' }, select_node: { id: '' }, set_enabled: { enabled: false } });
+    exit(0);
+}
+if (ARGV[0] != 'call') exit(1);
+const input = json(fs.readfile('/dev/stdin'));
+const method = ARGV[1];
+const uci = cursor();
+app.checked(uci.load('zray'), '读取 Zray 配置失败。');
+let response;
+
+if (method == 'status') response = app.status();
+else if (method == 'get_node') {
+    const matches = filter(app.nodes(true), node => node.id == input.id);
+    response = length(matches) ? { node: matches[0] } : { error: '节点不存在。' };
+}
+else if (method == 'logs') {
+    const log = fs.access('/mnt/zray/.scratch/ui-apply.log') ? fs.readfile('/mnt/zray/.scratch/ui-apply.log') : '';
+    response = { log: substr(log, -12000) };
+}
+else if (method == 'save_nodes') {
+    let incoming;
+    try { incoming = json(input.data); }
+    catch (error) { print({ error: '节点数据格式不正确：' + error.message }); exit(0); }
+    let error;
+    if (type(incoming) != 'array' || !length(incoming) || length(incoming) > 20)
+        error = '一次需要保存 1 至 20 个节点。';
+    else for (let node in incoming) {
+        error = app.validate(node);
+        if (error) break;
+        if (node.id && !length(filter(app.nodes(false), item => item.id == node.id))) {
+            error = '编辑的节点不存在。';
+            break;
+        }
+    }
+    if (error) response = { error };
+    else {
+        const existing = app.nodes(true);
+        const ids = [];
+        for (let node in incoming) {
+            const same = filter(existing, item => item.server == node.server && item.port == node.port && item.uuid == node.uuid && item.public_key == node.public_key && item.sni == node.sni && item.short_id == node.short_id);
+            const id = node.id || (length(same) ? same[0].id : app.checked(uci.add('zray', 'node'), '创建节点失败。'));
+            for (let key in ['name', 'server', 'port', 'uuid', 'sni', 'public_key', 'short_id'])
+                app.checked(uci.set('zray', id, key, '' + node[key]), '保存节点字段失败。');
+            push(ids, id);
+            if (!length(same)) push(existing, { ...node, id });
+        }
+        if (!uci.get('zray', 'main', 'node')) app.checked(uci.set('zray', 'main', 'node', ids[0]), '选择节点失败。');
+        response = app.commit(uci, uci.get('zray', 'main', 'enabled') == '1');
+        response.ids = ids;
+    }
+}
+else if (method == 'delete_node') {
+    if (!length(filter(app.nodes(false), item => item.id == input.id))) response = { error: '节点不存在。' };
+    else if (uci.get('zray', 'main', 'node') == input.id && uci.get('zray', 'main', 'enabled') == '1') response = { error: '请先关闭主开关或选择其他节点，再删除当前节点。' };
+    else {
+        if (uci.get('zray', 'main', 'node') == input.id) app.checked(uci.set('zray', 'main', 'node', ''), '更新当前节点失败。');
+        app.checked(uci.delete('zray', input.id), '删除节点失败。');
+        response = app.commit(uci, false);
+    }
+}
+else if (method == 'select_node' || method == 'set_enabled') {
+    const id = method == 'select_node' ? input.id : uci.get('zray', 'main', 'node');
+    const selected = filter(app.nodes(true), item => item.id == id);
+    if ((method == 'select_node' || input.enabled) && !length(selected)) response = { error: '请先添加并选择一个节点。' };
+    else {
+        if (method == 'select_node') app.checked(uci.set('zray', 'main', 'node', id), '选择节点失败。');
+        else app.checked(uci.set('zray', 'main', 'enabled', input.enabled ? '1' : '0'), '设置主开关失败。');
+        response = app.commit(uci, true);
+    }
+}
+else response = { error: '不支持此操作。' };
+print(response);

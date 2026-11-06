@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+umask 077
+exec /usr/bin/flock -x /var/lock/zray-ui.lock /usr/bin/ucode /usr/share/zray-ui/apply.uc

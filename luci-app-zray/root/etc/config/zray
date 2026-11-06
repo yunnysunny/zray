@@ -1,0 +1,6 @@
+config global 'main'
+    option enabled '0'
+    option node ''
+    option revision 'initial'
+    option bootstrap_dns '223.5.5.5'
+    option max_connections '128'

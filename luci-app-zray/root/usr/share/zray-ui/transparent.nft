@@ -1,0 +1,44 @@
+add table inet zray
+delete table inet zray
+
+table inet zray {
+    set upstream4 {
+        type ipv4_addr
+        elements = $ZRAY_UPSTREAM4
+    }
+    set direct4 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+            169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24,
+            192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15,
+            198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3
+        }
+    }
+    chain lan_redirect {
+        ip daddr @upstream4 counter return comment "Zray node direct"
+        ip daddr @direct4 return
+        fib daddr type local return
+        udp dport 53 counter redirect to :53 comment "Zray LAN DNS"
+        meta l4proto tcp counter redirect to :1080 comment "Zray LAN TCP"
+    }
+    chain prerouting {
+        type nat hook prerouting priority -101; policy accept;
+        iifname $ZRAY_LAN meta nfproto ipv4 jump lan_redirect
+    }
+    chain output {
+        type nat hook output priority -101; policy accept;
+        meta skuid "zray" counter return comment "Zray upstream bypass"
+        ip daddr @upstream4 return
+        meta nfproto != ipv4 return
+        ip daddr @direct4 return
+        fib daddr type local return
+        meta l4proto tcp counter redirect to :1080 comment "Zray router TCP"
+    }
+    chain forward {
+        type filter hook forward priority -1; policy accept;
+        iifname $ZRAY_LAN ip daddr @direct4 return
+        iifname $ZRAY_LAN meta nfproto ipv4 udp dport 443 counter reject with icmp type port-unreachable comment "Zray prefer HTTPS TCP"
+    }
+}

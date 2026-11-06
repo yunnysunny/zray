@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+[ -z "${IPKG_INSTROOT:-}" ] || exit 0
+umask 077
+. /lib/functions.sh
+if ! group_exists zray; then
+    zray_group="$(group_add_next zray)"
+fi
+if ! user_exists zray; then
+    zray_group="$(/bin/grep '^zray:' /etc/group | /usr/bin/cut -d: -f3)"
+    user_add zray '' "$zray_group" 'Zray proxy service' /mnt/zray /bin/false
+fi
+/bin/mkdir -p /mnt/zray/.scratch
+/bin/chmod 700 /mnt/zray/.scratch
+/bin/chmod 600 /etc/config/zray
+/bin/touch /mnt/zray/.scratch/ui-apply.log
+/bin/chmod 600 /mnt/zray/.scratch/ui-apply.log
+/usr/bin/ucode /usr/share/zray-ui/migrate.uc
+for service in zray-transparent zray-ui https-dns-proxy; do
+    if [ -x "/etc/init.d/$service" ]; then
+        if "/etc/init.d/$service" running; then
+            "/etc/init.d/$service" stop
+        fi
+        "/etc/init.d/$service" disable
+    fi
+done
+/etc/init.d/zray disable
+/usr/bin/ucode /usr/share/zray-ui/firewall.uc
+/etc/init.d/zray-ui enable
+/etc/init.d/rpcd reload
+/usr/bin/ucode /usr/share/zray-ui/enqueue.uc
+echo 'Zray 页面与节点管理已安装，设置任务已提交。'

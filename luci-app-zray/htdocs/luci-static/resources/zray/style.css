@@ -1,0 +1,38 @@
+.zray-page { --zray-green: #2dce89; --zray-blue: #337ab7; --zray-muted: #8898aa; }
+.zray-status-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin: .5rem 0; }
+.zray-status-block { padding: 1.1rem 1.25rem; border: 1px solid rgba(128,128,128,.16); border-radius: .375rem; box-shadow: 0 0 1rem rgba(136,152,170,.12); overflow-wrap: anywhere; }
+.zray-status-title { color: var(--zray-muted); font-size: .875rem; margin-bottom: .6rem; }
+.zray-status-block strong { font-size: .95rem; }
+.zray-green { color: var(--zray-green); }
+.zray-muted { color: var(--zray-muted); }
+.zray-switch-label { display: inline-flex; align-items: center; gap: .7rem; min-height: 2.25rem; cursor: pointer; }
+#zray-main-switch { appearance: none; width: 2.8rem; height: 1.5rem; border-radius: 1rem; border: 0; padding: 0; margin: 0; background: #a7b0b9; position: relative; cursor: pointer; transition: background-color .12s ease; }
+#zray-main-switch::after { content: ''; display: block; width: 1.1rem; height: 1.1rem; border-radius: 50%; background: #fff; position: absolute; top: .2rem; left: .2rem; transition: transform .12s ease; }
+#zray-main-switch:checked { background: var(--zray-blue); }
+#zray-main-switch:checked::after { transform: translateX(1.3rem); }
+#zray-main-switch:focus-visible { outline: 2px solid var(--zray-blue); outline-offset: 3px; }
+#zray-main-switch:disabled { opacity: .65; cursor: wait; }
+.zray-node-choice, .zray-actions, .zray-toolbar, .zray-dialog-tabs, .zray-dialog-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
+.zray-node-choice select { min-width: 14rem; max-width: 100%; }
+.zray-toolbar { justify-content: space-between; margin: 1rem 0; }
+.zray-toolbar span { font-size: .875rem; opacity: .8; }
+.zray-current { display: inline-block; margin-left: .6rem; padding: .1rem .4rem; color: var(--zray-blue); font-size: .75rem; border: 1px solid currentColor; border-radius: .2rem; }
+.zray-log { min-height: 12rem; max-height: 30rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 1rem; }
+.zray-node-dialog { max-width: 48rem; }
+.zray-node-dialog textarea, .zray-node-dialog input { box-sizing: border-box; width: 100%; }
+.zray-node-dialog textarea { margin: .5rem 0; font-family: monospace; }
+.zray-dialog-tabs { margin-bottom: 1rem; }
+.zray-dialog-actions { justify-content: flex-end; margin-top: 1.5rem; }
+.zray-form-error[hidden] { display: none; }
+.zray-field-label { display: block; }
+@media (max-width: 700px) {
+    .zray-status-grid { grid-template-columns: 1fr; gap: .5rem; }
+    .zray-status-block { padding: .8rem 1rem; }
+    .zray-node-choice select { width: 100%; min-width: 0; }
+    .zray-actions { justify-content: flex-start; }
+    .zray-node-dialog .cbi-value-title { float: none; width: auto; display: block; text-align: left; margin-bottom: .3rem; }
+    .zray-node-dialog .cbi-value-field { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+    #zray-main-switch, #zray-main-switch::after { transition: none; }
+}
