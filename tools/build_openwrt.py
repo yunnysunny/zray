@@ -107,7 +107,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="生成包含 Zray 程序及 LuCI 界面的 OpenWrt 软件包")
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--arch", required=True, choices=ARCHITECTURES)
-    parser.add_argument("--version", default="0.2.0-15")
+    parser.add_argument("--version", default="0.2.0-16")
     parser.add_argument("--output", default="dist", type=pathlib.Path)
     arguments = parser.parse_args()
     build(arguments.binary.resolve(), arguments.arch, arguments.version, arguments.output.resolve())
