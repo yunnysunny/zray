@@ -4,10 +4,15 @@ START=80
 STOP=15
 USE_PROCD=1
 
+boot() {
+    /usr/bin/ucode /usr/share/zray-ui/enqueue.uc
+}
+
 start_service() {
     local enabled server
     enabled="$(/sbin/uci -q get zray.main.enabled)" || return 1
     [ "$enabled" = 1 ] || return 0
+    [ "$(/sbin/uci -q get zray.main.mode)" != direct ] || return 0
     umask 077
     /usr/bin/ucode /usr/share/zray-ui/generate.uc || return 1
     /bin/chown zray:zray /mnt/zray/config.json || return 1
@@ -20,27 +25,29 @@ start_service() {
     procd_set_param user zray
     procd_set_param group zray
     procd_set_param respawn 3600 5 0
-    procd_set_param stdout 1
-    procd_set_param stderr 1
+    procd_set_param stdout 0
+    procd_set_param stderr 0
     procd_close_instance
 }
 
 service_started() {
-    local attempt=0 state running result
+    local attempt=0 state running result probe_url
     [ "$(/sbin/uci -q get zray.main.enabled)" = 1 ] || return 0
+    [ "$(/sbin/uci -q get zray.main.mode)" != direct ] || return 0
     while [ "$attempt" -lt 30 ]; do
         state="$(/bin/ubus call service list '{"name":"zray-ui"}')" || return 1
         running="$(printf '%s' "$state" | /usr/bin/jsonfilter -e '@["zray-ui"].instances.proxy.running')"
         if [ "$running" = true ]; then
-            /usr/bin/curl --silent --show-error --fail --retry 2 --retry-connrefused --retry-delay 1 --connect-timeout 2 --max-time 10 --socks5-hostname 127.0.0.1:10800 --output /dev/null https://www.gstatic.com/generate_204
+            probe_url="$(/sbin/uci -q get zray.main.probe_url)"
+            [ -n "$probe_url" ] || probe_url=https://www.gstatic.com/generate_204
+            /usr/bin/curl --silent --show-error --fail --retry 0 --connect-timeout 4 --max-time 8 --socks5-hostname 127.0.0.1:10800 --output /dev/null -- "$probe_url"
             result=$?
             if [ "$result" -ne 0 ]; then
                 echo "节点连接检测失败，curl 返回值：$result" >&2
                 return "$result"
             fi
-            /usr/libexec/zray-ui-rules start || return 1
-            /usr/bin/ucode /usr/share/zray-ui/dns.uc || return 1
-            /etc/init.d/https-dns-proxy start || return 1
+            # Cross-service DNS operations belong to the apply worker, after
+            # this procd init invocation has returned and released its locks.
             return 0
         fi
         attempt=$((attempt + 1))
@@ -51,15 +58,9 @@ service_started() {
 }
 
 stop_service() {
-    /usr/libexec/zray-ui-rules stop || return 1
-    if [ -f /mnt/zray/.scratch/ui-doh-original ]; then
-        if /etc/init.d/https-dns-proxy running; then
-            /etc/init.d/https-dns-proxy stop || return 1
-        fi
-        /usr/bin/ucode /usr/share/zray-ui/restore-dns.uc || return 1
-    fi
+    /usr/bin/ucode /usr/share/zray-ui/cleanup.uc
 }
 
 service_triggers() {
-    procd_add_interface_trigger 'interface.*' wan /etc/init.d/zray-ui restart
+    procd_add_interface_trigger 'interface.*' wan /usr/libexec/zray-ui-restart
 }

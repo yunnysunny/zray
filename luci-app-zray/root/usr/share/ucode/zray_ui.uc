@@ -1,8 +1,9 @@
 import * as fs from 'fs';
 import { cursor } from 'uci';
 import { connect } from 'ubus';
+import * as policy from 'zray_policy';
 
-export const state_path = '/mnt/zray/.scratch/ui-state.json';
+export const state_path = '/tmp/zray-ui-state.json';
 
 export function checked(result, message) {
     assert(result !== false && result !== null, message);
@@ -11,7 +12,8 @@ export function checked(result, message) {
 
 export function settings() {
     const uci = cursor();
-    return uci.get_all('zray', 'main');
+    const config = uci.get_all('zray', 'main');
+    return { ...config, ...policy.options(config) };
 };
 
 export function nodes(secret) {
@@ -45,11 +47,12 @@ export function validate(node) {
 };
 
 export function state() {
-    if (!fs.access(state_path)) return { revision: '', phase: 'idle', error: '' };
+    if (!fs.access(state_path)) return { revision: settings().revision, phase: 'idle', error: '' };
     return json(checked(fs.readfile(state_path), '读取服务状态失败：' + fs.error()));
 };
 
 export function write_state(value) {
+    if (value.error) value.error = substr(value.error, 0, 1024);
     checked(fs.writefile(state_path + '.new', value), '写入服务状态失败：' + fs.error());
     checked(fs.rename(state_path + '.new', state_path), '保存服务状态失败：' + fs.error());
 };
@@ -91,7 +94,8 @@ export function status() {
     const pending = current.revision != config.revision || current.phase == 'applying';
     return {
         enabled: config.enabled == '1', node: config.node || '', revision: config.revision,
-        running: live('zray-ui') && rules_active(), dns_running: live('https-dns-proxy'),
+        running: live('zray-ui') && rules_active(), dns_running: live('zray-dns'),
+        options: policy.options(config), ipv6_warning: config.ipv6_policy == 'passthrough',
         pending, phase: current.phase, error: current.error || '', nodes: nodes(false)
     };
 };
@@ -101,7 +105,7 @@ export function commit(uci, apply) {
     checked(uci.set('zray', 'main', 'revision', revision), '更新设置版本失败。');
     checked(uci.save('zray'), '保存设置失败：' + uci.error());
     checked(uci.commit('zray'), '提交设置失败：' + uci.error());
-    const child = checked(fs.popen('/usr/libexec/zray-ui-apply >>/mnt/zray/.scratch/ui-apply.log 2>&1 &', 'r'), '启动设置任务失败。');
+    const child = checked(fs.popen('/usr/libexec/zray-ui-apply >/dev/null 2>&1 &', 'r'), '启动设置任务失败。');
     checked(child.close() == 0, '提交设置任务失败。');
     return { ok: true, revision };
 };

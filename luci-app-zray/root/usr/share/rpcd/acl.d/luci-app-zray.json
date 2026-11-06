@@ -1,7 +1,7 @@
 {
   "luci-app-zray": {
     "description": "管理 Zray 节点和透明代理",
-    "read": { "ubus": { "zray": ["status", "get_node", "logs"] } },
-    "write": { "ubus": { "zray": ["save_nodes", "delete_node", "select_node", "set_enabled"] } }
+    "read": { "ubus": { "zray": ["status", "get_node", "resources", "devices", "export_nodes"] } },
+    "write": { "ubus": { "zray": ["save_nodes", "delete_node", "select_node", "set_enabled", "save_options", "test_node", "subscription"] } }
   }
 }

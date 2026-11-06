@@ -1,5 +1,6 @@
 config global 'main'
     option enabled '0'
+    option failure_policy 'direct'
     option node ''
     option revision 'initial'
     option migration_done '0'

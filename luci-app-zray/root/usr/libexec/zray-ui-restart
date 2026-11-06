@@ -1,0 +1,7 @@
+#!/usr/bin/ucode
+import * as fs from 'fs';
+import { cursor } from 'uci';
+import * as app from 'zray_ui';
+if (app.settings().enabled != '1') exit(0);
+if (fs.access('/tmp/zray-ui-applied-options')) fs.unlink('/tmp/zray-ui-applied-options');
+app.commit(cursor(), true);

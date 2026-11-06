@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+umask 077
+while true; do
+    interval="$(uci -q get zray.main.health_interval || true)"
+    case "$interval" in ''|*[!0-9]*) interval=60 ;; esac
+    [ "$interval" -ge 30 ] && [ "$interval" -le 3600 ] || interval=60
+    sleep "$interval"
+    if [ "$(uci -q get zray.main.enabled)" = 1 ]; then
+        /usr/bin/flock -n /var/lock/zray-ui.lock /usr/bin/ucode /usr/share/zray-ui/health.uc >/dev/null 2>&1 || :
+    fi
+done

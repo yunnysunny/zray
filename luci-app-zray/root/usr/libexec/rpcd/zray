@@ -2,9 +2,11 @@
 import * as fs from 'fs';
 import { cursor } from 'uci';
 import * as app from 'zray_ui';
+import * as monitor from 'zray_monitor';
+import * as manage from 'zray_manage';
 
 if (ARGV[0] == 'list') {
-    print({ status: {}, get_node: { id: '' }, logs: {}, save_nodes: { data: '' }, delete_node: { id: '' }, select_node: { id: '' }, set_enabled: { enabled: false } });
+    print({ status: {}, resources: {}, devices: {}, save_options: { data: '' }, test_node: { id: '' }, subscription: { url: '' }, export_nodes: {}, get_node: { id: '' }, save_nodes: { data: '' }, delete_node: { id: '' }, select_node: { id: '' }, set_enabled: { enabled: false } });
     exit(0);
 }
 if (ARGV[0] != 'call') exit(1);
@@ -14,22 +16,24 @@ const uci = cursor();
 app.checked(uci.load('zray'), '读取 Zray 配置失败。');
 let response;
 
-if (method == 'status') response = app.status();
+if (method == 'status') response = { ...app.status(), health: monitor.health() };
+else if (method == 'resources') response = monitor.resources();
+else if (method == 'devices') response = { devices: manage.devices() };
+else if (method == 'save_options') response = manage.save_options(json(input.data));
+else if (method == 'test_node') response = manage.test_node(input.id);
+else if (method == 'subscription') response = manage.subscription(input.url);
+else if (method == 'export_nodes') response = { version: 1, nodes: app.nodes(true) };
 else if (method == 'get_node') {
     const matches = filter(app.nodes(true), node => node.id == input.id);
     response = length(matches) ? { node: matches[0] } : { error: '节点不存在。' };
-}
-else if (method == 'logs') {
-    const log = fs.access('/mnt/zray/.scratch/ui-apply.log') ? fs.readfile('/mnt/zray/.scratch/ui-apply.log') : '';
-    response = { log: substr(log, -12000) };
 }
 else if (method == 'save_nodes') {
     let incoming;
     try { incoming = json(input.data); }
     catch (error) { print({ error: '节点数据格式不正确：' + error.message }); exit(0); }
     let error;
-    if (type(incoming) != 'array' || !length(incoming) || length(incoming) > 20)
-        error = '一次需要保存 1 至 20 个节点。';
+    if (type(incoming) != 'array' || !length(incoming) || length(incoming) > 256)
+        error = '一次需要保存 1 至 256 个节点。';
     else for (let node in incoming) {
         error = app.validate(node);
         if (error) break;
@@ -57,6 +61,7 @@ else if (method == 'save_nodes') {
 }
 else if (method == 'delete_node') {
     if (!length(filter(app.nodes(false), item => item.id == input.id))) response = { error: '节点不存在。' };
+    else if (index(app.settings().backup_nodes, input.id) >= 0) response = { error: '请先从备用节点列表中移除此节点。' };
     else if (uci.get('zray', 'main', 'node') == input.id && uci.get('zray', 'main', 'enabled') == '1') response = { error: '请先关闭主开关或选择其他节点，再删除当前节点。' };
     else {
         if (uci.get('zray', 'main', 'node') == input.id) app.checked(uci.set('zray', 'main', 'node', ''), '更新当前节点失败。');

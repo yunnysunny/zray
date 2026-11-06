@@ -1,38 +1,39 @@
-.zray-page { --zray-green: #2dce89; --zray-blue: #337ab7; --zray-muted: #8898aa; }
-.zray-status-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin: .5rem 0; }
-.zray-status-block { padding: 1.1rem 1.25rem; border: 1px solid rgba(128,128,128,.16); border-radius: .375rem; box-shadow: 0 0 1rem rgba(136,152,170,.12); overflow-wrap: anywhere; }
-.zray-status-title { color: var(--zray-muted); font-size: .875rem; margin-bottom: .6rem; }
-.zray-status-block strong { font-size: .95rem; }
+.zray-page { --zray-green: #21864b; --zray-blue: #337ab7; --zray-muted: #697782; }
+.zray-page > .cbi-tabmenu { margin-left: 0; margin-right: 0; width: auto; max-width: 100%; box-sizing: border-box; }
 .zray-green { color: var(--zray-green); }
 .zray-muted { color: var(--zray-muted); }
+.zray-basic { max-width: 48rem; margin: 1.25rem 0; }
 .zray-switch-label { display: inline-flex; align-items: center; gap: .7rem; min-height: 2.25rem; cursor: pointer; }
-#zray-main-switch { appearance: none; width: 2.8rem; height: 1.5rem; border-radius: 1rem; border: 0; padding: 0; margin: 0; background: #a7b0b9; position: relative; cursor: pointer; transition: background-color .12s ease; }
-#zray-main-switch::after { content: ''; display: block; width: 1.1rem; height: 1.1rem; border-radius: 50%; background: #fff; position: absolute; top: .2rem; left: .2rem; transition: transform .12s ease; }
+#zray-main-switch { appearance: none; width: 2.8rem; height: 1.5rem; border-radius: 1rem; border: 0; padding: 0; margin: 0; background: #a7b0b9; position: relative; cursor: pointer; }
+#zray-main-switch::after { content: ''; width: 1.1rem; height: 1.1rem; border-radius: 50%; background: #fff; position: absolute; top: .2rem; left: .2rem; }
 #zray-main-switch:checked { background: var(--zray-blue); }
 #zray-main-switch:checked::after { transform: translateX(1.3rem); }
-#zray-main-switch:focus-visible { outline: 2px solid var(--zray-blue); outline-offset: 3px; }
-#zray-main-switch:disabled { opacity: .65; cursor: wait; }
-.zray-node-choice, .zray-actions, .zray-toolbar, .zray-dialog-tabs, .zray-dialog-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
-.zray-node-choice select { min-width: 14rem; max-width: 100%; }
+#zray-main-switch:focus-visible, .zray-menu > summary:focus-visible { outline: 2px solid var(--zray-blue); outline-offset: 3px; }
+#zray-main-switch:disabled { opacity: .65; cursor: not-allowed; }
+.zray-actions, .zray-toolbar, .zray-dialog-tabs, .zray-dialog-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
 .zray-toolbar { justify-content: space-between; margin: 1rem 0; }
-.zray-toolbar span { font-size: .875rem; opacity: .8; }
-.zray-current { display: inline-block; margin-left: .6rem; padding: .1rem .4rem; color: var(--zray-blue); font-size: .75rem; border: 1px solid currentColor; border-radius: .2rem; }
-.zray-log { min-height: 12rem; max-height: 30rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 1rem; }
-.zray-node-dialog { max-width: 48rem; }
-.zray-node-dialog textarea, .zray-node-dialog input { box-sizing: border-box; width: 100%; }
-.zray-node-dialog textarea { margin: .5rem 0; font-family: monospace; }
+.zray-current { margin-left: .6rem; color: var(--zray-blue); font-size: .8rem; }
+.zray-node-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid rgba(128,128,128,.2); }
+.zray-node-name { min-width: 0; overflow-wrap: anywhere; }
+.zray-menu { position: relative; }
+.zray-menu > summary { cursor: pointer; padding: .4rem .7rem; }
+.zray-menu-items { position: absolute; right: 0; top: 100%; z-index: 5; display: flex; flex-direction: column; gap: .4rem; min-width: 9rem; padding: .6rem; background: var(--background-color, Canvas); color: CanvasText; border: 1px solid rgba(128,128,128,.4); border-radius: .2rem; }
+.zray-settings-row { padding: 1rem 0; border-bottom: 1px solid rgba(128,128,128,.2); }
+.zray-settings-row p { margin: .4rem 0 0; }
+.zray-diagnostics { padding: 1rem 0; }
+.zray-diagnostics dl { display: grid; grid-template-columns: minmax(8rem, auto) 1fr; gap: .4rem 1rem; }
+.zray-diagnostics dd { margin: 0; overflow-wrap: anywhere; }
+.zray-connection-details { margin: 1rem 0; }
+.zray-node-dialog, .zray-settings-dialog { max-width: 48rem; }
+.zray-node-dialog textarea, .zray-node-dialog input, .zray-settings-dialog textarea { box-sizing: border-box; width: 100%; }
 .zray-dialog-tabs { margin-bottom: 1rem; }
 .zray-dialog-actions { justify-content: flex-end; margin-top: 1.5rem; }
-.zray-form-error[hidden] { display: none; }
+.zray-page [hidden], .zray-settings-dialog [hidden] { display: none !important; }
 .zray-field-label { display: block; }
 @media (max-width: 700px) {
-    .zray-status-grid { grid-template-columns: 1fr; gap: .5rem; }
-    .zray-status-block { padding: .8rem 1rem; }
-    .zray-node-choice select { width: 100%; min-width: 0; }
-    .zray-actions { justify-content: flex-start; }
-    .zray-node-dialog .cbi-value-title { float: none; width: auto; display: block; text-align: left; margin-bottom: .3rem; }
-    .zray-node-dialog .cbi-value-field { margin-left: 0; }
-}
-@media (prefers-reduced-motion: reduce) {
-    #zray-main-switch, #zray-main-switch::after { transition: none; }
+    .zray-basic select { width: 100%; min-width: 0; box-sizing: border-box; }
+    .zray-node-row { align-items: flex-start; flex-direction: column; gap: .6rem; }
+    .zray-node-row > .zray-actions { align-self: flex-end; }
+    .zray-node-dialog .cbi-value-title, .zray-settings-dialog .cbi-value-title { float: none; width: auto; display: block; text-align: left; margin-bottom: .3rem; }
+    .zray-node-dialog .cbi-value-field, .zray-settings-dialog .cbi-value-field { margin-left: 0; }
 }

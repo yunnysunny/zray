@@ -5,3 +5,9 @@ if /etc/init.d/zray-ui running; then
     /etc/init.d/zray-ui stop
 fi
 /etc/init.d/zray-ui disable
+if /etc/init.d/zray-dns running; then
+    /etc/init.d/zray-dns stop
+fi
+/etc/init.d/zray-dns disable
+/etc/init.d/zray-health stop
+/etc/init.d/zray-health disable

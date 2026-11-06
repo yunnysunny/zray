@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+USE_PROCD=1
+START=81
+STOP=14
+start_service() {
+    local url bootstrap
+    url="$(uci -q get https-dns-proxy.zray.resolver_url)" || return 1
+    bootstrap="$(uci -q get https-dns-proxy.zray.bootstrap_dns)" || return 1
+    procd_open_instance dns
+    procd_set_param command /usr/sbin/https-dns-proxy -4 -r "$url" -a 127.0.0.1 -p 5053 -b "$bootstrap" -t socks5h://127.0.0.1:10800 -u nobody -g nogroup
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}
