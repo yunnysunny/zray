@@ -108,7 +108,8 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `tls_verify` | — | 仅 `security = "tls"` 时使用，且必填。目前只实现了 `"none"`（不校验证书，等同 `allowInsecure`）；`"ca"`、`"pin"` 预留，暂时会被拒绝。 |
 | `uuid` | — | VLESS 用户 id。 |
 | `max_connections` | `128` | 连接槽位数。每个槽位约 92 KiB，启动时分配。 |
-| `handshake_timeout_s` | `15` | TCP 连接 + TLS 握手的总时限。 |
+| `handshake_timeout_s` | `15` | 入站侧时限：SOCKS5 握手、选定上游之前等待客户端。 |
+| `connect_timeout_s` | `5` | 单次上游尝试（TCP 连接、hop SOCKS、TLS、WS 升级）的硬时限，有流量也不延长；超时即换组内下一个成员。 |
 | `idle_timeout_s` | `600` | 双向都无流量多久后关闭。 |
 | `sock_buf` | `0` | 每个 socket 的 `SO_SNDBUF` / `SO_RCVBUF`；`0` 用内核默认。 |
 
@@ -163,9 +164,40 @@ Wi-Fi、运营商中间设备、上游被入侵的路由器）都可以冒充服
 `a.example.com`，不匹配 `notexample.com`），`outbound` 是该组的 tag 列表。
 `default` 是都不匹配时使用的组，默认第一个节点。`fail_backoff_s`（默认 30）
 是某个成员连接失败后被跳过的秒数；只在**同一组**内换下一个，命中的规则不会
-退回到别的组或 `default`。最多 16 个节点。UDP 只走带 Vision 的 TCP 节点。
+退回到别的组或 `default`。切换只会换到不在 backoff 期的成员；组内全部处于
+backoff 时，每条连接只探测一次，失败即断开。最多 16 个节点。UDP 只走带 Vision 的 TCP 节点。
 目标是 IP 且可能命中规则时，最多等 1 秒嗅探 SNI / Host，否则用 `default`。
 示例见 [config.example.routing.json](../config.example.routing.json)。
+
+#### WebSocket 和链式在小路由器上的代价
+
+在上面那台 MT7621 上实测（单线程，每次只跑一个 20–30 MB 下载，relay 在日本）。
+“每 MB CPU”是 zray 自身每传 1 MB 消耗的 CPU 时间。
+
+| 路径 | 吞吐 | 每 MB CPU |
+|---|---|---|
+| 单个 REALITY + Vision 节点 | 5–7 MB/s | 0.03–0.05 s |
+| 链式，relay 和 exit 都是 REALITY + Vision | 1.2–6 MB/s | 0.10–0.15 s（约 3 倍） |
+| 单个 `network: "ws"` 节点（TLS，无 Vision） | 约 0.5 MB/s | 0.65–1.0 s（15–30 倍） |
+| 链式，Vision relay → ws exit | 约 0.55 MB/s | 约 1.0 s |
+
+- Vision 在内层 TLS 建立后让 zray 不再加解密，所以每字节几乎不花 CPU。`ws` 节点
+  （以及任何 `flow: "none"` 的节点）整条连接都要保留外层 TLS，MIPS 核心要用软件
+  加解密每一个字节。按每 MB 1 秒算，即使线路够快，单核也就 1–1.5 MB/s 左右（上表
+  约 0.5 MB/s 的上限在节点，不在 CPU）。ws 出口适合 AI 聊天这类小流量，不适合下载
+  和视频；`default` 应保持在 Vision 节点上。
+- relay 用 Vision 的链式额外加密很少，但每个字节要在本机回环 hop 上多走两趟，这就
+  是第二行约 3 倍的来源。
+- 每条链式连接占**两个**槽位（客户端那条和它的 hop 连接），每个约 93 KiB。
+  `max_connections` 要按并发链式连接数的两倍估算，并且不超过路由器的空闲内存
+  （启动日志会打印 `N slots x 93 KiB`）。空闲内存只有 20 MB 左右的机器，32–64
+  个槽位比较合适。
+- 链式节点失败时，日志会指出是哪一段的问题，例如
+  `outbound exit-a failed: connect timeout; relay up, no reply from exit -> exit side`
+  或 `...; relay TCP connect pending -> relay side`。无论哪一段出问题，backoff
+  都记在链式节点本身。
+- hop 监听绑定在 `127.0.0.1` 的随机端口上，没有认证：本机任何进程都能把它当成
+  经 dialer 节点出去的 SOCKS 代理。在路由器上通常只有 zray 自己会连它。
 
 ## 部署到 OpenWrt
 

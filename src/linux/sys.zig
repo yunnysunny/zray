@@ -109,6 +109,13 @@ pub fn udpSocket(fam: u32) Error!fd_t {
     return @intCast(rc);
 }
 
+pub fn peerAddr(fd: fd_t) Error!SockAddr {
+    var raw: linux.sockaddr.in6 = undefined;
+    var alen: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+    _ = try check(linux.getpeername(fd, @ptrCast(&raw), &alen));
+    return SockAddr.fromRaw(&raw);
+}
+
 pub fn localAddr(fd: fd_t) Error!SockAddr {
     var raw: linux.sockaddr.in6 = undefined;
     var alen: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
@@ -265,6 +272,12 @@ pub fn monotonicSeconds() u64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &ts);
     return @intCast(ts.sec);
+}
+
+pub fn monotonicMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 
 pub fn realtimeSeconds() i64 {

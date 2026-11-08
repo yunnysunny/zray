@@ -70,6 +70,9 @@ pub const Config = struct {
     default_group: []const u8,
     handshake_timeout_s: u64 = 15,
     idle_timeout_s: u64 = 600,
+    /// Hard deadline for one upstream attempt (TCP connect, hop SOCKS, TLS,
+    /// WS upgrade). Not extended by traffic; on expiry the next member is tried.
+    connect_timeout_s: u64 = 5,
     /// Per-socket SO_RCVBUF / SO_SNDBUF; 0 = kernel default.
     sock_buf: i32 = 0,
     /// Replace redirected IP targets with the sniffed TLS SNI / HTTP Host.
@@ -117,6 +120,14 @@ pub const State = enum {
     /// TLS up, HTTP Upgrade sent, waiting for 101.
     ws_upgrade,
     relay,
+};
+
+/// Snapshot of a hop connection, used to say which leg of a chain failed.
+pub const HopEnd = struct {
+    ob: u8,
+    state: State,
+    got_resp_hdr: bool,
+    why: []const u8,
 };
 
 pub const Conn = struct {
@@ -180,7 +191,17 @@ pub const Conn = struct {
     ob: u8 = 0,
     /// Pinned outbound (hop listener connections).
     forced: ?u8 = null,
-    born: u64 = 0,
+    /// Loopback port pairing a chained connection with its hop connection.
+    /// Chained side: local port of up_fd (0 = outbound not chained).
+    chain_lport: u16 = 0,
+    /// Hop side: peer port of client_fd (0 = not a hop connection).
+    hop_peer: u16 = 0,
+    /// Chained side: how the paired hop connection ended, if it already did.
+    hop_end: ?HopEnd = null,
+    /// When sniffing started (ms).
+    sniff_since_ms: u64 = 0,
+    /// Current upstream attempt must reach .relay before this (ms).
+    attempt_deadline_ms: u64 = 0,
     vision_on: bool = true,
     ws_on: bool = false,
     wsd: ws.Deframer = .{},
@@ -256,7 +277,10 @@ pub const Loop = struct {
         c.tried_mask = 0;
         c.group = &.{};
         c.last_active = sys.monotonicSeconds();
-        c.born = c.last_active;
+        c.attempt_deadline_ms = 0;
+        c.hop_end = null;
+        c.chain_lport = 0;
+        c.hop_peer = if (forced == null) 0 else if (sys.peerAddr(fd)) |a| a.getPort() else |_| 0;
         sys.setNoDelay(fd);
         if (l.cfg.sock_buf > 0) sys.setBufferSizes(fd, l.cfg.sock_buf, l.cfg.sock_buf);
         sys.epollAdd(l.ep, fd, sys.EPOLL.IN | sys.EPOLL.RDHUP, c.token(.client)) catch {
@@ -297,6 +321,9 @@ pub const Loop = struct {
     pub fn close(l: *Loop, c: *Conn, why: []const u8) void {
         if (c.state == .free) return;
         sys.log("[{d}] close: {s}", .{ c.slot, why });
+        if (c.hop_peer != 0) {
+            if (l.findChained(c.hop_peer)) |a| a.hop_end = .{ .ob = c.ob, .state = c.state, .got_resp_hdr = c.got_resp_hdr, .why = why };
+        }
         if (c.client_fd >= 0) {
             sys.epollDel(l.ep, c.client_fd);
             sys.close(c.client_fd);
@@ -319,9 +346,10 @@ pub const Loop = struct {
     /// Close connections that have been idle too long.
     pub fn sweep(l: *Loop) void {
         const now = sys.monotonicSeconds();
+        const now_ms = sys.monotonicMs();
         for (l.conns) |*c| {
             if (c.state == .free) continue;
-            if (c.state == .sniffing and now - c.born >= 1) {
+            if (c.state == .sniffing and now_ms - c.sniff_since_ms >= 1000) {
                 // Server-first protocol (or a slow client): use the default route.
                 c.group = l.cfg.default_group;
                 l.startUpstream(c) catch |e| {
@@ -331,10 +359,12 @@ pub const Loop = struct {
                 l.updateInterest(c);
                 continue;
             }
-            const limit = if (c.state == .relay) l.cfg.idle_timeout_s else l.cfg.handshake_timeout_s;
-            if (now - c.last_active > limit) {
-                if (l.preRelay(c)) l.retry(c, "handshake timeout") else l.close(c, "timeout");
+            if (l.preRelay(c)) {
+                if (now_ms >= c.attempt_deadline_ms) l.retryAndUpdate(c, "connect timeout");
+                continue;
             }
+            const limit = if (c.state == .relay) l.cfg.idle_timeout_s else l.cfg.handshake_timeout_s;
+            if (now - c.last_active > limit) l.close(c, "timeout");
         }
     }
 
@@ -445,6 +475,10 @@ pub const Loop = struct {
         };
         if (n == 0) {
             c.client_eof = true;
+            // Hop connection whose chained outbound gave up before the relay
+            // answered (dead exit): nobody is left to read the reply, and the
+            // relay may keep dialing for a minute. Free the slot now.
+            if (c.forced != null and !c.got_resp_hdr) return error.HopClientGone;
             // Nothing more to forward: let upstream finish, then close on its EOF.
             if (c.state == .relay and c.cin_len == 0 and c.up_out_len == 0) {
                 if (c.fullyDirect()) sys.shutdownWrite(c.up_fd) else {
@@ -688,6 +722,7 @@ pub const Loop = struct {
             c.group = l.cfg.default_group;
         } else {
             c.state = .sniffing;
+            c.sniff_since_ms = sys.monotonicMs();
             if (c.cin_len > 0) try l.sniffRoute(c);
             return;
         }
@@ -709,8 +744,10 @@ pub const Loop = struct {
         };
     }
 
-    /// Try group members: on try k take the k-th healthy member, then the
-    /// recently failed ones, so every member is tried at most once.
+    /// Try group members: the first attempt takes the first healthy member
+    /// (or, if all are in backoff, the first member as a probe); failover
+    /// only moves to untried healthy members, so a dead group costs one
+    /// attempt instead of one per member.
     fn startUpstream(l: *Loop, c: *Conn) !void {
         const now = sys.monotonicSeconds();
         while (c.tries < c.group.len) {
@@ -720,13 +757,14 @@ pub const Loop = struct {
                 order[n] = i;
                 n += 1;
             };
+            const n_healthy = n;
             for (c.group) |i| if (l.bad_until[i] > now) {
                 order[n] = i;
                 n += 1;
             };
-            // Members already tried were marked bad and moved to the back;
-            // the untried healthy ones stay in front.
-            const i = order[if (c.tries == 0) 0 else firstUntried(order[0..n], c)];
+            // Members already tried were marked bad and moved to the back.
+            const k = if (c.tries == 0) 0 else firstUntried(order[0..n_healthy], c) orelse break;
+            const i = order[k];
             c.tries += 1;
             c.ob = i;
             c.tried_mask |= @as(u16, 1) << @intCast(i);
@@ -740,13 +778,61 @@ pub const Loop = struct {
         return error.AllOutboundsFailed;
     }
 
-    fn firstUntried(order: []const u8, c: *const Conn) usize {
+    /// Silence or a dropped stream: could be either leg of a chain.
+    fn isTransportFailure(why: []const u8) bool {
+        const names = [_][]const u8{ "connect timeout", "upstream hup", "UpstreamEof", "UpstreamCloseNotify", "ConnectionReset", "BrokenPipe", "HopSocksRejected" };
+        for (names) |n| if (mem.eql(u8, why, n)) return true;
+        return false;
+    }
+
+    /// Which leg of a chain was stuck, judged from the hop connection.
+    fn hopLeg(e: HopEnd) []const u8 {
+        return switch (e.state) {
+            .socks_greeting, .socks_request => "hop: SOCKS not finished -> local",
+            .connecting => "TCP connect pending -> relay side",
+            .socks_dial, .tls_handshake, .ws_upgrade => "handshake pending -> relay side",
+            .relay => if (e.got_resp_hdr) "up, exit replied -> exit side" else "up, no reply from exit -> exit side",
+            else => @tagName(e.state),
+        };
+    }
+
+    /// The chained connection (still attempting) that owns hop port `p`.
+    fn findChained(l: *Loop, p: u16) ?*Conn {
+        for (l.conns) |*a| if (a.state != .free and a.chain_lport == p and l.preRelay(a) and a.up_fd >= 0) return a;
+        return null;
+    }
+
+    /// The live hop connection accepted from local port `p`.
+    fn findHop(l: *Loop, p: u16) ?*Conn {
+        for (l.conns) |*b| if (b.state != .free and b.hop_peer == p) return b;
+        return null;
+    }
+
+    fn firstUntried(order: []const u8, c: *const Conn) ?usize {
         for (order, 0..) |i, k| if (c.tried_mask & (@as(u16, 1) << @intCast(i)) == 0) return k;
-        return 0;
+        return null;
     }
 
     fn markBad(l: *Loop, c: *Conn, why: []const u8) void {
-        sys.log("[{d}] outbound {s} failed: {s}", .{ c.slot, l.cfg.outbounds[c.ob].tag, why });
+        const tag = l.cfg.outbounds[c.ob].tag;
+        if (c.chain_lport != 0 and !isTransportFailure(why)) {
+            // The exit's handshake itself failed (bad reply, rejected key,
+            // config): the relay leg is irrelevant.
+            sys.log("[{d}] outbound {s} failed: {s}; exit handshake error -> exit side", .{ c.slot, tag, why });
+        } else if (c.chain_lport != 0) {
+            const end: ?HopEnd = c.hop_end orelse if (l.findHop(c.chain_lport)) |b|
+                HopEnd{ .ob = b.ob, .state = b.state, .got_resp_hdr = b.got_resp_hdr, .why = "" }
+            else
+                null;
+            if (end) |e| {
+                const relay = l.cfg.outbounds[e.ob].tag;
+                const leg = hopLeg(e);
+                if (e.why.len > 0)
+                    sys.log("[{d}] outbound {s} failed: {s}; {s} {s} (hop closed: {s})", .{ c.slot, tag, why, relay, leg, e.why })
+                else
+                    sys.log("[{d}] outbound {s} failed: {s}; {s} {s}", .{ c.slot, tag, why, relay, leg });
+            } else sys.log("[{d}] outbound {s} failed: {s}; hop connection never accepted", .{ c.slot, tag, why });
+        } else sys.log("[{d}] outbound {s} failed: {s}", .{ c.slot, tag, why });
         l.bad_until[c.ob] = sys.monotonicSeconds() + l.cfg.fail_backoff_s;
     }
 
@@ -788,7 +874,11 @@ pub const Loop = struct {
         c.up_out_off = 0;
         c.up_out_len = 0;
         c.last_active = sys.monotonicSeconds();
+        c.attempt_deadline_ms = sys.monotonicMs() + l.cfg.connect_timeout_s * 1000;
+        c.hop_end = null;
+        c.chain_lport = 0;
         const immediate = try sys.connect(fd, &ob.addr);
+        if (ob.hop_host.len > 0) c.chain_lport = if (sys.localAddr(fd)) |a| a.getPort() else |_| 0;
         const ev: u32 = sys.EPOLL.OUT | sys.EPOLL.RDHUP;
         try sys.epollAdd(l.ep, fd, ev, c.token(.upstream));
         c.up_ev = ev;
