@@ -10,7 +10,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const reality = @import("tls/reality.zig");
 
-pub const version = "0.2.0";
+pub const version = "0.3.0";
 
 /// How the upstream is authenticated. Chosen explicitly so a mistyped or
 /// missing `public_key` fails at startup instead of quietly downgrading a
