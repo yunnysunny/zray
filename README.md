@@ -224,6 +224,40 @@ and a rule might apply, zray waits up to one second for a TLS SNI or HTTP
 }
 ```
 
+#### What WebSocket and chaining cost on a small router
+
+Measured on the MT7621 box above (single thread, one 20-30 MB download at a
+time, relay in Japan). CPU is zray's own CPU time per MB transferred.
+
+| path | throughput | CPU per MB |
+|---|---|---|
+| one REALITY + Vision node | 5-7 MB/s | 0.03-0.05 s |
+| chain, relay and exit both REALITY + Vision | 1.2-6 MB/s | 0.10-0.15 s (~3x) |
+| one `network: "ws"` node (TLS, no Vision) | ~0.5 MB/s | 0.65-1.0 s (15-30x) |
+| chain, Vision relay -> ws exit | ~0.55 MB/s | ~1.0 s |
+
+- Vision lets zray stop encrypting once the inner TLS is up, so a Vision node
+  costs almost nothing per byte. A `ws` node (and any `flow: "none"` node)
+  keeps the outer TLS for the whole connection, and the MIPS core encrypts
+  every byte in software. At 1 s per MB one core tops out around 1-1.5 MB/s
+  even on a fast line (the ~0.5 MB/s above was the node, not the CPU). Use
+  ws exits for low-volume traffic such as AI chat sites, not downloads or
+  video, and keep `default` on a Vision node.
+- A chain whose relay uses Vision adds little crypto, but every byte crosses
+  the loopback hop twice more; that is the ~3x in the second row.
+- Each chained connection takes **two** slots (the client side and its hop
+  connection), each ~93 KiB. Size `max_connections` for twice the number of
+  concurrent chained connections, within the memory the router has free (the
+  startup log prints `N slots x 93 KiB`). On a box with ~20 MB available,
+  32-64 slots is a sensible ceiling.
+- When a chained outbound fails, the log says which leg was at fault, e.g.
+  `outbound exit-a failed: connect timeout; relay up, no reply from exit -> exit side`
+  or `...; relay TCP connect pending -> relay side`. Backoff is still
+  charged to the chained outbound either way.
+- The hop listener binds `127.0.0.1` on a random port without
+  authentication: any local process can use it as a SOCKS proxy through the
+  dialer outbound. On a router this is normally only zray itself.
+
 ## Deploying on OpenWrt
 
 See [deploy/](deploy/) for a procd init script and a config template.
