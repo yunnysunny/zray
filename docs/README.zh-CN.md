@@ -108,7 +108,8 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `tls_verify` | — | 仅 `security = "tls"` 时使用，且必填。目前只实现了 `"none"`（不校验证书，等同 `allowInsecure`）；`"ca"`、`"pin"` 预留，暂时会被拒绝。 |
 | `uuid` | — | VLESS 用户 id。 |
 | `max_connections` | `128` | 连接槽位数。每个槽位约 92 KiB，启动时分配。 |
-| `handshake_timeout_s` | `15` | TCP 连接 + TLS 握手的总时限。 |
+| `handshake_timeout_s` | `15` | 入站侧时限：SOCKS5 握手、选定上游之前等待客户端。 |
+| `connect_timeout_s` | `5` | 单次上游尝试（TCP 连接、hop SOCKS、TLS、WS 升级）的硬时限，有流量也不延长；超时即换组内下一个成员。 |
 | `idle_timeout_s` | `600` | 双向都无流量多久后关闭。 |
 | `sock_buf` | `0` | 每个 socket 的 `SO_SNDBUF` / `SO_RCVBUF`；`0` 用内核默认。 |
 
@@ -163,7 +164,8 @@ Wi-Fi、运营商中间设备、上游被入侵的路由器）都可以冒充服
 `a.example.com`，不匹配 `notexample.com`），`outbound` 是该组的 tag 列表。
 `default` 是都不匹配时使用的组，默认第一个节点。`fail_backoff_s`（默认 30）
 是某个成员连接失败后被跳过的秒数；只在**同一组**内换下一个，命中的规则不会
-退回到别的组或 `default`。最多 16 个节点。UDP 只走带 Vision 的 TCP 节点。
+退回到别的组或 `default`。切换只会换到不在 backoff 期的成员；组内全部处于
+backoff 时，每条连接只探测一次，失败即断开。最多 16 个节点。UDP 只走带 Vision 的 TCP 节点。
 目标是 IP 且可能命中规则时，最多等 1 秒嗅探 SNI / Host，否则用 `default`。
 示例见 [config.example.routing.json](../config.example.routing.json)。
 

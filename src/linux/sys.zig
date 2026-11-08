@@ -267,6 +267,12 @@ pub fn monotonicSeconds() u64 {
     return @intCast(ts.sec);
 }
 
+pub fn monotonicMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
 pub fn realtimeSeconds() i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &ts);

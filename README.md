@@ -124,7 +124,8 @@ inner connection presents.
 | `tls_verify` | ? | `security = "tls"` only, and then mandatory. Only `"none"` (no certificate verification, like `allowInsecure`) is implemented; `"ca"` and `"pin"` are reserved and rejected for now. |
 | `uuid` | ? | VLESS user id. |
 | `max_connections` | `128` | Connection slots. Each slot is ~92 KiB, allocated at startup. |
-| `handshake_timeout_s` | `15` | TCP connect + TLS handshake deadline. |
+| `handshake_timeout_s` | `15` | Inbound side: SOCKS5 handshake / waiting for the client before an upstream is chosen. |
+| `connect_timeout_s` | `5` | Hard deadline for one upstream attempt (TCP connect, hop SOCKS, TLS, WS upgrade), not extended by traffic. On expiry the next group member is tried. |
 | `idle_timeout_s` | `600` | Close a relay with no traffic in either direction. |
 | `sock_buf` | `0` | `SO_SNDBUF` / `SO_RCVBUF` per socket; `0` leaves kernel defaults. |
 
@@ -187,7 +188,7 @@ node fields, plus:
 |---|---|---|
 | `rules` | `[]` | First match wins. `domain_suffix` is a list of ASCII suffixes (`example.com` matches that host and `a.example.com`). `outbound` is the group of tags to use. |
 | `default` | the first outbound | Group used when no rule matches. |
-| `fail_backoff_s` | `30` | After a member fails to connect, skip it for this many seconds and try the next member of that same group. If every member of the matched group fails, the connection closes. |
+| `fail_backoff_s` | `30` | After a member fails to connect, skip it for this many seconds and try the next member of that same group. Failover only moves to members not in backoff; while all are in backoff each connection makes a single probe attempt. If no member is left, the connection closes. |
 
 At most 16 outbounds. A `dialer` tag must refer to an entry listed before
 it. UDP is only carried on a Vision TCP outbound. When the target is an IP

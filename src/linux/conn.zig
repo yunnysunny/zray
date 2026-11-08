@@ -70,6 +70,9 @@ pub const Config = struct {
     default_group: []const u8,
     handshake_timeout_s: u64 = 15,
     idle_timeout_s: u64 = 600,
+    /// Hard deadline for one upstream attempt (TCP connect, hop SOCKS, TLS,
+    /// WS upgrade). Not extended by traffic; on expiry the next member is tried.
+    connect_timeout_s: u64 = 5,
     /// Per-socket SO_RCVBUF / SO_SNDBUF; 0 = kernel default.
     sock_buf: i32 = 0,
     /// Replace redirected IP targets with the sniffed TLS SNI / HTTP Host.
@@ -180,7 +183,10 @@ pub const Conn = struct {
     ob: u8 = 0,
     /// Pinned outbound (hop listener connections).
     forced: ?u8 = null,
-    born: u64 = 0,
+    /// When sniffing started (ms).
+    sniff_since_ms: u64 = 0,
+    /// Current upstream attempt must reach .relay before this (ms).
+    attempt_deadline_ms: u64 = 0,
     vision_on: bool = true,
     ws_on: bool = false,
     wsd: ws.Deframer = .{},
@@ -256,7 +262,7 @@ pub const Loop = struct {
         c.tried_mask = 0;
         c.group = &.{};
         c.last_active = sys.monotonicSeconds();
-        c.born = c.last_active;
+        c.attempt_deadline_ms = 0;
         sys.setNoDelay(fd);
         if (l.cfg.sock_buf > 0) sys.setBufferSizes(fd, l.cfg.sock_buf, l.cfg.sock_buf);
         sys.epollAdd(l.ep, fd, sys.EPOLL.IN | sys.EPOLL.RDHUP, c.token(.client)) catch {
@@ -319,9 +325,10 @@ pub const Loop = struct {
     /// Close connections that have been idle too long.
     pub fn sweep(l: *Loop) void {
         const now = sys.monotonicSeconds();
+        const now_ms = sys.monotonicMs();
         for (l.conns) |*c| {
             if (c.state == .free) continue;
-            if (c.state == .sniffing and now - c.born >= 1) {
+            if (c.state == .sniffing and now_ms - c.sniff_since_ms >= 1000) {
                 // Server-first protocol (or a slow client): use the default route.
                 c.group = l.cfg.default_group;
                 l.startUpstream(c) catch |e| {
@@ -331,10 +338,12 @@ pub const Loop = struct {
                 l.updateInterest(c);
                 continue;
             }
-            const limit = if (c.state == .relay) l.cfg.idle_timeout_s else l.cfg.handshake_timeout_s;
-            if (now - c.last_active > limit) {
-                if (l.preRelay(c)) l.retry(c, "handshake timeout") else l.close(c, "timeout");
+            if (l.preRelay(c)) {
+                if (now_ms >= c.attempt_deadline_ms) l.retryAndUpdate(c, "connect timeout");
+                continue;
             }
+            const limit = if (c.state == .relay) l.cfg.idle_timeout_s else l.cfg.handshake_timeout_s;
+            if (now - c.last_active > limit) l.close(c, "timeout");
         }
     }
 
@@ -688,6 +697,7 @@ pub const Loop = struct {
             c.group = l.cfg.default_group;
         } else {
             c.state = .sniffing;
+            c.sniff_since_ms = sys.monotonicMs();
             if (c.cin_len > 0) try l.sniffRoute(c);
             return;
         }
@@ -709,8 +719,10 @@ pub const Loop = struct {
         };
     }
 
-    /// Try group members: on try k take the k-th healthy member, then the
-    /// recently failed ones, so every member is tried at most once.
+    /// Try group members: the first attempt takes the first healthy member
+    /// (or, if all are in backoff, the first member as a probe); failover
+    /// only moves to untried healthy members, so a dead group costs one
+    /// attempt instead of one per member.
     fn startUpstream(l: *Loop, c: *Conn) !void {
         const now = sys.monotonicSeconds();
         while (c.tries < c.group.len) {
@@ -720,13 +732,14 @@ pub const Loop = struct {
                 order[n] = i;
                 n += 1;
             };
+            const n_healthy = n;
             for (c.group) |i| if (l.bad_until[i] > now) {
                 order[n] = i;
                 n += 1;
             };
-            // Members already tried were marked bad and moved to the back;
-            // the untried healthy ones stay in front.
-            const i = order[if (c.tries == 0) 0 else firstUntried(order[0..n], c)];
+            // Members already tried were marked bad and moved to the back.
+            const k = if (c.tries == 0) 0 else firstUntried(order[0..n_healthy], c) orelse break;
+            const i = order[k];
             c.tries += 1;
             c.ob = i;
             c.tried_mask |= @as(u16, 1) << @intCast(i);
@@ -740,9 +753,9 @@ pub const Loop = struct {
         return error.AllOutboundsFailed;
     }
 
-    fn firstUntried(order: []const u8, c: *const Conn) usize {
+    fn firstUntried(order: []const u8, c: *const Conn) ?usize {
         for (order, 0..) |i, k| if (c.tried_mask & (@as(u16, 1) << @intCast(i)) == 0) return k;
-        return 0;
+        return null;
     }
 
     fn markBad(l: *Loop, c: *Conn, why: []const u8) void {
@@ -788,6 +801,7 @@ pub const Loop = struct {
         c.up_out_off = 0;
         c.up_out_len = 0;
         c.last_active = sys.monotonicSeconds();
+        c.attempt_deadline_ms = sys.monotonicMs() + l.cfg.connect_timeout_s * 1000;
         const immediate = try sys.connect(fd, &ob.addr);
         const ev: u32 = sys.EPOLL.OUT | sys.EPOLL.RDHUP;
         try sys.epollAdd(l.ep, fd, ev, c.token(.upstream));

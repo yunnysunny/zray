@@ -94,6 +94,7 @@ const FileConfig = struct {
     max_connections: u32 = 128,
     handshake_timeout_s: u64 = 15,
     idle_timeout_s: u64 = 600,
+    connect_timeout_s: u64 = 5,
     sock_buf: i32 = 0,
 };
 
@@ -198,6 +199,10 @@ fn linuxMain(init: std.process.Init) !void {
         sys.log("bad config: use either top-level server/uuid or outbounds, not both", .{});
         return error.BadConfig;
     }
+    if (parsed.connect_timeout_s == 0) {
+        sys.log("bad config: connect_timeout_s must be >= 1", .{});
+        return error.BadConfig;
+    }
     if (node_cfgs.len == 0 or node_cfgs.len > conn.max_outbounds) {
         sys.log("bad config: need 1..{d} outbounds", .{conn.max_outbounds});
         return error.BadConfig;
@@ -268,6 +273,7 @@ fn linuxMain(init: std.process.Init) !void {
         .default_group = default_group,
         .handshake_timeout_s = parsed.handshake_timeout_s,
         .idle_timeout_s = parsed.idle_timeout_s,
+        .connect_timeout_s = parsed.connect_timeout_s,
         .sock_buf = parsed.sock_buf,
         .sniff = parsed.sniff,
         .fail_backoff_s = parsed.fail_backoff_s,
