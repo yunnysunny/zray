@@ -109,6 +109,13 @@ pub fn udpSocket(fam: u32) Error!fd_t {
     return @intCast(rc);
 }
 
+pub fn peerAddr(fd: fd_t) Error!SockAddr {
+    var raw: linux.sockaddr.in6 = undefined;
+    var alen: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+    _ = try check(linux.getpeername(fd, @ptrCast(&raw), &alen));
+    return SockAddr.fromRaw(&raw);
+}
+
 pub fn localAddr(fd: fd_t) Error!SockAddr {
     var raw: linux.sockaddr.in6 = undefined;
     var alen: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
