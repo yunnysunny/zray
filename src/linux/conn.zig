@@ -454,6 +454,10 @@ pub const Loop = struct {
         };
         if (n == 0) {
             c.client_eof = true;
+            // Hop connection whose chained outbound gave up before the relay
+            // answered (dead exit): nobody is left to read the reply, and the
+            // relay may keep dialing for a minute. Free the slot now.
+            if (c.forced != null and !c.got_resp_hdr) return error.HopClientGone;
             // Nothing more to forward: let upstream finish, then close on its EOF.
             if (c.state == .relay and c.cin_len == 0 and c.up_out_len == 0) {
                 if (c.fullyDirect()) sys.shutdownWrite(c.up_fd) else {
