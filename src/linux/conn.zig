@@ -22,24 +22,83 @@ const socks5 = @import("../proxy/socks5.zig");
 const fingerprint = @import("../tls/fingerprint.zig");
 const sniff = @import("../proxy/sniff.zig");
 const mux = @import("../proxy/mux.zig");
+const ws = @import("../proxy/ws.zig");
 
 const max_rec = tls.max_ciphertext_record_len;
 /// Largest chunk read from the SOCKS client per event (xray uses 8 KiB).
 const client_chunk = 8192;
 
-pub const Config = struct {
-    server_addr: sys.SockAddr,
+pub const max_outbounds = 16;
+/// ob_index[i..][0..1] is a static one-element group for outbound i.
+const ob_index = blk: {
+    var a: [max_outbounds]u8 = undefined;
+    for (&a, 0..) |*x, i| x.* = i;
+    break :blk a;
+};
+
+/// One upstream node.
+pub const Outbound = struct {
+    tag: []const u8 = "",
+    /// Where the TCP connection goes: the server itself, or (chained) the
+    /// local hop listener served by the dialer outbound.
+    addr: sys.SockAddr,
+    /// Chained: SOCKS5 CONNECT to hop_host:hop_port through `addr` first.
+    hop_host: []const u8 = "",
+    hop_port: u16 = 0,
     sni: []const u8,
     /// null: plain TLS 1.3 (SNI only, certificate chain not verified).
     reality: ?reality.Config = null,
     uuid: [16]u8,
+    /// xtls-rprx-vision (the original zray behaviour) or no flow.
+    vision: bool = true,
+    /// WebSocket transport (inside TLS).
+    ws: bool = false,
+    ws_path: []const u8 = "/",
+    ws_host: []const u8 = "",
+};
+
+/// Domains ending in one of `suffixes` go to the first healthy outbound of
+/// `group` (indices into Config.outbounds).
+pub const Rule = struct {
+    suffixes: []const []const u8,
+    group: []const u8,
+};
+
+pub const Config = struct {
+    outbounds: []const Outbound,
+    rules: []const Rule = &.{},
+    default_group: []const u8,
     handshake_timeout_s: u64 = 15,
     idle_timeout_s: u64 = 600,
     /// Per-socket SO_RCVBUF / SO_SNDBUF; 0 = kernel default.
     sock_buf: i32 = 0,
     /// Replace redirected IP targets with the sniffed TLS SNI / HTTP Host.
     sniff: bool = true,
+    /// Seconds an outbound is skipped after it failed to connect.
+    fail_backoff_s: u64 = 30,
 };
+
+/// Does `host` equal `suffix` or end in ".suffix"? (ASCII case-insensitive)
+pub fn domainMatch(host: []const u8, suffix: []const u8) bool {
+    if (host.len < suffix.len) return false;
+    const tail = host[host.len - suffix.len ..];
+    if (!std.ascii.eqlIgnoreCase(tail, suffix)) return false;
+    return host.len == suffix.len or host[host.len - suffix.len - 1] == '.';
+}
+
+pub fn routeFor(cfg: *const Config, host: ?[]const u8) []const u8 {
+    const h = host orelse return cfg.default_group;
+    for (cfg.rules) |r| for (r.suffixes) |suf| if (domainMatch(h, suf)) return r.group;
+    return cfg.default_group;
+}
+
+test "domain suffix match" {
+    try std.testing.expect(domainMatch("chatgpt.com", "chatgpt.com"));
+    try std.testing.expect(domainMatch("ab.chatgpt.com", "chatgpt.com"));
+    try std.testing.expect(domainMatch("AB.ChatGPT.com", "chatgpt.com"));
+    try std.testing.expect(!domainMatch("notchatgpt.com", "chatgpt.com"));
+    try std.testing.expect(!domainMatch("x.ai.com", "x.ai"));
+}
 
 pub const Inbound = enum { socks5, redirect };
 
@@ -49,8 +108,14 @@ pub const State = enum {
     free,
     socks_greeting,
     socks_request,
+    /// Waiting for the first client bytes to pick an outbound by SNI/Host.
+    sniffing,
     connecting,
+    /// Chained outbound: waiting for the local hop's SOCKS5 replies.
+    socks_dial,
     tls_handshake,
+    /// TLS up, HTTP Upgrade sent, waiting for 101.
+    ws_upgrade,
     relay,
 };
 
@@ -107,6 +172,20 @@ pub const Conn = struct {
     target_len: u8 = 0,
     target_port: u16 = 0,
 
+    // outbound selection
+    /// Candidate outbounds (static slice into Config) and attempts so far.
+    group: []const u8 = &.{},
+    tries: u8 = 0,
+    tried_mask: u16 = 0,
+    ob: u8 = 0,
+    /// Pinned outbound (hop listener connections).
+    forced: ?u8 = null,
+    born: u64 = 0,
+    vision_on: bool = true,
+    ws_on: bool = false,
+    wsd: ws.Deframer = .{},
+    ws_hs_len: usize = 0,
+
     pub fn token(c: *const Conn, side: Side) u64 {
         return (@as(u64, c.gen) << 34) | (@as(u64, c.slot) << 2) | @backingInt(side);
     }
@@ -122,14 +201,20 @@ pub const Conn = struct {
     }
 };
 
+/// The running config (single-threaded; set by Loop.init) so the
+/// free-standing record helpers can reach the current outbound.
+var cur_cfg: ?*const Config = null;
+
 pub const Loop = struct {
     ep: sys.fd_t,
     cfg: *const Config,
     conns: []Conn,
     csprng: std.Random.DefaultCsprng,
     active: usize = 0,
+    bad_until: [max_outbounds]u64 = @splat(0),
 
     pub fn init(ep: sys.fd_t, cfg: *const Config, conns: []Conn) Loop {
+        cur_cfg = cfg;
         var seed: [32]u8 = undefined;
         sys.randomBytes(&seed);
         for (conns, 0..) |*c, i| c.* = .{ .slot = @intCast(i) };
@@ -138,7 +223,7 @@ pub const Loop = struct {
 
     // ---- lifecycle -----------------------------------------------------------
 
-    pub fn accept(l: *Loop, fd: sys.fd_t, kind: Inbound) void {
+    pub fn accept(l: *Loop, fd: sys.fd_t, kind: Inbound, forced: ?u8) void {
         const c = l.findFree() orelse {
             sys.log("conn table full, dropping client", .{});
             sys.close(fd);
@@ -165,8 +250,13 @@ pub const Loop = struct {
         c.client_eof = false;
         c.up_eof = false;
         c.got_resp_hdr = false;
-        c.sniff_enabled = l.cfg.sniff;
+        c.sniff_enabled = l.cfg.sniff and forced == null;
+        c.forced = forced;
+        c.tries = 0;
+        c.tried_mask = 0;
+        c.group = &.{};
         c.last_active = sys.monotonicSeconds();
+        c.born = c.last_active;
         sys.setNoDelay(fd);
         if (l.cfg.sock_buf > 0) sys.setBufferSizes(fd, l.cfg.sock_buf, l.cfg.sock_buf);
         sys.epollAdd(l.ep, fd, sys.EPOLL.IN | sys.EPOLL.RDHUP, c.token(.client)) catch {
@@ -194,7 +284,7 @@ pub const Loop = struct {
                 },
             }
             c.target_port = dst.getPort();
-            l.connectUpstream(c) catch |e| return l.close(c, @errorName(e));
+            l.routeOrSniff(c) catch |e| return l.close(c, @errorName(e));
             l.updateInterest(c);
         }
     }
@@ -231,8 +321,20 @@ pub const Loop = struct {
         const now = sys.monotonicSeconds();
         for (l.conns) |*c| {
             if (c.state == .free) continue;
+            if (c.state == .sniffing and now - c.born >= 1) {
+                // Server-first protocol (or a slow client): use the default route.
+                c.group = l.cfg.default_group;
+                l.startUpstream(c) catch |e| {
+                    l.close(c, @errorName(e));
+                    continue;
+                };
+                l.updateInterest(c);
+                continue;
+            }
             const limit = if (c.state == .relay) l.cfg.idle_timeout_s else l.cfg.handshake_timeout_s;
-            if (now - c.last_active > limit) l.close(c, "timeout");
+            if (now - c.last_active > limit) {
+                if (l.preRelay(c)) l.retry(c, "handshake timeout") else l.close(c, "timeout");
+            }
         }
     }
 
@@ -256,12 +358,21 @@ pub const Loop = struct {
                 if (fail and c.state != .free) return l.close(c, "client hup");
             },
             .upstream => {
-                if (events & sys.EPOLL.OUT != 0) l.upstreamWritable(c) catch |e| return l.close(c, @errorName(e));
-                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP) != 0) l.readUpstream(c) catch |e| switch (e) {
-                    error.UpstreamEof, error.UpstreamCloseNotify => return l.upstreamDone(c),
-                    else => return l.close(c, @errorName(e)),
+                if (events & sys.EPOLL.OUT != 0) l.upstreamWritable(c) catch |e| {
+                    if (l.preRelay(c)) return l.retryAndUpdate(c, @errorName(e));
+                    return l.close(c, @errorName(e));
                 };
-                if (fail and c.state != .free) return l.upstreamDone(c);
+                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP) != 0) l.readUpstream(c) catch |e| {
+                    if (l.preRelay(c)) return l.retryAndUpdate(c, @errorName(e));
+                    switch (e) {
+                        error.UpstreamEof, error.UpstreamCloseNotify => return l.upstreamDone(c),
+                        else => return l.close(c, @errorName(e)),
+                    }
+                };
+                if (fail and c.state != .free) {
+                    if (l.preRelay(c)) return l.retryAndUpdate(c, "upstream hup");
+                    return l.upstreamDone(c);
+                }
             },
             .udp => {
                 // Unconnected UDP socket: no ERR/HUP semantics worth acting on.
@@ -392,16 +503,19 @@ pub const Loop = struct {
                 c.consumeClient(req.len);
                 if (req.command == .udp_associate) {
                     try l.openUdpRelay(c);
-                    try l.connectUpstream(c);
+                    c.group = l.cfg.default_group;
+                    if (c.forced) |f| c.group = ob_index[f..][0..1];
+                    try l.startUpstream(c);
                     return;
                 }
                 // Reply right away (like xray) so the client starts its own TLS
                 // handshake while we connect upstream; its bytes queue in `cin`.
                 l.queueClient(c, &socks5.reply(.succeeded));
                 try l.flushClient(c);
-                try l.connectUpstream(c);
+                try l.routeOrSniff(c);
             },
-            .connecting, .tls_handshake => {}, // buffer in cin until the tunnel is up
+            .sniffing => try l.sniffRoute(c),
+            .connecting, .socks_dial, .tls_handshake, .ws_upgrade => {}, // buffer in cin until the tunnel is up
             .relay => try l.forwardClient(c),
             .free => unreachable,
         }
@@ -415,9 +529,16 @@ pub const Loop = struct {
             @memcpy(c.up_out[0..data.len], data);
             c.up_out_len = data.len;
         } else {
-            var padded_buf: [client_chunk + 2 * vision.max_overhead]u8 = undefined;
-            const padded = c.padder.pad(data, &padded_buf) catch return error.VisionPad;
-            const rec = c.tls.encrypt(padded, &c.up_out) catch return error.TlsEncrypt;
+            var padded_buf: [ws.max_header_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
+            const off = ws.max_header_len;
+            const padded = if (c.vision_on)
+                c.padder.pad(data, padded_buf[off..]) catch return error.VisionPad
+            else blk: {
+                @memcpy(padded_buf[off..][0..data.len], data);
+                break :blk padded_buf[off..][0..data.len];
+            };
+            const plain = if (c.ws_on) ws.frameInPlace(&padded_buf, off, padded.len, maskOf(c)) else padded;
+            const rec = c.tls.encrypt(plain, &c.up_out) catch return error.TlsEncrypt;
             c.up_out_len = rec.len;
             if (c.padder.direct) sys.log("[{d}] vision uplink -> direct", .{c.slot});
         }
@@ -556,30 +677,173 @@ pub const Loop = struct {
 
     // ---- upstream side -------------------------------------------------------
 
+    /// Pick the outbound now if the target already tells us (domain, pinned,
+    /// or no routing rules); otherwise wait for the first client bytes.
+    fn routeOrSniff(l: *Loop, c: *Conn) !void {
+        if (c.forced) |f| {
+            c.group = ob_index[f..][0..1];
+        } else if (c.target_kind == .domain) {
+            c.group = routeFor(l.cfg, c.target_buf[0..c.target_len]);
+        } else if (l.cfg.rules.len == 0 or !c.sniff_enabled) {
+            c.group = l.cfg.default_group;
+        } else {
+            c.state = .sniffing;
+            if (c.cin_len > 0) try l.sniffRoute(c);
+            return;
+        }
+        try l.startUpstream(c);
+    }
+
+    fn sniffRoute(l: *Loop, c: *Conn) error{AllOutboundsFailed}!void {
+        const r = sniff.sniff(c.cin[0..c.cin_len]);
+        if (r == .need_more and c.cin_len < c.cin.len) return;
+        c.group = routeFor(l.cfg, if (r == .host) r.host else null);
+        if (r == .host) sys.log("[{d}] route {s} -> {s}", .{ c.slot, r.host, l.cfg.outbounds[c.group[0]].tag });
+        try l.startUpstream(c);
+    }
+
+    fn preRelay(_: *Loop, c: *const Conn) bool {
+        return switch (c.state) {
+            .connecting, .socks_dial, .tls_handshake, .ws_upgrade => true,
+            else => false,
+        };
+    }
+
+    /// Try group members: on try k take the k-th healthy member, then the
+    /// recently failed ones, so every member is tried at most once.
+    fn startUpstream(l: *Loop, c: *Conn) !void {
+        const now = sys.monotonicSeconds();
+        while (c.tries < c.group.len) {
+            var order: [max_outbounds]u8 = undefined;
+            var n: usize = 0;
+            for (c.group) |i| if (l.bad_until[i] <= now) {
+                order[n] = i;
+                n += 1;
+            };
+            for (c.group) |i| if (l.bad_until[i] > now) {
+                order[n] = i;
+                n += 1;
+            };
+            // Members already tried were marked bad and moved to the back;
+            // the untried healthy ones stay in front.
+            const i = order[if (c.tries == 0) 0 else firstUntried(order[0..n], c)];
+            c.tries += 1;
+            c.ob = i;
+            c.tried_mask |= @as(u16, 1) << @intCast(i);
+            l.connectUpstream(c) catch |e| {
+                l.markBad(c, @errorName(e));
+                l.dropUpstream(c);
+                continue;
+            };
+            return;
+        }
+        return error.AllOutboundsFailed;
+    }
+
+    fn firstUntried(order: []const u8, c: *const Conn) usize {
+        for (order, 0..) |i, k| if (c.tried_mask & (@as(u16, 1) << @intCast(i)) == 0) return k;
+        return 0;
+    }
+
+    fn markBad(l: *Loop, c: *Conn, why: []const u8) void {
+        sys.log("[{d}] outbound {s} failed: {s}", .{ c.slot, l.cfg.outbounds[c.ob].tag, why });
+        l.bad_until[c.ob] = sys.monotonicSeconds() + l.cfg.fail_backoff_s;
+    }
+
+    fn dropUpstream(l: *Loop, c: *Conn) void {
+        if (c.up_fd >= 0) {
+            sys.epollDel(l.ep, c.up_fd);
+            sys.close(c.up_fd);
+            c.up_fd = -1;
+        }
+        c.up_ev = 0;
+        c.up_out_off = 0;
+        c.up_out_len = 0;
+        c.uin_len = 0;
+    }
+
+    /// Handshake with the current outbound failed: move to the next one.
+    /// Nothing from cin has been sent yet, so the client sees no difference.
+    fn retry(l: *Loop, c: *Conn, why: []const u8) void {
+        l.markBad(c, why);
+        l.dropUpstream(c);
+        if (c.tries >= c.group.len) return l.close(c, why);
+        l.startUpstream(c) catch |e| return l.close(c, @errorName(e));
+    }
+
+    fn retryAndUpdate(l: *Loop, c: *Conn, why: []const u8) void {
+        l.retry(c, why);
+        if (c.state != .free) l.updateInterest(c);
+    }
+
     fn connectUpstream(l: *Loop, c: *Conn) !void {
-        const fd = try sys.tcpSocket(l.cfg.server_addr.family());
+        const ob = &l.cfg.outbounds[c.ob];
+        if (c.is_udp and (!ob.vision or ob.ws)) return error.UdpNeedsVisionTcp;
+        const fd = try sys.tcpSocket(ob.addr.family());
         sys.setNoDelay(fd);
         if (l.cfg.sock_buf > 0) sys.setBufferSizes(fd, l.cfg.sock_buf, l.cfg.sock_buf);
         c.up_fd = fd;
         c.state = .connecting;
-        const immediate = sys.connect(fd, &l.cfg.server_addr) catch |e| return e;
+        c.uin_len = 0;
+        c.up_out_off = 0;
+        c.up_out_len = 0;
+        c.last_active = sys.monotonicSeconds();
+        const immediate = try sys.connect(fd, &ob.addr);
         const ev: u32 = sys.EPOLL.OUT | sys.EPOLL.RDHUP;
         try sys.epollAdd(l.ep, fd, ev, c.token(.upstream));
         c.up_ev = ev;
-        if (immediate) try l.startTls(c);
+        if (immediate) try l.connected(c);
+    }
+
+    fn connected(l: *Loop, c: *Conn) !void {
+        const ob = &l.cfg.outbounds[c.ob];
+        if (ob.hop_host.len == 0) return l.startTls(c);
+        // Pipelined SOCKS5 greeting + CONNECT hop_host:hop_port to the local hop.
+        c.state = .socks_dial;
+        const h = ob.hop_host;
+        c.up_out[0..3].* = .{ 5, 1, 0 };
+        c.up_out[3..8].* = .{ 5, 1, 0, 3, @intCast(h.len) };
+        @memcpy(c.up_out[8..][0..h.len], h);
+        mem.writeInt(u16, c.up_out[8 + h.len ..][0..2], ob.hop_port, .big);
+        c.up_out_off = 0;
+        c.up_out_len = 10 + h.len;
+        try l.flushUpstream(c);
+    }
+
+    /// Parse the hop's greeting reply + CONNECT reply out of uin.
+    fn socksDialReply(l: *Loop, c: *Conn) !void {
+        const b = c.uin[0..c.uin_len];
+        if (b.len < 2 + 5) return;
+        if (b[0] != 5 or b[1] != 0 or b[2] != 5 or b[3] != 0) return error.HopSocksRejected;
+        const alen: usize = switch (b[5]) {
+            1 => 4,
+            4 => 16,
+            3 => 1 + @as(usize, b[6]),
+            else => return error.HopSocksRejected,
+        };
+        const total = 2 + 4 + alen + 2;
+        if (b.len < total) return;
+        if (b.len > total) return error.HopSocksRejected; // server spoke before TLS
+        c.uin_len = 0;
+        try l.startTls(c);
     }
 
     fn upstreamWritable(l: *Loop, c: *Conn) !void {
         if (c.state == .connecting) {
             try sys.connectResult(c.up_fd);
-            try l.startTls(c);
+            try l.connected(c);
             return;
         }
         try l.flushUpstream(c);
     }
 
     fn startTls(l: *Loop, c: *Conn) !void {
+        const ob = &l.cfg.outbounds[c.ob];
         c.state = .tls_handshake;
+        c.vision_on = ob.vision;
+        c.ws_on = ob.ws;
+        c.wsd = .{};
+        c.ws_hs_len = 0;
         var entropy: [128]u8 = undefined;
         sys.randomBytes(&entropy);
 
@@ -590,7 +854,7 @@ pub const Loop = struct {
         var sid: [32]u8 = undefined;
         var verifier: client.Verifier = client.Verifier.insecure;
         var hook: ?client.HelloHook = null;
-        if (l.cfg.reality) |rc| {
+        if (ob.reality) |rc| {
             c.rl = reality.Reality.init(rc, sys.realtimeSeconds());
             verifier = c.rl.verifier();
             hook = c.rl.helloHook();
@@ -605,18 +869,20 @@ pub const Loop = struct {
             .verifier = verifier,
             .handshake_buf = &c.hs_buf,
         });
-        c.vstate = vision.State.init(l.cfg.uuid);
+        c.vstate = vision.State.init(ob.uuid);
         c.padder = vision.Padder.init(&c.vstate, l.csprng.random());
         c.unpadder = vision.Unpadder.init(&c.vstate);
 
         var fp: fingerprint.Chrome = undefined;
         fp.build(l.csprng.random(), .{
-            .sni = l.cfg.sni,
+            .sni = ob.sni,
+            // WebSocket needs HTTP/1.1; an h2 ALPN answer would break the Upgrade.
+            .alpn = if (ob.ws) &fingerprint.alpn_http11 else &fingerprint.alpn_h2_http11,
             .x25519_public = c.tls.publicKey(),
             .ml_kem_public = c.tls.mlKemPublicKey(),
             // Only offer compressed certificates to REALITY servers; a plain
             // TLS upstream may compress in a form this client does not parse.
-            .compress_certificate = l.cfg.reality != null,
+            .compress_certificate = ob.reality != null,
         });
         const first = c.tls.clientHello(&c.up_out, .{
             .random = undefined,
@@ -624,7 +890,7 @@ pub const Loop = struct {
             .cipher_suites = fp.cipherSuites(),
             .extensions = fp.extensions(),
         }, hook) catch return error.ClientHello;
-        if (l.cfg.reality != null and c.rl.err != null) return error.RealityHook;
+        if (ob.reality != null and c.rl.err != null) return error.RealityHook;
         c.up_out_off = 0;
         c.up_out_len = first.len;
         try l.flushUpstream(c);
@@ -663,6 +929,7 @@ pub const Loop = struct {
         };
         if (n == 0) return error.UpstreamEof;
         c.uin_len += n;
+        if (c.state == .socks_dial) return l.socksDialReply(c);
         try l.processUpstream(c);
     }
 
@@ -695,16 +962,34 @@ pub const Loop = struct {
                 c.up_out_len += res.to_send.len;
             }
             if (res.event == .close_notify) return error.UpstreamCloseNotify;
-            if (res.event == .handshake_complete) try sendVlessRequest(c);
+            if (res.event == .handshake_complete) {
+                if (c.ws_on) try sendWsUpgrade(c, cfgOf(c)) else try sendVlessRequest(c);
+            }
 
             var data = res.app_data;
+            if (c.state == .ws_upgrade and data.len > 0) {
+                if (c.ws_hs_len + data.len > c.mux_in.len) return error.WsUpgradeTooLarge;
+                @memcpy(c.mux_in[c.ws_hs_len..][0..data.len], data);
+                c.ws_hs_len += data.len;
+                data = data[0..0];
+                if (try ws.parseUpgradeResponse(c.mux_in[0..c.ws_hs_len])) |hl| {
+                    if (hl != c.ws_hs_len) return error.WsEarlyData;
+                    try sendVlessRequest(c);
+                }
+            }
+            if (c.ws_on and c.state == .relay and data.len > 0) {
+                data = c.wsd.feed(data) catch |e| switch (e) {
+                    error.WsClosed => return error.UpstreamEof,
+                    else => return e,
+                };
+            }
             if (c.state == .relay and data.len > 0) {
                 if (!c.got_resp_hdr) {
                     const resp = (vless.parseResponse(data) catch return error.VlessResponse) orelse return error.VlessResponse;
                     c.got_resp_hdr = true;
                     data = data[resp.len..];
                 }
-                const content = c.unpadder.feed(data);
+                const content = if (c.vision_on) c.unpadder.feed(data) else data;
                 if (c.is_udp) {
                     if (c.mux_in_len + content.len > c.mux_in.len) return error.MuxFrameTooLarge;
                     @memcpy(c.mux_in[c.mux_in_len..][0..content.len], content);
@@ -738,7 +1023,8 @@ pub const Loop = struct {
     /// padding block) in one record.
     fn sendVlessRequest(c: *Conn) !void {
         c.state = .relay;
-        var buf: [vless.max_request_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
+        var wbuf: [ws.max_header_len + vless.max_request_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
+        const buf = wbuf[ws.max_header_len..];
         var addr: vless.Address = switch (c.target_kind) {
             .ipv4 => .{ .ipv4 = c.target_buf[0..4].* },
             .ipv6 => .{ .ipv6 = c.target_buf[0..16].* },
@@ -746,7 +1032,7 @@ pub const Loop = struct {
         };
         if (c.is_udp) {
             // XUDP: everything rides one Mux stream; targets live in the frames.
-            const hdr = vless.encodeRequest(&buf, .{
+            const hdr = vless.encodeRequest(buf, .{
                 .uuid = c.vstate.uuid,
                 .flow = .vision,
                 .command = .mux,
@@ -766,20 +1052,47 @@ pub const Loop = struct {
                 else => {},
             }
         }
-        const hdr = vless.encodeRequest(&buf, .{
+        const hdr = vless.encodeRequest(buf, .{
             .uuid = c.vstate.uuid,
-            .flow = .vision,
+            .flow = if (c.vision_on) .vision else .none,
             .address = addr,
             .port = c.target_port,
         }) catch return error.VlessRequest;
         var n = hdr.len;
-        const padded = if (c.cin_len > 0)
-            c.padder.pad(c.cin[0..c.cin_len], buf[n..]) catch return error.VisionPad
-        else
-            c.padder.padEmpty(buf[n..]) catch return error.VisionPad;
-        n += padded.len;
+        if (c.vision_on) {
+            const padded = if (c.cin_len > 0)
+                c.padder.pad(c.cin[0..c.cin_len], buf[n..]) catch return error.VisionPad
+            else
+                c.padder.padEmpty(buf[n..]) catch return error.VisionPad;
+            n += padded.len;
+        } else {
+            @memcpy(buf[n..][0..c.cin_len], c.cin[0..c.cin_len]);
+            n += c.cin_len;
+        }
         c.cin_len = 0;
-        try queueUpstreamRecord(c, buf[0..n]);
+        if (c.ws_on) {
+            try queueUpstreamRecord(c, ws.frameInPlace(&wbuf, ws.max_header_len, n, maskOf(c)));
+        } else try queueUpstreamRecord(c, buf[0..n]);
+    }
+
+    fn maskOf(_: *Conn) [4]u8 {
+        var m: [4]u8 = undefined;
+        sys.randomBytes(&m);
+        return m;
+    }
+
+    fn cfgOf(c: *Conn) *const Outbound {
+        return &cur_cfg.?.outbounds[c.ob];
+    }
+
+    fn sendWsUpgrade(c: *Conn, ob: *const Outbound) !void {
+        c.state = .ws_upgrade;
+        var key: [16]u8 = undefined;
+        sys.randomBytes(&key);
+        var req_buf: [1024]u8 = undefined;
+        const host = if (ob.ws_host.len > 0) ob.ws_host else ob.sni;
+        const req = ws.upgradeRequest(&req_buf, host, ob.ws_path, key) catch return error.WsRequestTooLong;
+        try queueUpstreamRecord(c, req);
     }
 
     /// Encrypt and append behind whatever is already queued in `up_out`

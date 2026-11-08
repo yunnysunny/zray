@@ -14,6 +14,8 @@ comptime {
     _ = @import("proxy/mux.zig");
     _ = @import("proxy/sniff.zig");
     _ = @import("proxy/dns.zig");
+    _ = @import("proxy/ws.zig");
+    _ = @import("linux/conn.zig");
     _ = @import("tls/fingerprint.zig");
     _ = @import("main.zig");
 }

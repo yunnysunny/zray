@@ -73,4 +73,15 @@ expect_reject "{$base,\"security\":\"tls\",\"tls_verify\":\"none\",\"public_key\
 expect_start "{$base,\"public_key\":\"$pk\",\"short_id\":\"0123abcd\"}" 'mode reality (short_id 0123abcd)'
 expect_start "{$base,\"security\":\"tls\",\"tls_verify\":\"none\"}" 'mode tls, verify NONE'
 
+# Multi-node: ws + vision is rejected; an unknown dialer is rejected; a
+# chained ws exit behind an IP-literal relay reaches the event loop.
+ws_bad="{\"listen\":\"127.0.0.1:18081\",\"outbounds\":[{\"tag\":\"w\",\"server\":\"127.0.0.1\",\"security\":\"tls\",\"tls_verify\":\"none\",\"uuid\":\"$uuid\",\"network\":\"ws\",\"flow\":\"xtls-rprx-vision\"}]}"
+expect_reject "$ws_bad" 'does not work over ws'
+dial_bad="{\"listen\":\"127.0.0.1:18081\",\"outbounds\":[{\"tag\":\"w\",\"server\":\"127.0.0.1\",\"security\":\"tls\",\"tls_verify\":\"none\",\"uuid\":\"$uuid\",\"dialer\":\"missing\"}]}"
+expect_reject "$dial_bad" 'unknown dialer'
+both="{\"listen\":\"127.0.0.1:18081\",\"server\":\"127.0.0.1\",\"uuid\":\"$uuid\",\"outbounds\":[{\"tag\":\"a\",\"server\":\"127.0.0.1\",\"public_key\":\"$pk\",\"uuid\":\"$uuid\"}]}"
+expect_reject "$both" 'not both'
+routed="{\"listen\":\"127.0.0.1:18081\",\"outbounds\":[{\"tag\":\"relay\",\"server\":\"127.0.0.1\",\"public_key\":\"$pk\",\"short_id\":\"ab\",\"uuid\":\"$uuid\"},{\"tag\":\"exit\",\"server\":\"exit.example.com\",\"security\":\"tls\",\"tls_verify\":\"none\",\"uuid\":\"$uuid\",\"network\":\"ws\",\"ws_path\":\"/vless-ws\",\"dialer\":\"relay\"}],\"rules\":[{\"domain_suffix\":[\"example.com\"],\"outbound\":[\"exit\",\"relay\"]}],\"default\":[\"relay\"],\"fail_backoff_s\":30}"
+expect_start "$routed" 'via hop'
+
 echo "smoke: all checks passed"
