@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="zh-CN" data-lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zray — 为老路由器写的 REALITY 客户端</title>
+<meta name="description" content="zray 是一个用 Zig 写的 REALITY（VLESS + XTLS Vision）客户端，单线程、零依赖、静态约 832 KB，为只有一两个慢核和无 FPU 的家用路由器而生。">
+<meta property="og:title" content="zray — a REALITY client for routers">
+<meta property="og:description" content="TLS 1.3, REALITY, VLESS + XTLS Vision, written from scratch in Zig. One thread, epoll, memory fixed at startup.">
+<meta property="og:type" content="website">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="zray">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="1.5" y="1.5" width="21" height="21" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M6 7h12l-12 10h12" stroke="#b4451e" stroke-width="1.8"/>
+      </svg>
+      zray
+    </a>
+    <nav class="main">
+      <a href="#why"><span lang="zh">为什么</span><span lang="en">Why</span></a>
+      <a href="#features"><span lang="zh">能力</span><span lang="en">Features</span></a>
+      <a href="#numbers"><span lang="zh">实测</span><span lang="en">Numbers</span></a>
+      <a href="#install"><span lang="zh">安装</span><span lang="en">Install</span></a>
+      <a href="#config"><span lang="zh">配置</span><span lang="en">Config</span></a>
+      <a href="#docs"><span lang="zh">文档</span><span lang="en">Docs</span></a>
+      <a href="https://github.com/yunnysunny/zray">GitHub&nbsp;↗</a>
+    </nav>
+    <div class="langswitch" role="group" aria-label="Language">
+      <button type="button" data-setlang="zh" aria-pressed="true">中</button>
+      <button type="button" data-setlang="en" aria-pressed="false">EN</button>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ================= hero ================= -->
+<div class="hero">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">
+        <span lang="zh">单线程 · 零依赖 · 静态二进制</span>
+        <span lang="en">One thread · no dependencies · static binary</span>
+      </p>
+      <h1>
+        <span lang="zh">给<em>老路由器</em>写的<br>REALITY 客户端</span>
+        <span lang="en">A <em>REALITY</em> client for<br>the router you own</span>
+      </h1>
+      <p class="lede">
+        <span lang="zh">TLS 1.3、REALITY 认证、VLESS + XTLS Vision，全部从零实现。一个线程、一个 epoll 循环，内存在启动时算好，不随流量增长。</span>
+        <span lang="en">TLS 1.3, REALITY authentication, VLESS + XTLS Vision — all written from scratch. One thread, one epoll loop, memory decided at startup and never growing with traffic.</span>
+      </p>
+      <div class="cta">
+        <a class="btn" href="https://github.com/yunnysunny/zray/releases/latest">
+          <span lang="zh">下载 v0.4.0</span><span lang="en">Download v0.4.0</span>
+        </a>
+        <a class="btn ghost" href="https://github.com/yunnysunny/zray/blob/master/docs/usage.zh-CN.md">
+          <span lang="zh">使用说明</span><span lang="en">User guide</span>
+        </a>
+      </div>
+    </div>
+
+    <aside class="spec" aria-label="Measured footprint">
+      <div class="spec-head">
+        <span><span lang="zh">实测占用</span><span lang="en">Measured</span></span>
+        <span>AC2100 / MT7621</span>
+      </div>
+      <dl>
+        <div class="row">
+          <dt><span lang="zh">单文件静态二进制</span><span lang="en">Static binary</span></dt>
+          <dd><b>832</b> KB</dd>
+        </div>
+        <div class="row">
+          <dt><span lang="zh">常驻内存 RSS</span><span lang="en">RSS, 64 slots</span></dt>
+          <dd><b>2.2</b> MB</dd>
+        </div>
+        <div class="row">
+          <dt><span lang="zh">虚拟内存 VSZ</span><span lang="en">VSZ, 64 slots</span></dt>
+          <dd><b>7.3</b> MB</dd>
+        </div>
+        <div class="row">
+          <dt><span lang="zh">单流 HTTPS 吞吐</span><span lang="en">HTTPS, one stream</span></dt>
+          <dd><b>9–10</b> MB/s</dd>
+        </div>
+        <div class="row">
+          <dt><span lang="zh">线程 / 依赖</span><span lang="en">Threads / deps</span></dt>
+          <dd><b>1</b> / <b>0</b></dd>
+        </div>
+      </dl>
+      <div class="spec-foot">
+        <span lang="zh">ImmortalWrt 23.05 · 服务器在日本 · RTT ~110 ms</span>
+        <span lang="en">ImmortalWrt 23.05 · server in Japan · RTT ~110 ms</span>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<!-- ================= why ================= -->
+<section id="why">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">01</span>
+      <h2><span lang="zh">它解决的问题</span><span lang="en">The problem it solves</span></h2>
+      <p class="sub">
+        <span lang="zh">这类机器的三个硬约束互相咬合：慢核、小内存、没有硬件加密。xray-core 在这台机器上 VSZ 超过 32 MB 的 ulimit，起不来；trojan-go 能跑但吃不消。zray 是把这三条约束当成设计前提重写了一遍，而不是把通用客户端塞进去。</span>
+        <span lang="en">Three hardware constraints interlock on a box like this: a slow core, little RAM, no hardware crypto. On the reference router xray-core exceeds a 32 MB VSZ ulimit and never starts. zray treats those constraints as the design brief instead of squeezing a general-purpose client through them.</span>
+      </p>
+    </div>
+
+    <div class="constraints">
+      <div class="constraint">
+        <div class="stat">1.5</div>
+        <div class="unit">MB/s · software AES-GCM</div>
+        <h3><span lang="zh">慢核</span><span lang="en">A slow core</span></h3>
+        <p>
+          <span lang="zh">单核软算 AES-GCM 的上限就在 1.5 MB/s 左右。所以必须让大流量离开外层 TLS：XTLS Vision 认出内层 TLS 握手后切成直接拷贝，稳态下几乎不再加解密。</span>
+          <span lang="en">Software AES-GCM on this core tops out near 1.5 MB/s, so bulk traffic has to leave the outer TLS. XTLS Vision spots the inner TLS handshake and switches to direct copy — at steady state it barely encrypts anything.</span>
+        </p>
+      </div>
+      <div class="constraint">
+        <div class="stat">93</div>
+        <div class="unit">KiB / slot</div>
+        <h3><span lang="zh">小内存</span><span lang="en">Little RAM</span></h3>
+        <p>
+          <span lang="zh">128 MB 的路由器可用内存只有 20 MB 上下。连接槽在启动时一次性分配，之后既不增长也不碎片化，超出就干净地拒绝新连接。</span>
+          <span lang="en">A 128 MB router has maybe 20 MB free. Connection slots are allocated once at startup — no growth, no fragmentation — and new connections are refused cleanly when they run out.</span>
+        </p>
+      </div>
+      <div class="constraint">
+        <div class="stat">0</div>
+        <div class="unit"><span lang="zh">FPU · 依赖</span><span lang="en">FPU · deps</span></div>
+        <h3><span lang="zh">无浮点、无依赖</span><span lang="en">No FPU, no deps</span></h3>
+        <p>
+          <span lang="zh">MT7621 没有 FPU，固件也常常不带 CA 证书链。除了 Zig 标准库没有任何依赖，静态 musl 二进制拷进去就能跑，不用装包、不用带一套动态库。</span>
+          <span lang="en">The MT7621 has no FPU, and router firmware rarely ships a CA bundle. There is nothing beyond the Zig standard library: drop in the static musl binary and run, no packages, no shared objects.</span>
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= features ================= -->
+<section id="features">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">02</span>
+      <h2><span lang="zh">做了什么</span><span lang="en">What is inside</span></h2>
+      <p class="sub">
+        <span lang="zh">协议栈是自己写的，所以可以只为这一条路径优化：没有插件系统，没有通用抽象层，也没有为了兼容别的协议而存在的代码。</span>
+        <span lang="en">The protocol stack is hand-written, which is what makes it optimisable for exactly one path: no plugin system, no generic abstraction layers, no code that exists to support other protocols.</span>
+      </p>
+    </div>
+
+    <div class="features">
+      <div class="feature">
+        <div class="idx">01</div>
+        <div>
+          <h3><span lang="zh">从零实现的 TLS 1.3</span><span lang="en">TLS 1.3 from scratch</span></h3>
+          <p><span lang="zh">密钥调度、记录层、握手状态机、证书签名校验。与 RFC 8448 测试向量逐字节对照，不只是「能连上」。</span><span lang="en">Key schedule, record layer, handshake state machine, certificate signature checks — verified byte-for-byte against the RFC 8448 vectors, not just "it connects".</span></p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="idx">02</div>
+        <div>
+          <h3><span lang="zh">REALITY 认证</span><span lang="en">REALITY authentication</span></h3>
+          <p><span lang="zh">对服务端公钥做临时 X25519，HKDF 派生 auth key，AEAD 封装 <code>session_id</code>，再用 HMAC-SHA512 校验证书。</span><span lang="en">Ephemeral X25519 against the server key, HKDF auth key, AEAD-sealed <code>session_id</code>, HMAC-SHA512 certificate check.</span></p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="idx">03</div>
+        <div>
+          <h3><span lang="zh">Chrome 指纹</span><span lang="en">Chrome fingerprint</span></h3>
+          <p><span lang="zh">GREASE、15 个 Chrome 套件、逐连接打乱的扩展顺序、GREASE ECH、ALPS、X25519MLKEM768 混合密钥交换。JA4 的 <code>_b</code> / <code>_c</code> 段与当前 Chrome 一致。</span><span lang="en">GREASE, 15 Chrome cipher suites, per-connection extension shuffle, GREASE ECH, ALPS, X25519MLKEM768 hybrid key share. JA4 <code>_b</code> and <code>_c</code> match current Chrome.</span></p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="idx">04</div>
+        <div>
+          <h3><span lang="zh">VLESS + XTLS Vision</span><span lang="en">VLESS + XTLS Vision</span></h3>
+          <p><span lang="zh">完整的填充状态机，识别到内层 TLS 1.3 后双向切直接拷贝。这是它在这类设备上跑得动的根本原因。</span><span lang="en">The full padding state machine, switching both directions to direct copy once the inner TLS 1.3 handshake is seen. This is why it is fast on this class of hardware at all.</span></p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="idx">05</div>
+        <div>
+          <h3><span lang="zh">两种入口</span><span lang="en">Two inbounds</span></h3>
+          <p><span lang="zh">SOCKS5（CONNECT 与 UDP ASSOCIATE，UDP 走 XUDP / full-cone）和透明 netfilter <code>REDIRECT</code>（<code>SO_ORIGINAL_DST</code>）。</span><span lang="en">SOCKS5 (CONNECT and UDP ASSOCIATE, UDP over XUDP, full-cone) and a transparent netfilter <code>REDIRECT</code> inbound via <code>SO_ORIGINAL_DST</code>.</span></p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="idx">06</div>
+        <div>
+          <h3><span lang="zh">零延迟嗅探</span><span lang="en">Zero-latency sniffing</span></h3>
+          <p><span lang="zh">上游握手还在飞的时候，客户端的首包已经到了。顺手解出 TLS SNI 或 HTTP <code>Host</code>，服务端看到的是域名而不是 IP。</span><span lang="en">While the upstream handshake is still in flight, the client's first bytes have already arrived — the SNI or HTTP <code>Host</code> is read from them, so the server sees a name instead of an IP. No extra round trip.</span></p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="idx">07</div>
+        <div>
+          <h3><span lang="zh">WebSocket、链式、分流</span><span lang="en">WebSocket, chaining, routing</span></h3>
+          <p><span lang="zh">节点可以骑在 TLS 里的 VLESS WebSocket 上；一个出口可以经另一个节点拨出（<code>dialer</code>）；<code>domain_suffix</code> 规则把域名分给一组出口，故障只在组内切换。</span><span lang="en">A node can ride VLESS over WebSocket inside TLS; an outbound can dial through another (<code>dialer</code>); <code>domain_suffix</code> rules send names to a group that fails over only within itself.</span></p>
+        </div>
+      </div>
+      <div class="feature">
+        <div class="idx">08</div>
+        <div>
+          <h3><span lang="zh">可预测的资源占用</span><span lang="en">Predictable footprint</span></h3>
+          <p><span lang="zh">固定内存池、单线程 epoll、没有后台线程也没有 GC。占用在启动那一行日志里就写完了：<code>N slots × 93 KiB</code>。</span><span lang="en">Fixed pool, single-threaded epoll, no worker threads and no GC. The whole footprint is printed on the startup line: <code>N slots × 93 KiB</code>.</span></p>
+        </div>
+      </div>
+    </div>
+
+    <div class="diagram" style="margin-top:42px">
+      <svg class="d-h" viewBox="0 0 1000 210" role="img" aria-label="Traffic path: LAN devices → router running zray → REALITY TLS to server → the internet">
+        <defs>
+          <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="#16202e"/>
+          </marker>
+          <marker id="ahr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="#b4451e"/>
+          </marker>
+        </defs>
+        <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#4b5563">
+          <rect x="20" y="66" width="130" height="54" fill="#faf8f4" stroke="#cfc7b8"/>
+          <text x="85" y="90" text-anchor="middle" fill="#16202e">LAN</text>
+          <text x="85" y="106" text-anchor="middle" font-size="10.5">phone · laptop</text>
+
+          <rect x="255" y="50" width="180" height="86" fill="#fff" stroke="#16202e" stroke-width="1.4"/>
+          <text x="345" y="78" text-anchor="middle" fill="#16202e" font-weight="600">router · zray</text>
+          <text x="345" y="96" text-anchor="middle" font-size="10.5">SOCKS5 / REDIRECT</text>
+          <text x="345" y="112" text-anchor="middle" font-size="10.5">1 thread · epoll · fixed pool</text>
+
+          <rect x="540" y="66" width="160" height="54" fill="#faf8f4" stroke="#cfc7b8"/>
+          <text x="620" y="90" text-anchor="middle" fill="#16202e">server</text>
+          <text x="620" y="106" text-anchor="middle" font-size="10.5">REALITY · VLESS</text>
+
+          <rect x="800" y="66" width="180" height="54" fill="#faf8f4" stroke="#cfc7b8"/>
+          <text x="890" y="90" text-anchor="middle" fill="#16202e">internet</text>
+          <text x="890" y="106" text-anchor="middle" font-size="10.5">HTTPS from the server IP</text>
+
+          <line x1="152" y1="93" x2="250" y2="93" stroke="#16202e" stroke-width="1.2" marker-end="url(#ah)"/>
+          <text x="201" y="84" text-anchor="middle" font-size="10.5">TCP</text>
+
+          <line x1="438" y1="93" x2="535" y2="93" stroke="#b4451e" stroke-width="1.6" marker-end="url(#ahr)"/>
+          <text x="486" y="84" text-anchor="middle" font-size="10.5" fill="#b4451e">TLS 1.3</text>
+
+          <line x1="703" y1="93" x2="795" y2="93" stroke="#16202e" stroke-width="1.2" marker-end="url(#ah)"/>
+          <text x="749" y="84" text-anchor="middle" font-size="10.5">TLS</text>
+
+          <path d="M255 150 h180" stroke="#b4451e" stroke-dasharray="4 4" stroke-width="1"/>
+          <text x="345" y="168" text-anchor="middle" font-size="10.5" fill="#b4451e">looks like: example.com</text>
+          <path d="M345 150 v-7" stroke="#b4451e" stroke-dasharray="4 4" stroke-width="1"/>
+
+          <text x="540" y="150" font-size="10.5">inner: VLESS + Vision → direct copy,</text>
+          <text x="540" y="166" font-size="10.5">outer TLS is dropped for bulk traffic</text>
+        </g>
+      </svg>
+
+      <svg class="d-v" viewBox="0 0 320 412" role="img" aria-label="Traffic path: LAN devices → router running zray → REALITY TLS to server → the internet">
+        <defs>
+          <marker id="ah2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="#16202e"/>
+          </marker>
+          <marker id="ahr2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="#b4451e"/>
+          </marker>
+        </defs>
+        <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+          <rect x="24" y="10" width="272" height="52" fill="#faf8f4" stroke="#cfc7b8"/>
+          <text x="160" y="33" text-anchor="middle" fill="#16202e">LAN</text>
+          <text x="160" y="50" text-anchor="middle" font-size="11.5" fill="#4b5563">phone · laptop</text>
+
+          <line x1="160" y1="63" x2="160" y2="87" stroke="#16202e" stroke-width="1.2" marker-end="url(#ah2)"/>
+          <text x="170" y="80" font-size="11" fill="#4b5563">TCP</text>
+
+          <rect x="24" y="90" width="272" height="70" fill="#fff" stroke="#16202e" stroke-width="1.4"/>
+          <text x="160" y="113" text-anchor="middle" fill="#16202e" font-weight="600">router · zray</text>
+          <text x="160" y="130" text-anchor="middle" font-size="11.5" fill="#4b5563">SOCKS5 / REDIRECT</text>
+          <text x="160" y="147" text-anchor="middle" font-size="11.5" fill="#4b5563">1 thread · epoll · fixed pool</text>
+
+          <line x1="160" y1="161" x2="160" y2="195" stroke="#b4451e" stroke-width="1.6" marker-end="url(#ahr2)"/>
+          <text x="170" y="172" font-size="11" fill="#b4451e">TLS 1.3</text>
+          <text x="170" y="186" font-size="11" fill="#b4451e">looks like example.com</text>
+
+          <rect x="24" y="198" width="272" height="64" fill="#faf8f4" stroke="#cfc7b8"/>
+          <text x="160" y="222" text-anchor="middle" fill="#16202e">server</text>
+          <text x="160" y="239" text-anchor="middle" font-size="11.5" fill="#4b5563">REALITY · VLESS + Vision</text>
+          <text x="160" y="254" text-anchor="middle" font-size="11.5" fill="#4b5563">bulk traffic passes through</text>
+
+          <line x1="160" y1="263" x2="160" y2="289" stroke="#16202e" stroke-width="1.2" marker-end="url(#ah2)"/>
+          <text x="170" y="280" font-size="11" fill="#4b5563">TLS</text>
+
+          <rect x="24" y="292" width="272" height="60" fill="#faf8f4" stroke="#cfc7b8"/>
+          <text x="160" y="316" text-anchor="middle" fill="#16202e">internet</text>
+          <text x="160" y="333" text-anchor="middle" font-size="11.5" fill="#4b5563">HTTPS from the server IP</text>
+
+          <text x="24" y="378" font-size="11" fill="#7a828e">one TLS layer end to end;</text>
+          <text x="24" y="394" font-size="11" fill="#7a828e">the site only sees the server.</text>
+        </g>
+      </svg>
+    </div>
+    <p class="note">
+      <span lang="zh">从设备到网站只经过一层 TLS：外层是伪装成访问 <code>sni</code> 的 REALITY，稳态下大流量直接透传；服务端只知道是谁在访问，网站只知道服务端的 IP。</span>
+      <span lang="en">One TLS layer from device to site: the outside is REALITY dressed up as a visit to <code>sni</code>, and at steady state bulk traffic passes straight through. The server learns what you visit; the site only learns the server's IP.</span>
+    </p>
+  </div>
+</section>
+
+<!-- ================= numbers ================= -->
+<section id="numbers">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">03</span>
+      <h2><span lang="zh">实测数字</span><span lang="en">Measured numbers</span></h2>
+      <p class="sub">
+        <span lang="zh">全部来自小米 AC2100（MT7621，MIPS 1004Kc 单核，软浮点，ImmortalWrt 23.05），隧道对端在日本，RTT 约 110 ms。同一台机器不走隧道、WAN 直连只有 1.4 MB/s —— 慢的是国际出口，不是 CPU。</span>
+        <span lang="en">Everything below is from a Xiaomi AC2100 (MT7621, one MIPS 1004Kc core, soft-float, ImmortalWrt 23.05) against a server in Japan at ~110 ms RTT. Fetched over the WAN without any tunnel, the same box does 1.4 MB/s: the international path is the slow part, not the CPU.</span>
+      </p>
+    </div>
+
+    <h3 class="blocktitle"><span lang="zh">单节点，拉取 50 MB</span><span lang="en">One node, 50 MB download</span></h3>
+    <div class="tablewrap" style="margin-bottom:34px">
+      <table>
+        <thead>
+          <tr>
+            <th><span lang="zh">路径</span><span lang="en">Path</span></th>
+            <th class="num"><span lang="zh">吞吐</span><span lang="en">Throughput</span></th>
+            <th class="num"><span lang="zh">CPU（单核）</span><span lang="en">CPU, one core</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th><span lang="zh">HTTPS，Vision 已切到直接拷贝</span><span lang="en">HTTPS, Vision switched to direct copy</span></th>
+            <td class="num">9–10 MB/s</td>
+            <td class="num">~17 %</td>
+          </tr>
+          <tr>
+            <th><span lang="zh">HTTP，留在外层 TLS 内（软算 AES-GCM）</span><span lang="en">HTTP, stuck inside outer TLS (sw AES-GCM)</span></th>
+            <td class="num">1.5 MB/s</td>
+            <td class="num">~98 %</td>
+          </tr>
+          <tr>
+            <th><span lang="zh">3 路 HTTPS 并发</span><span lang="en">3 parallel HTTPS streams</span></th>
+            <td class="num">10 MB/s <span style="font-size:12px;color:var(--ink-3)"><span lang="zh">合计</span><span lang="en">aggregate</span></span></td>
+            <td class="num">~55 %</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="blocktitle"><span lang="zh">WebSocket 与链式的代价</span><span lang="en">What WebSocket and chaining cost</span></h3>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th><span lang="zh">路径</span><span lang="en">Path</span></th>
+            <th class="num"><span lang="zh">吞吐</span><span lang="en">Throughput</span></th>
+            <th class="num"><span lang="zh">每 MB 的 CPU 时间</span><span lang="en">CPU per MB</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th><span lang="zh">单个 REALITY + Vision 节点</span><span lang="en">one REALITY + Vision node</span></th>
+            <td class="num">5–7 MB/s</td>
+            <td class="num">0.03–0.05 s</td>
+          </tr>
+          <tr>
+            <th><span lang="zh">链式，relay 和 exit 都是 Vision</span><span lang="en">chain, Vision on both legs</span></th>
+            <td class="num">1.2–6 MB/s</td>
+            <td class="num">0.10–0.15 s <span style="font-size:12px;color:var(--ink-3)">~3×</span></td>
+          </tr>
+          <tr>
+            <th><span lang="zh">单个 <code>network: "ws"</code> 节点（无 Vision）</span><span lang="en">one <code>network: "ws"</code> node (no Vision)</span></th>
+            <td class="num">~0.5 MB/s</td>
+            <td class="num">0.65–1.0 s <span style="font-size:12px;color:var(--ink-3)">15–30×</span></td>
+          </tr>
+          <tr>
+            <th><span lang="zh">链式，Vision relay → ws exit</span><span lang="en">chain, Vision relay → ws exit</span></th>
+            <td class="num">~0.55 MB/s</td>
+            <td class="num">~1.0 s</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      <span lang="zh">ws 出口整条连接都要软件加解密，单核上限就在 1–1.5 MB/s，适合 AI 聊天这类小流量；<code>default</code> 应该留在 Vision 节点上。另外这类机器有一个内核参数比任何 zray 选项都重要：<code>net.ipv4.tcp_rmem</code> 的默认上限约 930 KB，把单流卡在「窗口 / RTT」上，调到 4 MB 之后上表的 HTTPS 数字才成立。</span>
+      <span lang="en">A ws exit keeps the outer TLS for the whole connection, so one core caps out at 1–1.5 MB/s — fine for chat-sized traffic, not for video; keep <code>default</code> on a Vision node. One kernel knob matters more than any zray option here: the default <code>net.ipv4.tcp_rmem</code> ceiling (~930 KB) pins a single stream to window / RTT, and the HTTPS numbers above only hold once it is raised to about 4 MB.</span>
+    </p>
+  </div>
+</section>
+
+<!-- ================= install ================= -->
+<section id="install">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">04</span>
+      <h2><span lang="zh">装上它</span><span lang="en">Install it</span></h2>
+      <p class="sub">
+        <span lang="zh">每个 Release 都带五个静态 musl 二进制和对应的 sha256，没有动态依赖。选错架构是唯一常见的坑：<code>uname -m</code> 在 MIPS 上分不出大小端。</span>
+        <span lang="en">Every release carries five static musl binaries with their sha256 sums — no dynamic dependencies. Picking the wrong architecture is the one common trap: <code>uname -m</code> cannot tell MIPS endianness apart.</span>
+      </p>
+    </div>
+
+    <div class="cols2">
+      <div>
+        <div class="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th><span lang="zh">文件</span><span lang="en">File</span></th>
+                <th><span lang="zh">适用</span><span lang="en">Target</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><th><code>zray-mipsel-softfloat</code></th><td><span lang="zh">小端 MIPS，多数 MT7621 / MT7620 路由器</span><span lang="en">LE MIPS: most MT7621 / MT7620 routers</span></td></tr>
+              <tr><th><code>zray-mips-softfloat</code></th><td><span lang="zh">大端 MIPS，少数老设备</span><span lang="en">BE MIPS, a few older boxes</span></td></tr>
+              <tr><th><code>zray-arm-v7</code></th><td><span lang="zh">ARMv7 路由器、树莓派 2 / 3</span><span lang="en">ARMv7 routers, Raspberry Pi 2 / 3</span></td></tr>
+              <tr><th><code>zray-aarch64</code></th><td><span lang="zh">ARM64 软路由、VPS、树莓派 4</span><span lang="en">ARM64 mini-PCs, VPS, Pi 4</span></td></tr>
+              <tr><th><code>zray-x86_64</code></th><td><span lang="zh">PC / x86 软路由 / VPS</span><span lang="en">PC / x86 mini-PC / VPS</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note">
+          <span lang="zh">在 OpenWrt 上用发行版架构串最准：<code>. /etc/openwrt_release &amp;&amp; echo $DISTRIB_ARCH</code> — <code>mipsel_24kc</code> 就选 mipsel。</span>
+          <span lang="en">On OpenWrt ask the distro: <code>. /etc/openwrt_release &amp;&amp; echo $DISTRIB_ARCH</code> — <code>mipsel_24kc</code> means the mipsel build.</span>
+        </p>
+      </div>
+
+      <div>
+        <div class="code">
+          <div class="code-bar">
+            <span><span lang="zh">路由器上，一行搞定</span><span lang="en">On the router</span></span>
+            <button class="copy" type="button" data-copy>
+              <span lang="zh">复制</span><span lang="en">Copy</span>
+            </button>
+          </div>
+<pre><code><span class="c"># download + verify + fix the mode</span>
+mkdir -p /mnt/zray &amp;&amp; cd /mnt/zray
+wget -O zray https://github.com/yunnysunny/zray/releases/latest/download/zray-mipsel-softfloat
+wget -O zray.sha256 https://github.com/yunnysunny/zray/releases/latest/download/zray-mipsel-softfloat.sha256
+chmod 755 zray
+sha256sum zray     <span class="c"># compare with the first column of zray.sha256</span>
+./zray</code></pre>
+        </div>
+        <div class="code">
+          <div class="code-bar">
+            <span><span lang="zh">或者自己编译（Zig 0.17.0）</span><span lang="en">Or build it (Zig 0.17.0)</span></span>
+            <button class="copy" type="button" data-copy>
+              <span lang="zh">复制</span><span lang="en">Copy</span>
+            </button>
+          </div>
+<pre><code>zig build test                       <span class="c"># unit tests, any host</span>
+zig build --release -Dtarget=mipsel-linux-musl \
+    -Dcpu=mips32r2+soft_float -p zig-out/mipsel</code></pre>
+        </div>
+        <p class="note">
+          <span lang="zh">代理服务只在 Linux 上运行。macOS / Windows 上能编译、能跑 <code>probe</code>，服务本身不行。</span>
+          <span lang="en">The proxy service is Linux-only. On macOS / Windows you can build and run <code>probe</code>, nothing else.</span>
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= config ================= -->
+<section id="config">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">05</span>
+      <h2><span lang="zh">配置</span><span lang="en">Configure</span></h2>
+      <p class="sub">
+        <span lang="zh"><code>zray [config.json]</code>，默认读 <code>./config.json</code>。没有命令行参数，也没有环境变量。写错的键会直接报错退出，不会悄悄回退到默认值。</span>
+        <span lang="en"><code>zray [config.json]</code>, defaulting to <code>./config.json</code>. No flags, no environment variables. A mistyped key is a startup error rather than a silent fallback to a default.</span>
+      </p>
+    </div>
+
+    <div class="cols2">
+      <div>
+        <div class="code">
+          <div class="code-bar">
+            <span>config.json · REALITY</span>
+            <button class="copy" type="button" data-copy>
+              <span lang="zh">复制</span><span lang="en">Copy</span>
+            </button>
+          </div>
+<pre><code>{
+  "listen": "127.0.0.1:1080",
+  "server": "example.com",
+  "port": 443,
+  "sni": "example.com",
+  "security": "reality",
+  "public_key": "&lt;server publicKey&gt;",
+  "short_id": "",
+  "uuid": "&lt;uuid&gt;",
+  "max_connections": 64
+}</code></pre>
+        </div>
+        <p class="note">
+          <span lang="zh">普通 VLESS + TLS 节点把 <code>security</code> 改成 <code>"tls"</code>，去掉 <code>public_key</code> / <code>short_id</code>，加上 <code>"tls_verify": "none"</code>。模式永远不会被推断出来，混合字段会报错。</span>
+          <span lang="en">For a plain VLESS + TLS node set <code>security</code> to <code>"tls"</code>, drop <code>public_key</code> / <code>short_id</code> and add <code>"tls_verify": "none"</code>. The mode is never inferred and mixed fields are rejected.</span>
+        </p>
+      </div>
+
+      <div>
+        <div class="code">
+          <div class="code-bar">
+            <span><span lang="zh">多出口 + 链式 + 分流</span><span lang="en">Outbounds, chaining, routing</span></span>
+            <button class="copy" type="button" data-copy>
+              <span lang="zh">复制</span><span lang="en">Copy</span>
+            </button>
+          </div>
+<pre><code>{
+  "outbounds": [
+    { "tag": "relay", "server": "relay.example.com",
+      "security": "reality", "public_key": "&lt;pk&gt;", "uuid": "&lt;uuid&gt;" },
+    { "tag": "exit-a", "server": "exit.example.com",
+      "security": "tls", "tls_verify": "none",
+      "uuid": "&lt;uuid&gt;", "network": "ws",
+      "ws_path": "/vless-ws", "flow": "none",
+      "dialer": "relay" }
+  ],
+  "rules": [
+    { "domain_suffix": ["openai.com", "claude.ai"],
+      "outbound": ["exit-a"] }
+  ],
+  "default": ["relay"]
+}</code></pre>
+        </div>
+        <p class="note">
+          <span lang="zh">命中规则的流量走 <code>relay → exit-a</code>，失败只在组内切换、绝不退回 <code>default</code>；其余流量只到 relay 为止。完整原理见<a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">链式出站教程</a>。</span>
+          <span lang="en">Matched traffic goes <code>relay → exit-a</code> and fails over only inside the group, never back to <code>default</code>; everything else stops at the relay. See the <a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">chaining tutorial</a>.</span>
+        </p>
+      </div>
+    </div>
+
+    <h3 class="blocktitle" style="margin-top:44px"><span lang="zh">启动日志就是它的自检报告</span><span lang="en">The startup log is the health report</span></h3>
+    <div class="code">
+      <div class="code-bar">
+        <span><span lang="zh">两行看懂它在干什么</span><span lang="en">Two lines tell you what it is doing</span></span>
+        <button class="copy" type="button" data-copy>
+          <span lang="zh">复制</span><span lang="en">Copy</span>
+        </button>
+      </div>
+<pre><code>zray 0.4.0 socks5 [127.0.0.1:1080] redirect [] sniff true, 1 outbounds, 0 rules, 64 slots x 93 KiB = 5937 KiB
+outbound -: example.com:443 sni example.com mode reality (short_id -) vision</code></pre>
+    </div>
+    <p class="note">
+      <span lang="zh">入口、槽位与内存总量、每个上游的模式（<code>reality</code> / <code>tls, verify NONE</code>）、是否 Vision、是否 ws、是否经 hop——都在这里，不用去翻配置。</span>
+      <span lang="en">Inbounds, slots and total memory, the mode of every outbound (<code>reality</code> or <code>tls, verify NONE</code>), whether Vision and ws are on, whether it goes through a hop — it is all there, no need to re-read the config.</span>
+    </p>
+  </div>
+</section>
+
+<!-- ================= deploy + docs ================= -->
+<section id="docs">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">06</span>
+      <h2><span lang="zh">部署与文档</span><span lang="en">Deploy and docs</span></h2>
+      <p class="sub">
+        <span lang="zh">OpenWrt 上用仓库里的 procd 脚本，两分钟开机自启；透明代理需要一条 nft 规则把命中集合的流量 redirect 过来。</span>
+        <span lang="en">On OpenWrt the bundled procd script gets it running at boot in two minutes; transparent proxying needs one nft rule redirecting the matching set.</span>
+      </p>
+    </div>
+
+    <div class="cols2" style="margin-bottom:40px">
+      <div>
+        <div class="code">
+          <div class="code-bar">
+            <span>OpenWrt · procd</span>
+            <button class="copy" type="button" data-copy>
+              <span lang="zh">复制</span><span lang="en">Copy</span>
+            </button>
+          </div>
+<pre><code>scp zray config.json root@router:/mnt/zray/
+scp deploy/zray.init root@router:/etc/init.d/zray
+ssh root@router '
+  chmod 755 /etc/init.d/zray /mnt/zray/zray
+  chmod 600 /mnt/zray/config.json
+  /etc/init.d/zray enable &amp;&amp; /etc/init.d/zray start'</code></pre>
+        </div>
+      </div>
+      <div>
+        <div class="code">
+          <div class="code-bar">
+            <span><span lang="zh">透明代理 · nft</span><span lang="en">Transparent · nft</span></span>
+            <button class="copy" type="button" data-copy>
+              <span lang="zh">复制</span><span lang="en">Copy</span>
+            </button>
+          </div>
+<pre><code>table inet gfw {
+  set iplist { type ipv4_addr; flags interval; }
+  chain prerouting { type nat hook prerouting priority 0;
+    ip daddr @iplist ip protocol tcp redirect to :1080 }
+  chain output { type nat hook output priority filter;
+    ip daddr @iplist ip protocol tcp redirect to :1080 }
+}</code></pre>
+        </div>
+        <p class="note">
+          <span lang="zh">服务端自己的 IP 绝不能进这个集合，否则 zray 连自己的流量会被 redirect 回来。</span>
+          <span lang="en">The server's own IP must never enter that set, or zray's own outbound gets redirected back into itself.</span>
+        </p>
+      </div>
+    </div>
+
+    <ul class="doclist">
+      <li>
+        <a href="https://github.com/yunnysunny/zray/blob/master/docs/usage.zh-CN.md">
+          <span>
+            <span class="t"><span lang="zh">使用说明</span><span lang="en">User guide (中文)</span></span>
+            <span class="d"><span lang="zh">五分钟跑起来、分享链接怎么填、三种部署方式、调优、排错表、从 v0.3 升级</span><span lang="en">Five-minute start, share-link mapping, three deployments, tuning, a troubleshooting table, upgrading from v0.3</span></span>
+          </span>
+          <span class="meta">docs/usage.zh-CN.md</span>
+        </a>
+      </li>
+      <li>
+        <a href="https://github.com/yunnysunny/zray/blob/master/docs/usage.md">
+          <span>
+            <span class="t">User guide (English)</span>
+            <span class="d"><span lang="zh">上面那份的英文版</span><span lang="en">The same guide in English</span></span>
+          </span>
+          <span class="meta">docs/usage.md</span>
+        </a>
+      </li>
+      <li>
+        <a href="https://github.com/yunnysunny/zray/blob/master/README.md">
+          <span>
+            <span class="t">README</span>
+            <span class="d"><span lang="zh">完整的功能说明与全部配置字段（<a href="https://github.com/yunnysunny/zray/blob/master/docs/README.zh-CN.md">中文版</a>）</span><span lang="en">Every feature and config key, in full (<a href="https://github.com/yunnysunny/zray/blob/master/docs/README.zh-CN.md">中文版</a>)</span></span>
+          </span>
+          <span class="meta">README.md</span>
+        </a>
+      </li>
+      <li>
+        <a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">
+          <span>
+            <span class="t"><span lang="zh">链式出站教程：relay 和 exit 到底在干什么</span><span lang="en">Chaining tutorial (中文)</span></span>
+            <span class="d"><span lang="zh">为什么要把「怎么出去」和「以谁的身份出现」拆给两台机器，封装层次、代价、如何自证生效</span><span lang="en">Why "how you get out" and "who you appear as" belong to different machines: layers, costs, and how to prove it works</span></span>
+          </span>
+          <span class="meta">chain-relay-exit</span>
+        </a>
+      </li>
+      <li>
+        <a href="https://github.com/yunnysunny/zray/blob/master/TODO.md">
+          <span>
+            <span class="t"><span lang="zh">状态与已知限制</span><span lang="en">Status and known limits</span></span>
+            <span class="d"><span lang="zh">上游 IP 变更需重启、UDP 约 600 字节上限、没有日志级别控制、还没有 TPROXY</span><span lang="en">Resolved once at startup, the ~600 byte UDP ceiling, no log level control, no TPROXY yet</span></span>
+          </span>
+          <span class="meta">TODO.md</span>
+        </a>
+      </li>
+      <li>
+        <a href="https://github.com/yunnysunny/zray">
+          <span>
+            <span class="t"><span lang="zh">源码与 Issue</span><span lang="en">Source and issues</span></span>
+            <span class="d"><span lang="zh">Zig 0.17.0，MIT。CI 在 x86_64 和 MIPS（qemu-user）上跑单测与启动冒烟</span><span lang="en">Zig 0.17.0, MIT. CI runs unit tests and a startup smoke test on x86_64 and MIPS via qemu-user</span></span>
+          </span>
+          <span class="meta">github.com/yunnysunny/zray</span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>zray <span class="tag">v0.4.0</span></span>
+    <span><span lang="zh">Zig 0.17.0 · 静态 musl · MIT</span><span lang="en">Zig 0.17.0 · static musl · MIT</span></span>
+    <a class="spacer" href="https://github.com/yunnysunny/zray">GitHub</a>
+    <a href="https://github.com/yunnysunny/zray/releases">Releases</a>
+    <a href="https://github.com/yunnysunny/zray/issues">Issues</a>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

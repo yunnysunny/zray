@@ -48,6 +48,9 @@ AES-GCM 的上限约 1.5 MB/s，这正是 Vision 的 direct 直拷在这类设�
 - **UDP** 走 XUDP（VLESS mux），full-cone，与 xray 对 Vision 的处理一致。
 - **零延迟嗅探**：上游握手还在飞的时候，客户端的首包已经到了，顺手解出
   TLS SNI 或 HTTP `Host`，让服务端看到域名而不是 IP。
+- **WebSocket 传输、链式与分流**：节点可以骑在 TLS 里的 `network: "ws"` 上；
+  一个出站可以经另一个拨出（`dialer`）；`domain_suffix` 规则把域名分给一组
+  出口，故障只在组内切换。
 
 刻意不做的：TLS 1.2、会话恢复、0-RTT、证书解压（只 *offer*
 `compress_certificate`，Go 服务端不会真用）、TPROXY、SOCKS5 UDP 分片。
@@ -230,6 +233,14 @@ table inet gfw {
 DoT 上游走 zray），把 `bootstrap_dns` 设成一个公共 DNS，启动时的解析就完全
 不经过本地解析器。
 
+## 文档
+
+- [usage.zh-CN.md](usage.zh-CN.md) —— 使用说明：五分钟上手、分享链接怎么填、
+  三种部署方式、调优、排错表、从 v0.3 升级。（[English](usage.md)）
+- [chain-relay-exit.zh-CN.md](chain-relay-exit.zh-CN.md) —— 链式出站教程：
+  relay 和 exit 到底在干什么，封装层次与代价。
+- [../website/](../website/) —— 官方网站（纯静态，无构建步骤）。
+
 ## 目录结构
 
 ```
@@ -252,11 +263,13 @@ src/
     mux.zig           XUDP（Mux.Cool）帧
     socks5.zig        SOCKS5 greeting / CONNECT / UDP ASSOCIATE
     sniff.zig         TLS SNI 与 HTTP Host 提取
+    ws.zig            WebSocket 客户端帧处理（VLESS 的 `ws` 传输）
   linux/
     sys.zig           系统调用薄封装（socket、epoll、SO_ORIGINAL_DST）
     conn.zig          单连接状态机与中继
 deploy/               OpenWrt procd 脚本与配置模板
 tools/udptest.py      SOCKS5 UDP ASSOCIATE 冒烟测试
+website/              官方网站（纯静态，无构建步骤）
 ```
 
 `tls/` 和 `proxy/` 全部是 sans-I/O 且有单元测试（`zig build test`）；

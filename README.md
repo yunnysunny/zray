@@ -66,6 +66,17 @@ Not included, on purpose: TLS 1.2, session resumption, 0-RTT, certificate
 decompression (we only *offer* `compress_certificate`; Go servers never use
 it), TPROXY, SOCKS5 UDP fragmentation.
 
+## Documentation
+
+- [docs/usage.md](docs/usage.md) — user guide: first run, share-link
+  mapping, the three deployment shapes, tuning, troubleshooting, upgrading.
+  ([简体中文](docs/usage.zh-CN.md))
+- [docs/chain-relay-exit.zh-CN.md](docs/chain-relay-exit.zh-CN.md) — what a
+  relay / exit chain actually does, with the encapsulation layers and its cost.
+- [website/](website/) — the official site (static, no build step):
+  `python3 -m http.server` inside that directory to preview.
+- [TODO.md](TODO.md) — known limits and deferred work.
+
 ## Building
 
 Requires Zig 0.17.0. Prebuilt binaries for mipsel / mips / aarch64 / armv7 /
