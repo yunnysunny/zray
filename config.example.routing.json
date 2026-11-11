@@ -52,5 +52,6 @@
   "default": ["relay"],
   "fail_backoff_s": 30,
   "max_connections": 64,
-  "stats_interval_s": 60
+  "stats_interval_s": 60,
+  "workers": 1
 }

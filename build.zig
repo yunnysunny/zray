@@ -10,7 +10,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // Routers have small flash; keep the binary lean.
         .strip = optimize != .debug,
-        .single_threaded = true,
     });
 
     const exe = b.addExecutable(.{

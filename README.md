@@ -7,7 +7,7 @@ A minimal [REALITY](https://github.com/XTLS/REALITY) client (VLESS +
 beyond the Zig standard library.
 
 It is built for the kind of box that has one or two slow cores, ~100 MB of
-RAM and no FPU: a single thread, an `epoll` loop, and a fixed pool of
+RAM and no FPU: one network worker by default, configurable `epoll` workers, and a fixed pool of
 connection slots allocated up front. Memory use is decided at startup and does
 not grow with traffic.
 
@@ -129,6 +129,7 @@ inner connection presents.
 | `idle_timeout_s` | `600` | Close a relay with no traffic in either direction. |
 | `sock_buf` | `0` | `SO_SNDBUF` / `SO_RCVBUF` per socket; `0` leaves kernel defaults. |
 | `stats_interval_s` | `60` | Periodic statistics interval in seconds; 0 disables periodic statistics. |
+| `workers` | `1` | Network workers: 1 keeps the original single loop; 0 selects automatically (up to 4); 2..16 requests a count, capped by max_connections. |
 
 All runtime controls above belong at the **top level** of the configuration JSON,
 alongside `listen` and `max_connections`, including when using multiple outbounds.
@@ -140,6 +141,23 @@ file, run `/etc/init.d/zray restart`. JSON does not allow comments.
 The REALITY server checks the client's clock (timestamp inside the sealed
 `session_id`). A router whose time is not synced will fail every handshake
 with `CertificateRejected`.
+
+### Network workers
+
+Merge these options into the top level of your existing JSON configuration:
+
+```json
+{
+  "workers": 1
+}
+```
+
+`workers` defaults to **1**, keeping the original single event loop on the main
+thread. Set `workers` to **0** to select automatically (at most four CPUs), or
+**2..16** to request that many network workers. The actual count cannot exceed
+`max_connections`, which remains the total connection budget for the process and
+is divided among worker pools. Extra workers handle concurrent connections;
+one TCP connection is not split across network workers. Changes require restart.
 
 ### Plain VLESS + TLS (no REALITY)
 

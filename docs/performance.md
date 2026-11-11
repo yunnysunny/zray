@@ -20,3 +20,18 @@ transfer, not a hardware benchmark or an expected speedup.
 Each readable event advances at most 16 ordinary reads, stopping on backpressure,
 EOF, protocol-state changes or no progress. This reduces repeated epoll wakeups
 without allowing one ready stream to drain indefinitely.
+
+## Network workers
+
+`workers` defaults to **1**, retaining one network event loop on the main thread.
+Set it to 0 to choose automatically (at most four CPUs), or 2..16 to request a
+specific worker count. The actual count cannot exceed `max_connections`.
+`max_connections` is a process-wide total, divided among worker pools including
+any remainder. A full pool stops accepting until a slot is released.
+
+Each connection belongs to one worker; extra workers help independent concurrent
+connections and do not divide one TCP stream across cores. Diagnostics are
+cumulative per worker. Shared listeners use EPOLLEXCLUSIVE when available.
+
+The build still uses the original ReleaseSmall preference. Only the compiler's
+single-thread-only assumption is removed so configured workers can run.

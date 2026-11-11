@@ -5,8 +5,8 @@
 面向家用路由器的最小 [REALITY](https://github.com/XTLS/REALITY) 客户端
 （VLESS + `xtls-rprx-vision`），用 Zig 编写，除 Zig 标准库外没有任何依赖。
 
-它针对的是这样的设备：一两个慢核心、约 100 MB 内存、没有 FPU。单线程、
-`epoll` 事件循环、启动时一次性分配固定数量的连接槽位。内存占用在启动时就
+它针对的是这样的设备：一两个慢核心、约 100 MB 内存、没有 FPU。默认单线程、
+可配置多个 `epoll` 网络 worker、启动时一次性分配固定数量的连接槽位。内存占用在启动时就
 确定，不随流量增长。
 
 参考部署：小米 AC2100（MT7621，MIPS 1004Kc，软浮点，ImmortalWrt 23.05）——
@@ -113,6 +113,7 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `idle_timeout_s` | `600` | 双向都无流量多久后关闭。 |
 | `sock_buf` | `0` | 每个 socket 的 `SO_SNDBUF` / `SO_RCVBUF`；`0` 用内核默认。 |
 | `stats_interval_s` | `60` | 统计输出间隔，单位秒；0 关闭定期统计。 |
+| `workers` | `1` | 网络 worker 数：1 保持原有单事件循环；0 自动选择、最多 4 个；2..16 指定数量，实际不超过 max_connections。 |
 
 上述运行参数全部写在配置 JSON 的**最外层**，与 `listen`、`max_connections`
 同级；使用多节点时也不要写进 `outbounds` 的节点对象。省略字段即采用表中默认值。
@@ -124,6 +125,39 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 
 REALITY 服务端会校验客户端时钟（封在 `session_id` 里的时间戳）。路由器时间
 没同步时所有握手都会以 `CertificateRejected` 失败。
+
+### 多核与转发配置
+
+`workers` 是网络事件循环数。默认 `1` 在主线程运行原有的单事件循环；
+设为 `0` 时自动选择、最多 4 个；设为 `2` 到 `16` 时指定数量，实际数量
+不超过 `max_connections`。例如四核机器可以设置 `"workers": 4`。
+`max_connections` 始终是整个进程的连接总额度，不会乘以 worker 数。
+每条连接归属于一个 worker，多核用于处理并发连接，不会把一条 TCP 流拆给多个核心。
+
+`stats_interval_s` 默认 `60`，可设为 `10` 每十秒查看一次累计统计，
+或设为 `0` 关闭定期统计。它不控制其他连接日志。
+
+### 完整 REALITY 配置示例
+
+下面展示四个网络 worker 的完整配置。必须替换 `server`、`sni`、`public_key`、
+`uuid`，并按服务端设置填写 `short_id`；占位值不能直接用于连接。
+
+```json
+{
+  "listen": "127.0.0.1:1080",
+  "server": "node.example.com",
+  "port": 443,
+  "sni": "example.com",
+  "security": "reality",
+  "public_key": "<填入服务端公钥，base64url>",
+  "short_id": "",
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "flow": "xtls-rprx-vision",
+  "max_connections": 64,
+  "workers": 4,
+  "stats_interval_s": 60
+}
+```
 
 ### 普通 VLESS + TLS（非 REALITY）
 
