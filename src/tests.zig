@@ -16,6 +16,7 @@ comptime {
     _ = @import("proxy/dns.zig");
     _ = @import("proxy/ws.zig");
     _ = @import("linux/conn.zig");
+    _ = @import("linux/kernel_crypto.zig");
     _ = @import("tls/fingerprint.zig");
     _ = @import("main.zig");
 }

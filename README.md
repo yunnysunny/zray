@@ -352,6 +352,7 @@ src/
   linux/
     sys.zig           thin syscall wrappers (sockets, epoll, SO_ORIGINAL_DST)
     conn.zig          per-connection state machine and relay
+    kernel_crypto.zig generic AF_ALG and devcrypto AES-GCM backends
 deploy/               OpenWrt procd script and config template
 tools/udptest.py      SOCKS5 UDP ASSOCIATE smoke test
 ```
