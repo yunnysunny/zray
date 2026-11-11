@@ -484,6 +484,14 @@ pub const Loop = struct {
     // ---- client side ---------------------------------------------------------
 
     fn readClient(l: *Loop, c: *Conn) !void {
+        for (0..16) |_| {
+            const reads = sys.counters.reads;
+            try l.readClientOnce(c);
+            if (c.state != .relay or c.client_eof or c.up_out_len > 0 or c.cin_len > 0 or sys.counters.reads == reads) break;
+        }
+    }
+
+    fn readClientOnce(l: *Loop, c: *Conn) !void {
         if (c.client_eof) return; // RDHUP can be reported more than once
         if (c.state == .relay and !c.is_udp and c.padder.direct and c.cin_len == 0 and c.up_out_len == 0) {
             // Read straight into the transmit queue: no cin -> up_out copy.
@@ -1050,6 +1058,14 @@ pub const Loop = struct {
     }
 
     fn readUpstream(l: *Loop, c: *Conn) !void {
+        for (0..16) |_| {
+            const reads = sys.counters.reads;
+            try l.readUpstreamOnce(c);
+            if (c.state != .relay or c.up_eof or c.c_out_len > 0 or sys.counters.reads == reads) break;
+        }
+    }
+
+    fn readUpstreamOnce(l: *Loop, c: *Conn) !void {
         if (c.up_eof) return;
         if (c.c_out_len > 0) return; // back-pressure
         if (c.state == .relay and c.unpadder.direct) {

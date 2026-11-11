@@ -14,3 +14,9 @@ or change the final argument to 4 for concurrent transfers. Use the same large
 object, node and socket-buffer settings for every comparison; repeat and observe
 CPU usage separately. The script reports bytes, seconds and bytes/second for each
 transfer, not a hardware benchmark or an expected speedup.
+
+## Bounded event progress
+
+Each readable event advances at most 16 ordinary reads, stopping on backpressure,
+EOF, protocol-state changes or no progress. This reduces repeated epoll wakeups
+without allowing one ready stream to drain indefinitely.
