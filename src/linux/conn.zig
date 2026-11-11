@@ -154,6 +154,8 @@ pub const Conn = struct {
     client_eof: bool = false,
     /// Upstream finished sending; close once `c_out` is drained.
     up_eof: bool = false,
+    up_write_closed: bool = false,
+    client_write_closed: bool = false,
 
     // client -> upstream
     cin: [client_chunk]u8 = undefined,
@@ -270,6 +272,8 @@ pub const Loop = struct {
         c.c_out_len = 0;
         c.client_eof = false;
         c.up_eof = false;
+        c.up_write_closed = false;
+        c.client_write_closed = false;
         c.got_resp_hdr = false;
         c.sniff_enabled = l.cfg.sniff and forced == null;
         c.forced = forced;
@@ -378,28 +382,26 @@ pub const Loop = struct {
         if (slot >= l.conns.len) return;
         const c = &l.conns[slot];
         if (c.state == .free or c.gen != gen) return; // stale
-        c.last_active = sys.monotonicSeconds();
-
-        const fail = events & (sys.EPOLL.ERR | sys.EPOLL.HUP) != 0;
         switch (side) {
             .client => {
                 if (events & sys.EPOLL.OUT != 0) l.flushClient(c) catch |e| return l.close(c, @errorName(e));
-                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP) != 0) l.readClient(c) catch |e| return l.close(c, @errorName(e));
-                if (fail and c.state != .free) return l.close(c, "client hup");
+                if (c.state == .free) return;
+                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP | sys.EPOLL.HUP) != 0) l.readClient(c) catch |e| return l.close(c, @errorName(e));
+                if (events & sys.EPOLL.ERR != 0 and c.state != .free) return l.close(c, "client error");
             },
             .upstream => {
                 if (events & sys.EPOLL.OUT != 0) l.upstreamWritable(c) catch |e| {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, @errorName(e));
                     return l.close(c, @errorName(e));
                 };
-                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP) != 0) l.readUpstream(c) catch |e| {
+                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP | sys.EPOLL.HUP) != 0) l.readUpstream(c) catch |e| {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, @errorName(e));
                     switch (e) {
                         error.UpstreamEof, error.UpstreamCloseNotify => return l.upstreamDone(c),
                         else => return l.close(c, @errorName(e)),
                     }
                 };
-                if (fail and c.state != .free) {
+                if (events & sys.EPOLL.ERR != 0 and c.state != .free) {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, "upstream hup");
                     return l.upstreamDone(c);
                 }
@@ -414,25 +416,37 @@ pub const Loop = struct {
 
     /// Upstream has nothing more to send: deliver what is queued, then close.
     fn upstreamDone(l: *Loop, c: *Conn) void {
-        if (c.c_out_len == 0) return l.close(c, "upstream eof");
         c.up_eof = true;
-        if (c.up_fd >= 0) {
-            sys.epollDel(l.ep, c.up_fd);
-            sys.close(c.up_fd);
-            c.up_fd = -1;
-        }
+        l.finishDirections(c) catch |e| return l.close(c, @errorName(e));
+        if (c.state == .free) return;
         l.updateInterest(c);
+    }
+
+    fn finishDirections(l: *Loop, c: *Conn) (sys.Error || client.Error)!void {
+        if (c.up_eof and c.c_out_len == 0 and !c.client_write_closed) {
+            sys.shutdownWrite(c.client_fd);
+            c.client_write_closed = true;
+        }
+        if (c.client_eof and c.cin_len == 0 and c.up_out_len == 0 and !c.up_write_closed and c.state == .relay) {
+            c.up_write_closed = true;
+            if (c.padder.direct) sys.shutdownWrite(c.up_fd) else {
+                const rec = try c.tls.close(&c.up_out);
+                c.up_out_off = 0;
+                c.up_out_len = rec.len;
+                try l.flushUpstream(c);
+            }
+        }
+        if (c.client_eof and c.up_eof and c.cin_len == 0 and c.c_out_len == 0 and c.up_out_len == 0) l.close(c, "eof");
     }
 
     /// Derive epoll interest sets from buffer state. Read a side only when the
     /// queue feeding the other side is empty.
     fn updateInterest(l: *Loop, c: *Conn) void {
-        var cev: u32 = sys.EPOLL.RDHUP;
+        var cev: u32 = 0;
         if (c.c_out_len > 0) cev |= sys.EPOLL.OUT;
-        if (c.is_udp or (!c.client_eof and c.up_out_len == 0 and c.cin_len < c.cin.len)) cev |= sys.EPOLL.IN;
+        if (c.is_udp or (!c.client_eof and c.up_out_len == 0 and c.cin_len < c.cin.len)) cev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
         if (cev != c.client_ev) {
-            sys.epollMod(l.ep, c.client_fd, cev, c.token(.client)) catch {};
-            c.client_ev = cev;
+            l.setInterest(c.client_fd, &c.client_ev, cev, c.token(.client));
         }
         if (c.udp_fd >= 0) {
             // Datagrams wait in the kernel until the tunnel is up and the
@@ -444,13 +458,26 @@ pub const Loop = struct {
             }
         }
         if (c.up_fd < 0) return;
-        var uev: u32 = sys.EPOLL.RDHUP;
+        var uev: u32 = 0;
         if (c.state == .connecting or c.up_out_len > 0) uev |= sys.EPOLL.OUT;
-        if (c.state != .connecting and c.c_out_len == 0) uev |= sys.EPOLL.IN;
+        if (!c.up_eof and c.state != .connecting and c.c_out_len == 0) uev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
         if (uev != c.up_ev) {
-            sys.epollMod(l.ep, c.up_fd, uev, c.token(.upstream)) catch {};
-            c.up_ev = uev;
+            l.setInterest(c.up_fd, &c.up_ev, uev, c.token(.upstream));
         }
+    }
+
+    // An empty mask still receives HUP/ERR. Remove blocked sockets entirely,
+    // and re-add them when the opposite queue drains so EOF remains observable.
+    fn setInterest(l: *Loop, fd: sys.fd_t, old: *u32, next: u32, tok: u64) void {
+        if (next == old.*) return;
+        if (next == 0) {
+            sys.epollDel(l.ep, fd);
+        } else if (old.* == 0) {
+            sys.epollAdd(l.ep, fd, next, tok) catch return;
+        } else {
+            sys.epollMod(l.ep, fd, next, tok) catch return;
+        }
+        old.* = next;
     }
 
     // ---- client side ---------------------------------------------------------
@@ -465,6 +492,7 @@ pub const Loop = struct {
                 error.WouldBlock => return,
                 else => return e,
             };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
             if (n == 0) return error.UdpControlClosed;
             return;
         }
@@ -473,24 +501,14 @@ pub const Loop = struct {
             error.WouldBlock => return,
             else => return e,
         };
+        if (n > 0) c.last_active = sys.monotonicSeconds();
         if (n == 0) {
             c.client_eof = true;
             // Hop connection whose chained outbound gave up before the relay
             // answered (dead exit): nobody is left to read the reply, and the
             // relay may keep dialing for a minute. Free the slot now.
             if (c.forced != null and !c.got_resp_hdr) return error.HopClientGone;
-            // Nothing more to forward: let upstream finish, then close on its EOF.
-            if (c.state == .relay and c.cin_len == 0 and c.up_out_len == 0) {
-                if (c.fullyDirect()) sys.shutdownWrite(c.up_fd) else {
-                    const rec = c.tls.close(&c.up_out) catch |e| {
-                        sys.log("[{d}] tls close: {s} (tls state {s})", .{ c.slot, @errorName(e), @tagName(c.tls.state) });
-                        return error.TlsClose;
-                    };
-                    c.up_out_off = 0;
-                    c.up_out_len = rec.len;
-                    try l.flushUpstream(c);
-                }
-            } else if (c.state != .relay) return error.ClientClosedEarly;
+            if (c.state == .relay) try l.finishDirections(c) else return error.ClientClosedEarly;
             return;
         }
         c.cin_len += n;
@@ -622,6 +640,7 @@ pub const Loop = struct {
         if (c.udp_peer) |p| {
             if (!p.eql(dg.from)) return; // not our client
         } else c.udp_peer = dg.from;
+        if (dg.len > 0) c.last_active = sys.monotonicSeconds();
         const dgram = c.cin[0..dg.len];
         const hdr = (socks5.parseUdpHeader(dgram) catch return) orelse return;
         const payload = dgram[hdr.len..];
@@ -697,11 +716,15 @@ pub const Loop = struct {
                 error.WouldBlock => return,
                 else => return e,
             };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
             c.c_out_off += n;
             c.c_out_len -= n;
         }
         c.c_out_off = 0;
-        if (c.up_eof) return error.Done;
+        if (c.state == .relay) {
+            try l.finishDirections(c);
+            if (c.state == .free) return;
+        }
         // Queue drained: records still buffered in uin can now be processed.
         if (c.uin_len > 0 and c.state == .relay and !c.unpadder.direct) {
             try processRecords(c);
@@ -986,19 +1009,22 @@ pub const Loop = struct {
         try l.flushUpstream(c);
     }
 
-    fn flushUpstream(_: *Loop, c: *Conn) !void {
+    fn flushUpstream(l: *Loop, c: *Conn) !void {
         while (c.up_out_len > 0) {
             const n = sys.write(c.up_fd, c.up_out[c.up_out_off..][0..c.up_out_len]) catch |e| switch (e) {
                 error.WouldBlock => return,
                 else => return e,
             };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
             c.up_out_off += n;
             c.up_out_len -= n;
         }
         c.up_out_off = 0;
+        if (c.state == .relay) try l.finishDirections(c);
     }
 
     fn readUpstream(l: *Loop, c: *Conn) !void {
+        if (c.up_eof) return;
         if (c.c_out_len > 0) return; // back-pressure
         if (c.state == .relay and c.unpadder.direct) {
             // Raw inner stream: straight copy.
@@ -1006,6 +1032,7 @@ pub const Loop = struct {
                 error.WouldBlock => return,
                 else => return e,
             };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
             if (n == 0) return error.UpstreamEof;
             c.c_out_off = 0;
             c.c_out_len = n;
@@ -1017,6 +1044,7 @@ pub const Loop = struct {
             error.WouldBlock => return,
             else => return e,
         };
+        if (n > 0) c.last_active = sys.monotonicSeconds();
         if (n == 0) return error.UpstreamEof;
         c.uin_len += n;
         if (c.state == .socks_dial) return l.socksDialReply(c);
@@ -1195,3 +1223,164 @@ pub const Loop = struct {
         c.up_out_len += rec.len;
     }
 };
+
+test "drain queued upload before FIN and preserve reverse traffic" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var cp: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &cp)));
+    defer sys.close(cp[1]);
+    var up: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &up)));
+    defer sys.close(up[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    const c = &conns[0];
+    c.state = .relay;
+    c.client_fd = cp[0];
+    c.up_fd = up[0];
+    c.padder.direct = true;
+    c.unpadder.direct = true;
+    c.client_eof = true;
+    c.up_out[0..3].* = "abc".*;
+    c.up_out_len = 3;
+    loop.active = 1;
+    defer loop.close(c, "test finished");
+    try loop.finishDirections(c);
+    try std.testing.expect(!c.up_write_closed);
+    try loop.flushUpstream(c);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try sys.read(up[1], &buf));
+    try std.testing.expectEqualSlices(u8, "abc", buf[0..3]);
+    try std.testing.expectEqual(@as(usize, 0), try sys.read(up[1], &buf));
+    try std.testing.expectEqual(@as(usize, 3), try sys.write(up[1], "xyz"));
+    loop.handle(c.token(.upstream), sys.EPOLL.IN);
+    try std.testing.expectEqual(@as(usize, 3), try sys.read(cp[1], &buf));
+    try std.testing.expectEqualSlices(u8, "xyz", buf[0..3]);
+    sys.shutdownWrite(up[1]);
+    loop.handle(c.token(.upstream), sys.EPOLL.IN);
+    try std.testing.expectEqual(@as(usize, 0), try sys.read(cp[1], &buf));
+    try std.testing.expectEqual(State.free, c.state);
+    try std.testing.expectEqual(@as(usize, 0), loop.active);
+}
+
+// Exercise real epoll readiness with unread data followed by FIN, rather than
+// pre-setting an EOF flag. Both directions must pause and later resume safely.
+fn backpressureHalfClose(download: bool, expire: bool) !void {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{}, .idle_timeout_s = 1 };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var cp: [2]sys.fd_t = undefined;
+    var up: [2]sys.fd_t = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &cp)));
+    defer sys.close(cp[1]);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &up)));
+    defer sys.close(up[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(cp[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    c.up_fd = up[0];
+    c.state = .relay;
+    c.padder.direct = true;
+    c.unpadder.direct = true;
+    const dst = if (download) cp[0] else up[0];
+    const sink = if (download) cp[1] else up[1];
+    const source = if (download) up[1] else cp[1];
+    const side: Side = if (download) .upstream else .client;
+    // Fill the destination's send buffer to force EAGAIN with a queued tail.
+    const filler: [4096]u8 = @splat(0x55);
+    while (true) {
+        _ = sys.write(dst, &filler) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    if (download) {
+        c.c_out[0..3].* = "abc".*;
+        c.c_out_len = 3;
+    } else {
+        c.up_out[0..3].* = "abc".*;
+        c.up_out_len = 3;
+    }
+    try std.testing.expectEqual(@as(usize, 3), try sys.write(source, "xyz"));
+    sys.shutdownWrite(source);
+    c.last_active = sys.monotonicSeconds() - 3;
+    const before = c.last_active;
+    // A stale RDHUP from the previous event batch must not extend idle life.
+    loop.handle(c.token(side), sys.EPOLL.RDHUP);
+    try std.testing.expectEqual(before, c.last_active);
+    for (0..4) |_| {
+        var events: [4]sys.Event = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try sys.epollWait(ep, &events, 10));
+    }
+    if (expire) {
+        loop.sweep();
+        try std.testing.expectEqual(State.free, c.state);
+        return;
+    }
+    // Remove only the filler, then let actual epoll events forward abc + xyz.
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        _ = sys.read(sink, &buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    var result: [6]u8 = undefined;
+    var used: usize = 0;
+    var eof = false;
+    for (0..100) |_| {
+        var events: [4]sys.Event = undefined;
+        const count = try sys.epollWait(ep, &events, 10);
+        for (events[0..count]) |ev| loop.handle(ev.data.u64, ev.events);
+        const n = sys.read(sink, &buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 0) {
+            eof = true;
+            break;
+        }
+        try std.testing.expect(used + n <= result.len);
+        @memcpy(result[used..][0..n], buf[0..n]);
+        used += n;
+    }
+    try std.testing.expect(eof);
+    try std.testing.expectEqualSlices(u8, "abcxyz", result[0..used]);
+    try std.testing.expect(c.last_active > before);
+    // The peer's FIN must leave the reverse direction usable.
+    try std.testing.expectEqual(@as(usize, 3), try sys.write(sink, "rev"));
+    var got_reverse = false;
+    for (0..100) |_| {
+        var events: [4]sys.Event = undefined;
+        const count = try sys.epollWait(ep, &events, 10);
+        for (events[0..count]) |ev| loop.handle(ev.data.u64, ev.events);
+        const n = sys.read(source, &buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        try std.testing.expectEqualSlices(u8, "rev", buf[0..n]);
+        got_reverse = true;
+        break;
+    }
+    try std.testing.expect(got_reverse);
+}
+
+test "upload backpressure and FIN pause epoll then preserve tail and reverse traffic" {
+    try backpressureHalfClose(false, false);
+}
+test "download backpressure and FIN pause epoll then preserve tail and reverse traffic" {
+    try backpressureHalfClose(true, false);
+}
+test "blocked half-closed upload still expires without progress" {
+    try backpressureHalfClose(false, true);
+}
+test "blocked half-closed download still expires without progress" {
+    try backpressureHalfClose(true, true);
+}
