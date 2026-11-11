@@ -159,6 +159,8 @@ const Schedule = union(enum) {
 
 pub const Client = struct {
     state: State = .start,
+    write_closed: bool = false,
+    read_closed: bool = false,
     opts: Options,
 
     x25519: X25519.KeyPair,
@@ -261,6 +263,7 @@ pub const Client = struct {
     /// Process one complete record (`rec` = header + body, decrypted in
     /// place). `out` receives anything that must be sent back.
     pub fn handleRecord(c: *Client, rec: []u8, out: []u8) Error!Result {
+        if (c.read_closed) return error.InvalidState;
         switch (c.state) {
             .start, .closed, .failed => return error.InvalidState,
             else => {},
@@ -310,15 +313,16 @@ pub const Client = struct {
 
     /// Encrypt application data into a record. Connected state only.
     pub fn encrypt(c: *Client, data: []const u8, out: []u8) Error![]u8 {
-        if (c.state != .connected) return error.InvalidState;
+        if (c.state != .connected or c.write_closed) return error.InvalidState;
         return c.write.?.seal(.application_data, data, out);
     }
 
-    /// Produce a close_notify alert record and move to `closed`.
+    /// Produce close_notify and close writing; peer input remains readable.
     pub fn close(c: *Client, out: []u8) Error![]u8 {
-        if (c.state != .connected) return error.InvalidState;
+        if (c.state != .connected or c.write_closed) return error.InvalidState;
         const rec = try c.write.?.seal(.alert, &tls.close_notify_alert, out);
-        c.state = .closed;
+        c.write_closed = true;
+        if (c.read_closed) c.state = .closed;
         return rec;
     }
 
@@ -329,7 +333,8 @@ pub const Client = struct {
         const alert: tls.Alert = .{ .level = @fromBackingInt(body[0]), .description = @fromBackingInt(body[1]) };
         c.last_alert = alert;
         if (alert.description == .close_notify) {
-            c.state = .closed;
+            c.read_closed = true;
+            if (c.write_closed) c.state = .closed;
             return .{ .event = .close_notify };
         }
         if (alert.level == .warning and alert.description == .user_canceled) return .{ .event = .warning_alert };
@@ -612,6 +617,12 @@ test "RFC 8448 full handshake reproduces client records byte-for-byte" {
 
     const alert = try c.close(&out);
     try testing.expectEqualSlices(u8, &rfc8448.client_alert_record, alert);
+    try testing.expect(c.write_closed);
+    try testing.expectEqual(State.connected, c.state);
+    try testing.expectError(error.InvalidState, c.encrypt(&payload, &out));
+    var server_alert = rfc8448.server_alert_record;
+    const r5 = try c.handleRecord(&server_alert, &out);
+    try testing.expectEqual(Event.close_notify, r5.event);
     try testing.expectEqual(State.closed, c.state);
 }
 
