@@ -2,6 +2,8 @@
 
 English | [简体中文](usage.zh-CN.md)
 
+> A web version of this guide lives at [website/usage.html](../website/usage.html), styled like the official site and switchable between English and Chinese.
+
 This is the **operator's guide**: which file to download, how to write the config, how to run it on a router after a reboot, and where to look when something breaks.
 
 [README](../README.md) is the complete feature and configuration reference; [the chaining tutorial](chain-relay-exit.zh-CN.md) (Chinese) covers relay / exit chains separately. The three complement each other.

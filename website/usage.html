@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="zh-CN" data-lang="zh"
+      data-title-zh="使用说明 — zray"
+      data-title-en="User guide — zray">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>使用说明 — zray</title>
+<meta name="description" content="zray 使用说明：从下载哪个文件、配置怎么写，到装在路由器上开机自启、出问题去哪儿看。">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="zray">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="1.5" y="1.5" width="21" height="21" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M6 7h12l-12 10h12" stroke="#b4451e" stroke-width="1.8"/>
+      </svg>
+      zray
+    </a>
+    <nav class="main">
+      <a href="index.html"><span lang="zh">首页</span><span lang="en">Home</span></a>
+      <a href="#s2"><span lang="zh">上手</span><span lang="en">Quickstart</span></a>
+      <a href="#s3"><span lang="zh">参数</span><span lang="en">Parameters</span></a>
+      <a href="#s4"><span lang="zh">用法</span><span lang="en">Usage</span></a>
+      <a href="#s5"><span lang="zh">部署</span><span lang="en">Service</span></a>
+      <a href="#s6"><span lang="zh">调优</span><span lang="en">Tuning</span></a>
+      <a href="#s7"><span lang="zh">排错</span><span lang="en">Troubleshooting</span></a>
+      <a href="https://github.com/yunnysunny/zray">GitHub&nbsp;↗</a>
+    </nav>
+    <div class="langswitch" role="group" aria-label="Language">
+      <button type="button" data-setlang="zh" aria-pressed="true">中</button>
+      <button type="button" data-setlang="en" aria-pressed="false">EN</button>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ================= page head ================= -->
+<section class="doc-head">
+  <div class="wrap">
+    <p class="eyebrow">
+      <span lang="zh">使用手册</span>
+      <span lang="en">Operator's guide</span>
+    </p>
+    <h1>
+      <span lang="zh">从下载到排错，<em>一口气</em>讲完</span>
+      <span lang="en">From download to<br>troubleshooting</span>
+    </h1>
+    <p class="lede">
+      <span lang="zh">面向要把 zray 用起来的人：哪个文件、配置怎么写、怎么装成开机自启的服务、出问题去哪儿看。完整的特性与配置参考在 <a href="https://github.com/yunnysunny/zray/blob/master/README.md">README</a>，链式出站单独有一篇<a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">教程</a>。</span>
+      <span lang="en">Which file to download, how to write the config, how to run it as a service that survives a reboot, and where to look when something breaks. The full feature and configuration reference is the <a href="https://github.com/yunnysunny/zray/blob/master/README.md">README</a>; relay / exit chaining has its own <a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">tutorial</a> (Chinese).</span>
+    </p>
+  </div>
+</section>
+
+<!-- ================= toc ================= -->
+<section class="toc">
+  <div class="wrap">
+    <ul class="doclist">
+      <li><a href="#s1"><span><span class="t"><span lang="zh">先确认你能不能用</span><span lang="en">Is this for you?</span></span></span><span class="meta">01</span></a></li>
+      <li><a href="#s2"><span><span class="t"><span lang="zh">五分钟跑起来（SOCKS5 模式）</span><span lang="en">Running in five minutes (SOCKS5)</span></span></span><span class="meta">02</span></a></li>
+      <li><a href="#s3"><span><span class="t"><span lang="zh">参数从哪来：分享链接怎么填</span><span lang="en">Where the values come from: share links</span></span></span><span class="meta">03</span></a></li>
+      <li><a href="#s4"><span><span class="t"><span lang="zh">三种用法</span><span lang="en">Three ways to deploy</span></span></span><span class="meta">04</span></a></li>
+      <li><a href="#s5"><span><span class="t"><span lang="zh">装成服务，开机自启</span><span lang="en">Run it as a service</span></span></span><span class="meta">05</span></a></li>
+      <li><a href="#s6"><span><span class="t"><span lang="zh">调优：把有限的 CPU 和内存用对地方</span><span lang="en">Tuning: spend the scarce CPU and RAM well</span></span></span><span class="meta">06</span></a></li>
+      <li><a href="#s7"><span><span class="t"><span lang="zh">排错</span><span lang="en">Troubleshooting</span></span></span><span class="meta">07</span></a></li>
+      <li><a href="#s8"><span><span class="t"><span lang="zh">从 v0.3 升级</span><span lang="en">Upgrading from v0.3</span></span></span><span class="meta">08</span></a></li>
+      <li><a href="#s9"><span><span class="t"><span lang="zh">自带的两个自测工具</span><span lang="en">The two bundled test tools</span></span></span><span class="meta">09</span></a></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= 01 ================= -->
+<section id="s1">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">01</span>
+      <h2><span lang="zh">先确认你能不能用</span><span lang="en">Is this for you?</span></h2>
+    </div>
+    <div class="doc">
+      <p><span lang="zh">zray 是一个<strong>客户端</strong>，服务端不需要它。要跑起来需要三样东西：</span>
+      <span lang="en">zray is a <strong>client</strong>; nothing is deployed on the server side. You need three things:</span></p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th><span lang="zh">需要</span><span lang="en">Need</span></th>
+              <th><span lang="zh">说明</span><span lang="en">Notes</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th><span lang="zh">一台 Linux 机器</span><span lang="en">A Linux box</span></th>
+              <td><span lang="zh">代理服务只在 Linux 上运行。路由器（OpenWrt / ImmortalWrt）、软路由、树莓派、VPS 都行。macOS / Windows 上只能编译和跑 <code>probe</code>。</span><span lang="en">The proxy service runs on Linux only: a router (OpenWrt / ImmortalWrt), a small x86 or ARM mini-PC, a Raspberry Pi, a VPS. On macOS / Windows you can build it and run <code>probe</code>, nothing else.</span></td>
+            </tr>
+            <tr>
+              <th><span lang="zh">一个服务端节点</span><span lang="en">A node to connect to</span></th>
+              <td><span lang="zh">REALITY（VLESS + <code>xtls-rprx-vision</code>），或者普通 VLESS + TLS（机场常见的那种）。协议必须是 VLESS，Trojan / VMess / Shadowsocks 都不支持。</span><span lang="en">REALITY (VLESS + <code>xtls-rprx-vision</code>), or plain VLESS + TLS (what most commercial providers offer). VLESS only — Trojan / VMess / Shadowsocks are not supported.</span></td>
+            </tr>
+            <tr>
+              <th><span lang="zh">系统的出口方式</span><span lang="en">A way to route traffic in</span></th>
+              <td><span lang="zh">你的手机、电脑、整栋房子要么手动填 SOCKS5，要么靠透明代理自动接管。</span><span lang="en">Either you point clients at its SOCKS5 port by hand, or a transparent nft rule hands it the traffic.</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><span lang="zh">如果你只有一台线路好、IP 也干净的服务器，直连就够了，不需要链式那一套。见<a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">链式出站教程</a>开头的判断。</span>
+      <span lang="en">If you have one server with both a good route and a clean IP, use it directly; the chaining machinery buys you nothing. See the decision section at the top of <a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">the chaining tutorial</a>.</span></p>
+      <p><span lang="zh"><strong>它不是什么</strong>：不是图形客户端，没有订阅、没有自动测速、没有负载均衡、没有日志级别开关（每条连接的生命周期都打到 stderr）。这些不在设计目标里。</span>
+      <span lang="en"><strong>What it is not</strong>: not a GUI client, no subscriptions, no automatic latency testing, no load balancing, no log level switch (every connection logs its lifecycle to stderr). Those are outside the design goals.</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 02 ================= -->
+<section id="s2">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">02</span>
+      <h2><span lang="zh">五分钟跑起来（SOCKS5 模式）</span><span lang="en">Running in five minutes (SOCKS5)</span></h2>
+    </div>
+    <div class="doc">
+      <h3><span lang="zh">选对二进制</span><span lang="en">Pick the right binary</span></h3>
+      <p><span lang="zh">每个 tag 的 Release 里都有五个静态 musl 二进制，<strong>没有动态依赖，也不用装任何库</strong>：</span>
+      <span lang="en">Every tagged release carries five static musl binaries. No shared libraries, nothing to install:</span></p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th><span lang="zh">文件</span><span lang="en">File</span></th>
+              <th><span lang="zh">适用设备</span><span lang="en">Target</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><th><code>zray-mipsel-softfloat</code></th><td><span lang="zh">小端 MIPS，绝大多数 MT7621 / MT7620 路由器（小米 AC2100、红米 AC2100、新路由 3 等）</span><span lang="en">Little-endian MIPS — most MT7621 / MT7620 routers (Xiaomi AC2100, Redmi AC2100, Newifi 3, ...)</span></td></tr>
+            <tr><th><code>zray-mips-softfloat</code></th><td><span lang="zh">大端 MIPS，少数老设备</span><span lang="en">Big-endian MIPS, a few older boxes</span></td></tr>
+            <tr><th><code>zray-arm-v7</code></th><td><span lang="zh">ARMv7，如多数高通 / 博通 A7 路由器、树莓派 2/3</span><span lang="en">ARMv7: most Qualcomm / Broadcom A7 routers, Raspberry Pi 2/3</span></td></tr>
+            <tr><th><code>zray-aarch64</code></th><td><span lang="zh">ARM64，如树莓派 4、ARM 软路由、ARM VPS</span><span lang="en">ARM64: Raspberry Pi 4, ARM mini-PCs, ARM VPS</span></td></tr>
+            <tr><th><code>zray-x86_64</code></th><td><span lang="zh">普通 PC / x86 软路由 / x86 VPS</span><span lang="en">Any PC / x86 mini-PC / x86 VPS</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><span lang="zh"><code>uname -m</code> 在 MIPS 上只回 <code>mips</code>，分不出大小端。在 OpenWrt 上用发行版架构串最准：</span>
+      <span lang="en"><code>uname -m</code> prints <code>mips</code> for both MIPS endiannesses, so it cannot tell you which one you have. On OpenWrt ask the distro instead:</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>OpenWrt · DISTRIB_ARCH</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>. /etc/openwrt_release &amp;&amp; echo $DISTRIB_ARCH
+<span class="c"># mipsel_24kc / mips_24kc / aarch64_generic / arm_cortex-a7_neon-vfpv4 / x86_64</span></code></pre>
+      </div>
+      <p><span lang="zh"><code>mipsel</code> 开头 → <code>zray-mipsel-softfloat</code>，<code>mips_</code> 开头 → <code>zray-mips-softfloat</code>，其余按上表对。还拿不准就再跑一次 <code>opkg print-architecture</code>，<code>mipsel_</code> 前缀即小端。</span>
+      <span lang="en"><code>mipsel*</code> → <code>zray-mipsel-softfloat</code>, <code>mips_*</code> → <code>zray-mips-softfloat</code>, everything else maps by the table. <code>opkg print-architecture</code> prints the same string.</span></p>
+
+      <h3><span lang="zh">下载、校验、放到固定位置</span><span lang="en">Download, verify, put it somewhere permanent</span></h3>
+      <div class="code">
+        <div class="code-bar">
+          <span>/mnt/zray</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>mkdir -p /mnt/zray
+cd /mnt/zray
+wget -O zray https://github.com/yunnysunny/zray/releases/latest/download/zray-mipsel-softfloat
+wget -O zray.sha256 https://github.com/yunnysunny/zray/releases/latest/download/zray-mipsel-softfloat.sha256
+chmod 755 zray
+sha256sum zray      <span class="c"># 和 zray.sha256 里的第一列目视比对 / compare with the first column</span>
+./zray              <span class="c"># 没有配置文件时报 cannot read config.json，说明二进制能跑</span></code></pre>
+      </div>
+      <p class="note"><span lang="zh">除了一个配置文件路径之外，<code>zray</code> <strong>不接受任何参数</strong>：没有 <code>-h</code>、没有 <code>--version</code>，<code>zray --help</code> 会被当成文件名去读。版本号看启动日志第一行。不要放在 <code>/tmp</code>（重启就没了）；<code>/mnt/zray</code> 这类数据分区在 OpenWrt 上重启后仍在。</span>
+      <span lang="en">Apart from a config path, <code>zray</code> takes <strong>no arguments</strong>: no <code>-h</code>, no <code>--version</code>. <code>zray --help</code> is treated as a file name. The version is the first field of the first startup log line. Do not leave it in <code>/tmp</code> (wiped on reboot); <code>/mnt/zray</code> on OpenWrt survives reboots.</span></p>
+
+      <h3><span lang="zh">写一份最小配置</span><span lang="en">Write a minimal config</span></h3>
+      <div class="code">
+        <div class="code-bar">
+          <span>config.json · REALITY</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>{
+  "listen": "127.0.0.1:1080",
+  "server": "服务器地址 / host or IP",
+  "port": 443,
+  "sni": "伪装域名 / camouflage site",
+  "security": "reality",
+  "public_key": "服务端 publicKey / server publicKey",
+  "short_id": "服务端 shortId，没有就留空 / empty if none",
+  "uuid": "你的 uuid / your uuid",
+  "max_connections": 64
+}</code></pre>
+      </div>
+      <p><span lang="zh">其余字段都有默认值，见 <a href="https://github.com/yunnysunny/zray/blob/master/config.example.json">config.example.json</a>。两条硬性规则：</span>
+      <span lang="en">Everything else has a default; see <a href="https://github.com/yunnysunny/zray/blob/master/config.example.json">config.example.json</a>. Two hard rules:</span></p>
+      <ul>
+        <li><span lang="zh">配置里<strong>出现不认识的键会直接报错退出</strong>（<code>bad config: UnknownField</code>）。多写一个逗号、键名拼错，都不会被静默忽略。</span><span lang="en"><strong>An unknown key is a startup error</strong> (<code>bad config: UnknownField</code>). A trailing comma or a misspelled key is never silently ignored.</span></li>
+        <li><span lang="zh"><code>security</code> 是显式声明的。<code>"reality"</code> 必须给 <code>public_key</code>；<code>"tls"</code> 不许出现 <code>public_key</code> / <code>short_id</code>。写错组合就报错，不会悄悄降级成不校验证书的 TLS。</span><span lang="en"><code>security</code> is explicit. <code>"reality"</code> requires <code>public_key</code>; <code>"tls"</code> rejects <code>public_key</code> / <code>short_id</code>. A wrong combination fails at startup instead of quietly downgrading to unverified TLS.</span></li>
+      </ul>
+      <p><span lang="zh">实用一下的话，把 <code>max_connections</code> 按内存算（每个槽约 93 KiB，见第 6 节）。</span>
+      <span lang="en">Size <code>max_connections</code> from the memory you have (about 93 KiB per slot, see section 06).</span></p>
+
+      <h3><span lang="zh">前台跑一次，看着日志</span><span lang="en">Run it in the foreground and read the log</span></h3>
+      <div class="code">
+        <div class="code-bar">
+          <span><span lang="zh">启动日志就是自检报告</span><span lang="en">The startup log is the health report</span></span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>cd /mnt/zray &amp;&amp; ./zray config.json
+
+<span class="c"># 正常启动会打两行 / a healthy start prints two lines:</span>
+zray 0.4.0 socks5 [127.0.0.1:1080] redirect [] sniff true, 1 outbounds, 0 rules, 64 slots x 93 KiB = 5937 KiB
+outbound -: server:443 sni camouflage mode reality (short_id -) vision</code></pre>
+      </div>
+      <p><span lang="zh"><code>mode reality</code> 就是 REALITY 模式；如果是 <code>mode tls, verify NONE -- WARNING: ...</code>，说明你在连普通 VLESS+TLS 节点，证书不校验，链路上的任何人都有可能冒充它。</span>
+      <span lang="en"><code>mode reality</code> means REALITY. <code>mode tls, verify NONE -- WARNING: ...</code> means you are on a plain VLESS+TLS node with no certificate verification: anyone on the path can impersonate it.</span></p>
+
+      <h3><span lang="zh">验证真的通了</span><span lang="en">Prove it actually works</span></h3>
+      <div class="code">
+        <div class="code-bar">
+          <span>curl</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>curl --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace
+<span class="c"># ip= 应为服务器出口 IP，loc= 是国家地区码</span>
+curl --socks5-hostname 127.0.0.1:1080 https://ipinfo.io/json
+<span class="c"># 第二条验证 DNS 也走隧道 / the second check proves DNS goes through too</span></code></pre>
+      </div>
+      <p><span lang="zh">两条都通，这台机器上的 SOCKS5 模式就配好了。前端接上它就行：SwitchyOmega、sing-box 的 socks outbound、手机上任意支持 SOCKS5 的客户端，地址填 <code>路由器IP:1080</code>。</span>
+      <span lang="en">Once both work, point a client at it: SwitchyOmega, a sing-box socks outbound, any phone SOCKS5 client — address <code>router-ip:1080</code>.</span></p>
+      <p class="note"><span lang="zh">SOCKS5 入口<strong>没有认证</strong>，也没有绑定检查之外的保护。<code>listen</code> 保持 <code>127.0.0.1</code>；确实要给局域网用时改 <code>0.0.0.0:1080</code>，但要清楚同一网段的任何人都能拿它当出口。</span>
+      <span lang="en">The SOCKS5 inbound has <strong>no authentication</strong>. Keep <code>listen</code> on <code>127.0.0.1</code>; if you must expose it to the LAN, <code>0.0.0.0:1080</code> works, but anyone on that network can use it as an exit.</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 03 ================= -->
+<section id="s3">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">03</span>
+      <h2><span lang="zh">参数从哪来：分享链接怎么填</span><span lang="en">Where the values come from: share links</span></h2>
+    </div>
+    <div class="doc">
+      <p><span lang="zh">机场和自建服务一般给一条 <code>vless://</code> 链接，字段和 zray 配置一一对应：</span>
+      <span lang="en">Providers and self-hosted panels hand out a <code>vless://</code> link. Its fields map one-to-one onto the config:</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>vless://</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>vless://&lt;uuid&gt;@&lt;地址 host&gt;:&lt;端口 port&gt;?encryption=none&amp;security=reality&amp;sni=example.com&amp;fp=chrome&amp;pbk=&lt;公钥 public key&gt;&amp;sid=ab12&amp;type=tcp&amp;flow=xtls-rprx-vision#名字</code></pre>
+      </div>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th><span lang="zh">链接里的</span><span lang="en">In the link</span></th>
+              <th><span lang="zh">配置字段</span><span lang="en">Config key</span></th>
+              <th><span lang="zh">备注</span><span lang="en">Notes</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><th><code>uuid</code></th><td><code>uuid</code></td><td></td></tr>
+            <tr><th><code>@</code> <span lang="zh">后面的主机 / 端口</span><span lang="en">host / port after <code>@</code></span></th><td><code>server</code> / <code>port</code></td><td><span lang="zh">主机可以是域名，也可直接写 IP</span><span lang="en">hostname or literal IP</span></td></tr>
+            <tr><th><code>security=reality</code></th><td><code>"security": "reality"</code></td><td></td></tr>
+            <tr><th><code>security=tls</code></th><td><code>"security": "tls"</code> + <code>"tls_verify": "none"</code></td><td><span lang="zh">后者在当前版本必填</span><span lang="en">the latter is mandatory in this version</span></td></tr>
+            <tr><th><code>pbk=</code></th><td><code>public_key</code></td><td><span lang="zh">base64url，原样抄</span><span lang="en">base64url, copy verbatim</span></td></tr>
+            <tr><th><code>sid=</code></th><td><code>short_id</code></td><td><span lang="zh">十六进制，最多 8 字节；没有就留空</span><span lang="en">hex, up to 8 bytes; empty if absent</span></td></tr>
+            <tr><th><code>sni=</code></th><td><code>sni</code></td><td><span lang="zh">REALITY 的伪装站点，必须和服务端一致</span><span lang="en">REALITY camouflage site, must match the server</span></td></tr>
+            <tr><th><code>fp=chrome</code></th><td>—</td><td><span lang="zh">指纹固定是 Chrome，不需要也不可能改成别的</span><span lang="en">the fingerprint is always Chrome; it cannot be changed</span></td></tr>
+            <tr><th><code>flow=xtls-rprx-vision</code></th><td><code>flow</code></td><td><span lang="zh">tcp 下默认就是 vision，可以省略</span><span lang="en">the default on <code>tcp</code>, so it can be omitted</span></td></tr>
+            <tr><th><code>encryption=none</code></th><td>—</td><td><span lang="zh">VLESS 固定 none</span><span lang="en">VLESS is always none</span></td></tr>
+            <tr><th><code>type=tcp</code></th><td>—</td><td><span lang="zh">默认就是 tcp</span><span lang="en">the default</span></td></tr>
+            <tr><th><code>type=ws</code></th><td><code>"network": "ws"</code></td><td><span lang="zh">配合 <code>path=</code> → <code>ws_path</code>，<code>host=</code> → <code>ws_host</code></span><span lang="en">with <code>path=</code> → <code>ws_path</code>, <code>host=</code> → <code>ws_host</code></span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><span lang="zh"><strong>不支持 / 需要注意</strong>：</span>
+      <span lang="en"><strong>Not supported / watch out for:</strong></span></p>
+      <ul>
+        <li><span lang="zh"><code>type=grpc</code>、<code>type=httpupgrade</code>、<code>type=quic</code>：都没有实现，只能用 <code>tcp</code> 和 <code>ws</code>。</span><span lang="en"><code>type=grpc</code>, <code>type=httpupgrade</code>, <code>type=quic</code>: not implemented. <code>tcp</code> and <code>ws</code> only.</span></li>
+        <li><span lang="zh">ws 的 <strong>early data</strong>（链接里带 <code>ed=2048</code> 这类参数）：不实现。别把它塞进 <code>ws_path</code>，服务端真发 early data 时连接会以 <code>WsEarlyData</code> 断开。大多数服务端在没有客户端请求时不会主动发。</span><span lang="en">WebSocket <strong>early data</strong> (<code>ed=2048</code> and friends): not implemented. Do not put it into <code>ws_path</code>; if the server sends early data alongside the 101, the connection dies with <code>WsEarlyData</code>.</span></li>
+        <li><span lang="zh"><code>fp</code> 不是 chrome（如 <code>firefox</code>、<code>safari</code>、<code>randomized</code>）：客户端只呈现 Chrome 指纹，写了也没用。服务端若按指纹做了限制会连不上。</span><span lang="en"><code>fp</code> other than chrome: the client only presents a Chrome fingerprint; setting something else does nothing, and a server that gates on fingerprint will refuse the connection.</span></li>
+        <li><span lang="zh">订阅 / 订阅转换：zray 不读订阅链接，需要自己把节点展开成链接再抄进配置。</span><span lang="en">Subscriptions: zray does not read them. Expand the node into its fields yourself.</span></li>
+        <li><span lang="zh">免费或公共节点常见的「同名多落地、自动选最快」：不属于 zray 的能力范围，它的 <code>rules</code> 只按域名后缀分流，不做测速。</span><span lang="en">"Same name, many landings, pick the fastest": out of scope. <code>rules</code> only splits by domain suffix, there is no latency testing.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 04 ================= -->
+<section id="s4">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">04</span>
+      <h2><span lang="zh">三种用法</span><span lang="en">Three ways to deploy</span></h2>
+    </div>
+    <div class="doc">
+      <h3><span lang="zh">本机 / 局域网 SOCKS5（最简单）</span><span lang="en">Local / LAN SOCKS5 (simplest)</span></h3>
+      <p><span lang="zh">就是第 02 节那套。适合：单台机器或几台设备手动挂代理；先验证节点可用，再折腾透明代理。</span>
+      <span lang="en">What section 02 sets up. Good for one machine or a handful of devices, and for validating a node before touching transparent proxying.</span></p>
+      <p><span lang="zh">UDP 走 SOCKS5 <code>UDP ASSOCIATE</code>，用 XUDP（VLESS mux）封装。注意两点：<strong>只支持带 Vision 的 TCP 节点</strong>（ws 节点没有 UDP），<strong>载荷超过约 600 字节可能被服务端出口丢弃</strong>（DNS 正常，QUIC 一般不通）。分片不支持，现实中也没有客户端用。</span>
+      <span lang="en">UDP rides SOCKS5 <code>UDP ASSOCIATE</code>, wrapped in XUDP (VLESS mux). Two limits: <strong>Vision TCP outbounds only</strong> (a ws outbound carries no UDP), and <strong>payloads above roughly 600 bytes may be dropped by the server's outbound</strong> (DNS works, QUIC generally does not). Fragmentation is not supported; no real client uses it.</span></p>
+
+      <h3><span lang="zh">透明代理（路由器当网关）</span><span lang="en">Transparent proxy (the router is the gateway)</span></h3>
+      <p><span lang="zh">目标：局域网里的设备什么都不用配，命中规则的流量自动进隧道。</span>
+      <span lang="en">Goal: LAN devices need no configuration, matching traffic enters the tunnel by itself.</span></p>
+      <p><span lang="zh"><strong>1. 配置两个入口。</strong><code>listen</code> 留着当调试用，<code>redirect</code> 才是给 nft 喂流量的：</span>
+      <span lang="en"><strong>1. Configure two inbounds.</strong> Keep <code>listen</code> for debugging; <code>redirect</code> is what nft feeds:</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>config.json · <span lang="zh">两个入口</span><span lang="en">two inbounds</span></span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>{
+  "listen": "127.0.0.1:10800",
+  "redirect": "0.0.0.0:1080",
+  "sniff": true,
+  "server": "服务器地址 / host or IP",
+  "port": 2443,
+  "bootstrap_dns": "223.5.5.5",
+  "...": "其余同前 / the rest as before"
+}</code></pre>
+      </div>
+      <p><span lang="zh"><strong>2. nft 规则把命中的 IP 重定向到 <code>redirect</code> 端口。</strong>典型的按域名分流：DNS 侧（dnsmasq + chinadns-ng，或 smartdns）把命中 gfwlist 的域名解析出的 IP 写进一个 nft 集合，再由这张表负责转发：</span>
+      <span lang="en"><strong>2. Redirect matching destinations to the <code>redirect</code> port.</strong> A typical domain-based split: the DNS side (dnsmasq + chinadns-ng, or smartdns) writes the IPs of matched domains into an nft set, and this table forwards them:</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>nft · inet gfw</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>table inet gfw {
+    set iplist { type ipv4_addr; flags interval; }
+    chain prerouting { type nat hook prerouting priority 0;
+        ip daddr @iplist ip protocol tcp redirect to :1080 }
+    chain output     { type nat hook output priority filter;
+        ip daddr @iplist ip protocol tcp redirect to :1080 }
+}</code></pre>
+      </div>
+      <p><span lang="zh"><code>prerouting</code> 管其他设备，<code>output</code> 管路由器自己。<code>redirect</code> 用的是 <code>SO_ORIGINAL_DST</code>，所以端口写的是 zray 的 <code>redirect</code> 端口（上例 <code>1080</code>），不是 <code>listen</code>。</span>
+      <span lang="en"><code>prerouting</code> covers other devices, <code>output</code> covers the router itself. <code>redirect</code> relies on <code>SO_ORIGINAL_DST</code>, so the port here is zray's <code>redirect</code> port (<code>1080</code> above), never <code>listen</code>.</span></p>
+      <p><span lang="zh"><strong>3. 两条必须避开的坑：</strong></span>
+      <span lang="en"><strong>3. Two traps that must be avoided:</strong></span></p>
+      <ul>
+        <li><span lang="zh"><strong>服务器自己的 IP 不能进那个集合</strong>。否则 zray 连服务器的流量又被自己拦回来，变成死循环（症状：启动正常、一有流量就满槽位、日志里全是失败）。用 <code>ip daddr != &lt;服务器 IP&gt;</code> 排除，或者在 DNS 侧把服务器域名加进直连名单。</span><span lang="en"><strong>The server's own IP must never land in that set.</strong> Otherwise zray's connection to its server is redirected back into zray — a loop whose symptom is a healthy start, then instant slot exhaustion and a log full of failures. Exclude it with <code>ip daddr != &lt;server IP&gt;</code>, or put the server hostname on the direct list.</span></li>
+        <li><span lang="zh"><strong>解析 <code>server</code> 的解析器不能依赖这条隧道</strong>。如果 dnsmasq / chinadns-ng 的 DoT 上游本身走 zray，开机时两边互相等，谁都起不来。这时把 <code>bootstrap_dns</code> 设成公共 DNS（如 <code>223.5.5.5</code>），启动时那次解析就完全不经过本地解析器。</span><span lang="en"><strong>Whatever resolves <code>server</code> must not depend on the tunnel.</strong> If dnsmasq / chinadns-ng forwards DoT through zray, both wait for each other at boot and neither starts. Set <code>bootstrap_dns</code> to a public resolver (e.g. <code>223.5.5.5</code>) so the startup lookup bypasses the local resolver entirely.</span></li>
+      </ul>
+      <p><span lang="zh"><strong>4. <code>sniff</code> 保持开启。</strong>透明代理只拿得到目标 IP，<code>sniff</code> 让它从首包解出 TLS SNI 或 HTTP <code>Host</code>，把目标换成域名。目标 IP 有可能命中 <code>rules</code> 时，zray 最多等 1 秒做这次嗅探——这是那 1 秒的来源，正常。</span>
+      <span lang="en"><strong>4. Leave <code>sniff</code> on.</strong> A transparent inbound only sees the destination IP; <code>sniff</code> extracts the TLS SNI or HTTP <code>Host</code> from the first client bytes and swaps the IP for the name. When the target IP could match a <code>rules</code> entry, zray waits up to one second for that sniff — that second is expected.</span></p>
+      <p><span lang="zh"><strong>5. 验证</strong>：在局域网另一台机器上不配代理，直接：</span>
+      <span lang="en"><strong>5. Verify</strong> from another LAN machine with no proxy configured:</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>curl</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>curl https://www.cloudflare.com/cdn-cgi/trace      <span class="c"># ip= 应为服务器出口 IP</span>
+curl https://www.baidu.com                          <span class="c"># 应正常（不在集合里，直连）</span></code></pre>
+      </div>
+
+      <h3><span lang="zh">多节点、按域名分流、链式出站</span><span lang="en">Several nodes, domain routing, chaining</span></h3>
+      <p><span lang="zh">需要「线路好的机器」和「IP 干净的机器」各一台时用这个：<code>rules</code> 把少数域名分给一组 exit，其余走 <code>default</code>。</span>
+      <span lang="en">For when "a machine with a good route" and "a machine with a clean IP" are different boxes: <code>rules</code> send a few domains to a group of exits, everything else stays on <code>default</code>.</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>config.json · outbounds + rules</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>{
+  "outbounds": [
+    { "tag": "relay", "server": "...", "security": "reality", "public_key": "...", "uuid": "..." },
+    { "tag": "exit-a", "server": "...", "security": "tls", "tls_verify": "none",
+      "uuid": "...", "network": "ws", "ws_path": "/vless-ws", "flow": "none", "dialer": "relay" }
+  ],
+  "rules": [
+    { "domain_suffix": ["openai.com", "chatgpt.com", "claude.ai"], "outbound": ["exit-a"] }
+  ],
+  "default": ["relay"]
+}</code></pre>
+      </div>
+      <p><span lang="zh">规则要点：<code>outbound</code> 是一个<strong>组</strong>，组内成员之间才做故障切换（<code>fail_backoff_s</code>，默认 30 秒）；命中的规则失败后<strong>不会退回 <code>default</code></strong>，这是故意的——宁可打不开，也不让本该走干净 IP 的请求从别处出去。链式的完整原理、封装层次、代价和验证方法都在<a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">链式出站教程</a>里。</span>
+      <span lang="en">Rules worth knowing: <code>outbound</code> is a <strong>group</strong>, and failover (<code>fail_backoff_s</code>, 30 s by default) only rotates inside that group; a matched rule <strong>never falls back to <code>default</code></strong>. That is deliberate — better a failed request than a request that was supposed to leave from the clean IP going out somewhere else. The full mechanics live in <a href="https://github.com/yunnysunny/zray/blob/master/docs/chain-relay-exit.zh-CN.md">the chaining tutorial</a> (Chinese).</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 05 ================= -->
+<section id="s5">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">05</span>
+      <h2><span lang="zh">装成服务，开机自启</span><span lang="en">Run it as a service</span></h2>
+    </div>
+    <div class="doc">
+      <h3><span lang="zh">OpenWrt：用仓库里的 procd 脚本</span><span lang="en">OpenWrt: the procd script in the repo</span></h3>
+      <div class="code">
+        <div class="code-bar">
+          <span>procd</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>scp zray              root@router:/mnt/zray/zray
+scp config.json       root@router:/mnt/zray/config.json
+scp deploy/zray.init  root@router:/etc/init.d/zray
+ssh root@router '
+  chmod 755 /etc/init.d/zray /mnt/zray/zray
+  chmod 600 /mnt/zray/config.json
+  /etc/init.d/zray enable
+  /etc/init.d/zray start
+  sleep 2; logread | tail -5
+'</code></pre>
+      </div>
+      <p><span lang="zh"><code>deploy/zray.init</code> 只做三件事：<code>procd_set_param command</code> 指向 <code>/mnt/zray/zray /mnt/zray/config.json</code>、<code>respawn 3600 5 0</code>（崩了自动拉起，5 秒内连崩就停）、把 stdout / stderr 交给 logd。想看实时日志：<code>logread -f</code>。配置文件的权限用 <code>600</code>（里面有 <code>uuid</code> 和 <code>public_key</code>），二进制用 <code>755</code>。别把配置放在 web 目录下。</span>
+      <span lang="en"><code>deploy/zray.init</code> does three things: <code>procd_set_param command</code> runs <code>/mnt/zray/zray /mnt/zray/config.json</code>, <code>respawn 3600 5 0</code> restarts it after a crash (and gives up if it crashes five times within 5 s), and stdout / stderr are handed to logd. Live log: <code>logread -f</code>. Keep the config at mode <code>600</code> (it holds the <code>uuid</code> and <code>public_key</code>) and the binary at <code>755</code>.</span></p>
+
+      <h3><span lang="zh">普通 Linux：systemd</span><span lang="en">Plain Linux: systemd</span></h3>
+      <div class="code">
+        <div class="code-bar">
+          <span>/etc/systemd/system/zray.service</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>[Unit]
+Description=zray REALITY/VLESS client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/zray/zray /etc/zray/config.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1024
+<span class="c"># 透明代理入口监听 1024 以下端口时用 / if the redirect inbound uses a privileged port:</span>
+<span class="c"># AmbientCapabilities=CAP_NET_BIND_SERVICE</span>
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+      </div>
+      <div class="code">
+        <div class="code-bar">
+          <span>systemctl</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>systemctl daemon-reload &amp;&amp; systemctl enable --now zray
+journalctl -u zray -f</code></pre>
+      </div>
+      <p><span lang="zh">仓库没有附带 systemd 单元，上面这份可以直接抄。透明代理的 nft / iptables 规则要另外持久化（<code>nft -f /etc/nftables.conf</code> 或发行版自己的机制），zray 不负责装规则。</span>
+      <span lang="en">The repo does not ship a unit file; the one above works as-is. Transparent-proxy nft / iptables rules are yours to persist; zray does not install them.</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 06 ================= -->
+<section id="s6">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">06</span>
+      <h2><span lang="zh">调优：把有限的 CPU 和内存用对地方</span><span lang="en">Tuning: spend the scarce CPU and RAM well</span></h2>
+    </div>
+    <div class="doc">
+      <h3><span lang="zh">内存：<code>max_connections</code> × 93 KiB</span><span lang="en">Memory: <code>max_connections</code> × 93 KiB</span></h3>
+      <p><span lang="zh">启动日志最后一段就是账：<code>64 slots x 93 KiB = 5937 KiB</code>。槽位在<strong>启动时一次性分配</strong>，不随流量增长，超出就拒绝新连接（<code>conn table full</code>）。</span>
+      <span lang="en">The tail of the startup line is the ledger: <code>64 slots x 93 KiB = 5937 KiB</code>. Slots are allocated <strong>once at startup</strong> and do not grow with traffic; when they run out, new connections are refused (<code>conn table full</code>).</span></p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th><span lang="zh">场景</span><span lang="en">Scenario</span></th>
+              <th><span lang="zh">估算</span><span lang="en">Estimate</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><th><span lang="zh">普通 SOCKS5 / 透明代理</span><span lang="en">Plain SOCKS5 / transparent</span></th><td><span lang="zh">并发连接数 × 93 KiB</span><span lang="en">concurrent connections × 93 KiB</span></td></tr>
+            <tr><th><span lang="zh">链式（<code>dialer</code>）</span><span lang="en">Chained (<code>dialer</code>)</span></th><td><span lang="zh">再乘 2：每条链式连接占两个槽（客户端那条 + hop 那条）</span><span lang="en">× 2: each chained connection holds two slots (client side + hop)</span></td></tr>
+            <tr><th><span lang="zh">128 MB 内存的路由器（可用约 20 MB）</span><span lang="en">128 MB router (~20 MB free)</span></th><td><span lang="zh">32–64 个槽比较合适</span><span lang="en">32–64 slots is a sensible range</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><span lang="zh">64 槽 ≈ 5.8 MB，128 槽 ≈ 11.6 MB。先给 <code>64</code>，出现 <code>conn table full</code> 再往上加；一加就 OOM 就说明该换更大的机器了。</span>
+      <span lang="en">64 slots ≈ 5.8 MB, 128 slots ≈ 11.6 MB. Start at 64; raise it when you see <code>conn table full</code>, and stop when raising it triggers the OOM killer.</span></p>
+
+      <h3><span lang="zh">TCP 窗口：<code>tcp_rmem</code>（比任何 zray 参数都重要）</span><span lang="en">TCP window: <code>tcp_rmem</code> (matters more than any zray option)</span></h3>
+      <p><span lang="zh">128 MB 内存的路由器上，<code>net.ipv4.tcp_rmem</code> 默认上限约 930 KB，单条流的吞吐被「窗口 / RTT」卡住：190 ms 时约 1 MB/s。在这类机器上实测，把上限提到 4 MB 之后同一条链路的 HTTPS 吞吐从约 1 MB/s 变成 9–10 MB/s：</span>
+      <span lang="en">On a 128 MB router the default <code>net.ipv4.tcp_rmem</code> ceiling is about 930 KB, capping one stream at roughly window / RTT — about 1 MB/s at 190 ms. On the reference box, raising the ceiling to 4 MB lifted HTTPS through the tunnel from ~1 MB/s to 9–10 MB/s:</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>sysctl</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>echo 'net.ipv4.tcp_rmem = 4096 131072 4194304' &gt; /etc/sysctl.d/99-zray.conf
+sysctl -p /etc/sysctl.d/99-zray.conf</code></pre>
+      </div>
+      <p><span lang="zh"><strong>不要</strong>用 zray 的 <code>sock_buf</code> 来干这件事：它会关掉内核的窗口自动调优，还会被 <code>net.core.rmem_max</code> 截断。<code>sock_buf</code> 留 <code>0</code>。</span>
+      <span lang="en">Do <strong>not</strong> reach for zray's <code>sock_buf</code> here: it disables the kernel's window autotuning and is clamped by <code>net.core.rmem_max</code>. Leave <code>sock_buf</code> at <code>0</code>.</span></p>
+
+      <h3><span lang="zh">超时</span><span lang="en">Timeouts</span></h3>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th><span lang="zh">字段</span><span lang="en">Key</span></th>
+              <th><span lang="zh">默认</span><span lang="en">Default</span></th>
+              <th><span lang="zh">什么时候改</span><span lang="en">When to change it</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><th><code>connect_timeout_s</code></th><td class="num">5</td><td><span lang="zh">跨境 + ws 握手慢的节点偶发超时，调到 8–10</span><span lang="en">raise to 8–10 if a slow cross-border + ws handshake occasionally times out</span></td></tr>
+            <tr><th><code>handshake_timeout_s</code></th><td class="num">15</td><td><span lang="zh">入站侧：等客户端把 SOCKS5 握手 / 首个请求送出来。移动网络下可放宽</span><span lang="en">inbound side: waiting for the client to finish SOCKS5 and send a request; relax on mobile networks</span></td></tr>
+            <tr><th><code>idle_timeout_s</code></th><td class="num">600</td><td><span lang="zh">手机推送这类长连接会被它掐断，可调到 1800</span><span lang="en">cuts long-lived connections such as phone push; raise to 1800 if pushes stall</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><span lang="zh"><code>connect_timeout_s</code> 必须 ≥ 1，设 0 直接报错退出。</span>
+      <span lang="en"><code>connect_timeout_s</code> must be ≥ 1; 0 is a startup error.</span></p>
+
+      <h3><span lang="zh">别给自己找麻烦的几条</span><span lang="en">Things not to do</span></h3>
+      <ul>
+        <li><span lang="zh"><strong>Vision 节点才是默认选择</strong>。<code>flow: "none"</code> 或 ws 节点整条连接都要软件加解密，MIPS 单核上限约 1–1.5 MB/s。</span><span lang="en"><strong>Prefer Vision nodes.</strong> A <code>flow: "none"</code> or ws node keeps the outer TLS for the whole connection, and a single MIPS core tops out around 1–1.5 MB/s.</span></li>
+        <li><span lang="zh"><strong><code>default</code> 放在 Vision 节点上</strong>，只有需要干净 IP 的少数域名走 ws exit。</span><span lang="en"><strong>Keep <code>default</code> on a Vision node</strong>; send only the few domains that need a clean IP to a ws exit.</span></li>
+        <li><span lang="zh"><strong>别把 REALITY 服务端域名加进 gfwlist</strong>（见第 04 节的坑）。</span><span lang="en"><strong>Keep the REALITY server's domain out of gfwlist</strong> (section 04, trap 3).</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 07 ================= -->
+<section id="s7">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">07</span>
+      <h2><span lang="zh">排错</span><span lang="en">Troubleshooting</span></h2>
+      <p class="sub">
+        <span lang="zh">日志全部打到 stderr，OpenWrt 上在 <code>logread</code>，systemd 上在 <code>journalctl</code>。按症状查：</span>
+        <span lang="en">Everything goes to stderr — <code>logread</code> on OpenWrt, <code>journalctl</code> on systemd. Find your symptom:</span>
+      </p>
+    </div>
+    <div class="doc">
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th><span lang="zh">症状</span><span lang="en">Symptom</span></th>
+              <th><span lang="zh">原因</span><span lang="en">Cause</span></th>
+              <th><span lang="zh">处理</span><span lang="en">Fix</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><th><code>bad config: UnknownField</code></th><td><span lang="zh">配置里有关键名拼错，或多了不该有的字段</span><span lang="en">a misspelled or extra key</span></td><td><span lang="zh">对照 <a href="https://github.com/yunnysunny/zray/blob/master/config.example.json">config.example.json</a> 逐字核对；<code>"..."</code> 这种占位键也是未知键</span><span lang="en">compare against <a href="https://github.com/yunnysunny/zray/blob/master/config.example.json">config.example.json</a> character by character; a <code>"..."</code> placeholder is an unknown key too</span></td></tr>
+            <tr><th><code>bad config: use either top-level server/uuid or outbounds, not both</code></th><td><span lang="zh">顶层 <code>server</code> / <code>uuid</code> 和 <code>outbounds</code> 同时存在</span><span lang="en">both forms present</span></td><td><span lang="zh">二选一</span><span lang="en">pick one</span></td></tr>
+            <tr><th><code>bad config: connect_timeout_s must be &gt;= 1</code></th><td><span lang="zh">设成了 0</span><span lang="en">set to 0</span></td><td><span lang="zh">设 ≥ 1</span><span lang="en">set ≥ 1</span></td></tr>
+            <tr><th><code>cannot resolve &lt;host&gt;: ...</code></th><td><span lang="zh">启动时解析上游失败</span><span lang="en">startup resolution failed</span></td><td><span lang="zh">检查网络；解析器依赖隧道时设 <code>bootstrap_dns</code>；它只查 A 记录，只有 AAAA 的域名请改用系统解析器</span><span lang="en">check the network; set <code>bootstrap_dns</code> when the local resolver depends on the tunnel; it only asks for A records, so an AAAA-only host needs the system resolver</span></td></tr>
+            <tr><th><code>CertificateRejected</code></th><td><span lang="zh">路由器时钟没同步（REALITY 会校验封在 <code>session_id</code> 里的时间戳）；或者 <code>public_key</code> / <code>short_id</code> / <code>uuid</code> 不匹配</span><span lang="en">router clock not synced (REALITY checks the timestamp sealed in <code>session_id</code>), or a key mismatch</span></td><td><span lang="zh">先对时：<code>ntpd -q -p ntp.aliyun.com</code>，确认 <code>date</code> 正确；再核对参数</span><span lang="en">sync first (<code>ntpd -q -p pool.ntp.org</code>, check <code>date</code>), then re-check the parameters</span></td></tr>
+            <tr><th><code>conn table full</code></th><td><span lang="zh">槽位用尽：并发太多，或上游不可达导致每条连接都占着坑等超时</span><span lang="en">slots exhausted: too much concurrency, or an unreachable upstream holding a slot per connection until the timeout</span></td><td><span lang="zh">增大 <code>max_connections</code>；同时查上游可达性（不可达时会连锁占坑）</span><span lang="en">raise <code>max_connections</code>; check upstream reachability</span></td></tr>
+            <tr><th><span lang="zh">启动正常，一有流量就全是失败、槽位很快满</span><span lang="en">healthy start, then instant failures and exhausted slots</span></th><td><span lang="zh">透明代理把服务器自己的流量也 redirect 回来了</span><span lang="en">the transparent inbound redirects the connection to the server itself</span></td><td><span lang="zh">把服务器 IP 排除出 nft 集合</span><span lang="en">exclude the server IP from the nft set</span></td></tr>
+            <tr><th><span lang="zh">透明代理完全没效果</span><span lang="en">transparent proxy does nothing</span></th><td><span lang="zh">nft 规则没命中 / 端口写成了 <code>listen</code> / <code>sniff</code> 关了 / 客户端没把网关和 DNS 指到路由器</span><span lang="en">rule not matching / port set to <code>listen</code> / <code>sniff</code> off / client gateway+DNS not pointed at the router</span></td><td><span lang="zh">逐项核对第 04 节</span><span lang="en">walk through section 04</span></td></tr>
+            <tr><th><span lang="zh">能打开 IP 站点，域名打不开</span><span lang="en">IP-only sites work, domains do not</span></th><td><span lang="zh">DNS 没走对，或 <code>sniff</code> 关闭导致域名匹配不上</span><span lang="en">DNS not routed correctly, or <code>sniff</code> off so names never reach the rules</span></td><td><span lang="zh">检查 DNS 分流；<code>sniff</code> 保持 <code>true</code></span><span lang="en">fix DNS splitting; keep <code>sniff: true</code></span></td></tr>
+            <tr><th><span lang="zh">ws 节点特别慢（&lt; 1 MB/s）</span><span lang="en">ws node is slow (&lt; 1 MB/s)</span></th><td><span lang="zh">ws 不能用 Vision，整条连接软件加解密，是 CPU 而不是线路</span><span lang="en">ws cannot use Vision; the whole connection is software-encrypted — it is CPU, not the line</span></td><td><span lang="zh">正常现象，只用它跑 AI 聊天这类小流量</span><span lang="en">expected; use it for chat-sized traffic only</span></td></tr>
+            <tr><th><span lang="zh">链式失败日志 <code>... -&gt; relay side</code></span><span lang="en">chain failure <code>... -&gt; relay side</code></span></th><td><span lang="zh">路由器到 relay 没连上（或 relay 的下一段握手没完成）</span><span lang="en">the router never got through to the relay (or the relay's own handshake did not finish)</span></td><td><span lang="zh">查 relay 本身、家宽出口</span><span lang="en">check the relay and your home uplink</span></td></tr>
+            <tr><th><span lang="zh">链式失败日志 <code>... -&gt; exit side</code></span><span lang="en">chain failure <code>... -&gt; exit side</code></span></th><td><span lang="zh">relay 通了，exit 没响应或握手出错</span><span lang="en">the relay is up, the exit never replied or the handshake failed</span></td><td><span lang="zh">查 exit 地址 / 端口 / uuid / ws_path，以及 relay 出站是否被 exit 白名单拦了</span><span lang="en">check exit address / port / uuid / ws_path, and whether the relay's egress is allowed by the exit</span></td></tr>
+            <tr><th><span lang="zh">链式失败日志 <code>hop connection never accepted</code></span><span lang="en">chain failure <code>hop connection never accepted</code></span></th><td><span lang="zh">relay 侧没有接受本机 hop 的 SOCKS 连接</span><span lang="en">the relay side never accepted the local hop SOCKS connection</span></td><td><span lang="zh">通常与 <code>dialer</code> 指错节点有关</span><span lang="en">usually a <code>dialer</code> pointing at the wrong node</span></td></tr>
+            <tr><th><code>WsUpgradeRejected</code></th><td><span lang="zh">WS 升级返回了非 101（多半是 404）</span><span lang="en">the upgrade returned something other than 101 (usually 404)</span></td><td><span lang="zh"><code>ws_path</code> / <code>ws_host</code> 和服务端不一致</span><span lang="en"><code>ws_path</code> / <code>ws_host</code> do not match the server</span></td></tr>
+            <tr><th><code>WsEarlyData</code></th><td><span lang="zh">服务端在同一记录里发了 101 之后的早期数据</span><span lang="en">the server sent early data in the same record as the 101</span></td><td><span lang="zh">关掉服务端的 early data；别把 <code>ed=</code> 写进 <code>ws_path</code></span><span lang="en">turn early data off on the server; keep <code>ed=</code> out of <code>ws_path</code></span></td></tr>
+            <tr><th><code>tls alert handshake_failure</code> / <code>CertificateRejected</code></th><td><span lang="zh"><code>sni</code> 与服务端证书或 REALITY 配置不符</span><span lang="en"><code>sni</code> does not match the server certificate or REALITY config</span></td><td><span lang="zh">核对 <code>sni</code></span><span lang="en">re-check <code>sni</code></span></td></tr>
+            <tr><th><span lang="zh">UDP 不通、QUIC 打不开</span><span lang="en">no UDP, QUIC fails</span></th><td><span lang="zh">只有 Vision TCP 节点带 UDP，且载荷 &gt; ~600 字节可能被服务端丢</span><span lang="en">only Vision TCP outbounds carry UDP, and payloads &gt; ~600 bytes may be dropped by the server</span></td><td><span lang="zh">属于已知限制，浏览器自动回落 TCP</span><span lang="en">known limit; browsers fall back to TCP</span></td></tr>
+            <tr><th><span lang="zh">手机上开着代理却推送延迟 / 断流</span><span lang="en">phone push stalls or drops</span></th><td><span lang="zh"><code>idle_timeout_s</code> 掐掉了长连接</span><span lang="en"><code>idle_timeout_s</code> closes long-lived connections</span></td><td><span lang="zh">调大 <code>idle_timeout_s</code></span><span lang="en">raise <code>idle_timeout_s</code></span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><span lang="zh">判断「到底是谁的问题」的通用方法：先用第 09 节的 <code>probe</code> 直接对服务端做一次握手和请求。<code>probe</code> 通、<code>zray</code> 不通，问题在 zray 的配置或入口；<code>probe</code> 也不通，问题在服务端或线路上。</span>
+      <span lang="en">A general way to tell whose problem it is: run <code>probe</code> (section 09) straight at the server. <code>probe</code> works but zray does not → the problem is zray's config or inbound. Neither works → the problem is the server or the path.</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 08 ================= -->
+<section id="s8">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">08</span>
+      <h2><span lang="zh">从 v0.3 升级</span><span lang="en">Upgrading from v0.3</span></h2>
+    </div>
+    <div class="doc">
+      <p><span lang="zh">0.4.0 新增：VLESS WebSocket 传输（<code>network: "ws"</code>）、出站链式（<code>dialer</code>）、按域名后缀分流（<code>rules</code> / <code>default</code>）、组内故障切换（<code>fail_backoff_s</code>）、单次连接硬超时（<code>connect_timeout_s</code>）。升级只需要换二进制：</span>
+      <span lang="en">0.4.0 adds the VLESS WebSocket transport (<code>network: "ws"</code>), outbound chaining (<code>dialer</code>), domain-suffix routing (<code>rules</code> / <code>default</code>), in-group failover (<code>fail_backoff_s</code>) and a hard per-attempt deadline (<code>connect_timeout_s</code>). Upgrading is a binary swap:</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>OpenWrt</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>/etc/init.d/zray stop
+<span class="c"># 覆盖 /mnt/zray/zray，保留原配置 / overwrite the binary, keep the config</span>
+/etc/init.d/zray start</code></pre>
+      </div>
+      <p><span lang="zh">配置向后兼容：只写了顶层 <code>server</code> / <code>uuid</code> 的旧配置照常工作，<code>connect_timeout_s</code> 默认 5 秒。要留意的是：</span>
+      <span lang="en">Configs stay backward compatible: a top-level <code>server</code> / <code>uuid</code> config keeps working, <code>connect_timeout_s</code> defaults to 5 s. Two things to keep in mind:</span></p>
+      <ul>
+        <li><span lang="zh">开始用链式时，<code>max_connections</code> 要按连接数翻倍往上加（每条链占两个槽）。</span><span lang="en">Once you start chaining, raise <code>max_connections</code> to twice the connection count (two slots per chained connection).</span></li>
+        <li><span lang="zh">0.4 之前没有 <code>connect_timeout_s</code>，入站侧的超时由 <code>handshake_timeout_s</code> 兜着；现在它只管入站，上游有独立的 5 秒硬超时。</span><span lang="en">Before 0.4, <code>handshake_timeout_s</code> covered the upstream attempts too; now it is inbound-only and upstreams have their own 5 s deadline.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 09 ================= -->
+<section id="s9">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">09</span>
+      <h2><span lang="zh">自带的两个自测工具</span><span lang="en">The two bundled test tools</span></h2>
+    </div>
+    <div class="doc">
+      <h3><span lang="zh"><code>probe</code>：直接验服务端</span><span lang="en"><code>probe</code>: check a server directly</span></h3>
+      <p><span lang="zh">不启动服务，做一次真实握手 + 一次经隧道的请求，任何平台都能编译运行（包括 Windows / macOS）：</span>
+      <span lang="en">Does one real handshake and one proxied request without starting the service. Builds and runs anywhere, Windows and macOS included:</span></p>
+      <div class="code">
+        <div class="code-bar">
+          <span>probe</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>zig build probe -- &lt;ip&gt; &lt;port&gt; &lt;sni&gt; &lt;public_key&gt; [short_id|-] [uuid url]
+
+zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
+    00000000-0000-0000-0000-000000000000 https://www.cloudflare.com/</code></pre>
+      </div>
+      <p><span lang="zh">输出包含服务端选的 cipher suite 和密钥交换组、证书 HMAC 是否通过、经隧道收到的字节数。把 URL 换成 <code>https://tls.peet.ws/api/all</code> 还能看到内层连接呈现的指纹。</span>
+      <span lang="en">The output shows the cipher suite and key-exchange group the REALITY server chose, whether the certificate HMAC verified, and the bytes received through the tunnel. Point the URL at <code>https://tls.peet.ws/api/all</code> to see the fingerprint the inner connection presents.</span></p>
+
+      <h3><span lang="zh"><code>udptest.py</code>：验 UDP</span><span lang="en"><code>udptest.py</code>: check UDP</span></h3>
+      <div class="code">
+        <div class="code-bar">
+          <span>udptest.py</span>
+          <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+        </div>
+<pre><code>python3 tools/udptest.py 127.0.0.1 1080</code></pre>
+      </div>
+      <p><span lang="zh">用 SOCKS5 <code>UDP ASSOCIATE</code> 发几次 DNS 查询，验证 XUDP 通路。需要 Python 3，没有第三方依赖。</span>
+      <span lang="en">Sends a few DNS queries over SOCKS5 <code>UDP ASSOCIATE</code> to exercise the XUDP path. Needs Python 3, no third-party packages.</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= feedback ================= -->
+<section id="feedback">
+  <div class="wrap">
+    <div class="sechead">
+      <span class="n">—</span>
+      <h2><span lang="zh">反馈</span><span lang="en">Feedback</span></h2>
+      <p class="sub">
+        <span lang="zh">配置被拒时，报错信息里带着键名和原因；调试时把启动那两行日志和报错一起贴出来，比只说「连不上」有用得多。问题与想法：<a href="https://github.com/yunnysunny/zray/issues">GitHub Issues</a>。这份手册的 Markdown 版在 <a href="https://github.com/yunnysunny/zray/blob/master/docs/usage.zh-CN.md">docs/usage.zh-CN.md</a> 与 <a href="https://github.com/yunnysunny/zray/blob/master/docs/usage.md">docs/usage.md</a>。</span>
+        <span lang="en">Config errors name the offending key and the reason; when asking for help, paste the two startup log lines together with the error — far more useful than "it does not connect". Issues: <a href="https://github.com/yunnysunny/zray/issues">GitHub Issues</a>. The Markdown source of this guide lives at <a href="https://github.com/yunnysunny/zray/blob/master/docs/usage.md">docs/usage.md</a> and <a href="https://github.com/yunnysunny/zray/blob/master/docs/usage.zh-CN.md">docs/usage.zh-CN.md</a>.</span>
+      </p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>zray <span class="tag">v0.4.0</span></span>
+    <span><span lang="zh">Zig 0.17.0 · 静态 musl · MIT</span><span lang="en">Zig 0.17.0 · static musl · MIT</span></span>
+    <a class="spacer" href="index.html"><span lang="zh">返回官网</span><span lang="en">Back to site</span></a>
+    <a href="https://github.com/yunnysunny/zray">GitHub</a>
+    <a href="https://github.com/yunnysunny/zray/releases">Releases</a>
+    <a href="https://github.com/yunnysunny/zray/issues">Issues</a>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

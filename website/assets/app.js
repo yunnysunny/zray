@@ -12,10 +12,12 @@
       var active = buttons[i].getAttribute("data-setlang") === lang;
       buttons[i].setAttribute("aria-pressed", active ? "true" : "false");
     }
+    var defaultZh = "zray — 为老路由器写的 REALITY 客户端";
+    var defaultEn = "zray — a REALITY client for routers";
     document.title =
       lang === "zh"
-        ? "zray — 为老路由器写的 REALITY 客户端"
-        : "zray — a REALITY client for routers";
+        ? (root.getAttribute("data-title-zh") || defaultZh)
+        : (root.getAttribute("data-title-en") || defaultEn);
   }
 
   function initial() {

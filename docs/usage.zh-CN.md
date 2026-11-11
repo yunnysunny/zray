@@ -2,6 +2,8 @@
 
 简体中文 | [English](usage.md)
 
+> 本页有网页版：[website/usage.html](../website/usage.html)，与官网同款排版，可中英切换。
+
 这份文档面向**要把 zray 用起来的人**：从下载哪个文件、配置怎么写，到装在路由器上开机自启、出问题去哪儿看。
 
 [README](README.zh-CN.md) 是完整的特性与配置参考，[链式出站教程](chain-relay-exit.zh-CN.md) 单独讲 relay / exit 那一套。三者互补，不重复。

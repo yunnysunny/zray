@@ -655,6 +655,65 @@ h3.blocktitle {
   pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; padding: 14px; }
 }
 
+/* user guide page */
+
+.doc-head { border-bottom: 1px solid var(--line); }
+.doc-head .wrap { padding-top: 64px; padding-bottom: 56px; }
+.doc-head h1 {
+  font-size: clamp(30px, 3.6vw, 44px);
+  margin: 0 0 18px;
+}
+.doc-head h1 em {
+  font-style: normal;
+  box-shadow: inset 0 -0.32em 0 var(--accent-soft);
+}
+.doc-head .lede { max-width: 58ch; }
+
+.toc { border-bottom: 1px solid var(--line); background: var(--paper-2); }
+.toc .wrap { padding-top: 34px; padding-bottom: 34px; }
+.toc .doclist a { padding: 13px 4px; }
+.toc .doclist .t { font-size: 15.5px; }
+
+.doc { max-width: 76ch; color: var(--ink-2); font-size: 15.5px; line-height: 1.8; }
+.doc > p { margin: 0 0 15px; }
+.doc strong { color: var(--ink); font-weight: 600; }
+.doc ul, .doc ol { margin: 0 0 15px; padding-left: 21px; }
+.doc li { margin: 0 0 8px; }
+.doc li::marker { color: var(--ink-3); }
+.doc li strong { color: var(--ink); }
+.doc h3 {
+  font-size: 19px;
+  color: var(--ink);
+  margin: 42px 0 13px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+.doc h3:first-of-type { margin-top: 8px; border-top: 0; padding-top: 0; }
+.doc h3 code {
+  font-size: 14px;
+  background: none;
+  padding: 0;
+  letter-spacing: 0.02em;
+}
+.doc code {
+  font-size: 13px;
+  background: var(--paper-2);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+.doc .tablewrap { margin: 0 0 20px; }
+.doc .code { margin-bottom: 20px; }
+.doc .note { margin: 6px 0 20px; }
+
+/* guide page tables sit in a wider column than the prose */
+.doc .tablewrap { max-width: none; }
+
+@media (max-width: 640px) {
+  .doc-head .wrap { padding-top: 44px; padding-bottom: 40px; }
+  .doc { font-size: 14.5px; }
+  .doc h3 { margin: 34px 0 11px; }
+}
+
 /* footer */
 footer.site { background: var(--paper-2); border-top: 1px solid var(--line-2); }
 footer.site .wrap {
