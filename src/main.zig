@@ -99,6 +99,9 @@ const FileConfig = struct {
     /// 0 selects up to four cores. max_connections remains the total budget.
     workers: u16 = 1,
     stats_interval_s: u64 = 60,
+    crypto_backend: @import("linux/kernel_crypto.zig").Policy = .off,
+    crypto_min_bytes: u32 = 4096,
+    crypto_max_bytes: u32 = 32768,
 };
 
 const Upstream = union(enum) {
@@ -206,6 +209,14 @@ fn linuxMain(init: std.process.Init) !void {
         sys.log("bad config: max_connections must be >= 1 and workers <= 16", .{});
         return error.BadConfig;
     }
+    const limits: @import("linux/kernel_crypto.zig").Limits = .{
+        .min_bytes = parsed.crypto_min_bytes,
+        .max_bytes = parsed.crypto_max_bytes,
+    };
+    if (!limits.valid()) {
+        sys.log("bad config: require 1 <= crypto_min_bytes <= crypto_max_bytes <= 32768", .{});
+        return error.BadConfig;
+    }
     if (parsed.connect_timeout_s == 0) {
         sys.log("bad config: connect_timeout_s must be >= 1", .{});
         return error.BadConfig;
@@ -289,6 +300,7 @@ fn linuxMain(init: std.process.Init) !void {
         .sniff = parsed.sniff,
         .fail_backoff_s = parsed.fail_backoff_s,
         .stats_interval_s = parsed.stats_interval_s,
+        .crypto_limits = limits,
     };
 
     if (parsed.listen.len == 0 and parsed.redirect.len == 0) {
@@ -299,9 +311,13 @@ fn linuxMain(init: std.process.Init) !void {
     const socks_fd: ?sys.fd_t = if (parsed.listen.len > 0) try listenOn(parsed.listen) else null;
     const redirect_fd: ?sys.fd_t = if (parsed.redirect.len > 0) try listenOn(parsed.redirect) else null;
     const worker_count = @min(parsed.max_connections, if (parsed.workers == 0) @min(@as(usize, 4), std.Thread.getCpuCount() catch 1) else @as(usize, parsed.workers));
-    @import("linux/fd_budget.zig").configure(parsed.max_connections, worker_count, 0);
-    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers, splice enabled", .{
-        version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, worker_count,
+    const policy = if (init.environ_map.get("ZRAY_CRYPTO_BACKEND")) |value|
+        std.meta.stringToEnum(@import("linux/kernel_crypto.zig").Policy, value) orelse return error.BadCryptoBackend
+    else
+        parsed.crypto_backend;
+    @import("linux/fd_budget.zig").configure(parsed.max_connections, worker_count, @import("linux/kernel_crypto.zig").fdReserve(policy, worker_count));
+    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers, splice enabled, crypto_backend {s} bytes={d}..{d}", .{
+        version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, worker_count, @tagName(policy), limits.min_bytes, limits.max_bytes,
     });
     for (obs, node_cfgs) |ob, oc| {
         // Keep the "mode ..." phrases: the startup smoke test matches them,
@@ -341,6 +357,7 @@ fn linuxMain(init: std.process.Init) !void {
             .socks_fd = socks_fd,
             .redirect_fd = redirect_fd,
             .hop_fd = hop_fd,
+            .policy = policy,
         };
     }
     // All config and listener initialization is complete before publication.
@@ -355,6 +372,7 @@ const Worker = struct {
     socks_fd: ?@import("linux/sys.zig").fd_t,
     redirect_fd: ?@import("linux/sys.zig").fd_t,
     hop_fd: [@import("linux/conn.zig").max_outbounds]?@import("linux/sys.zig").fd_t,
+    policy: @import("linux/kernel_crypto.zig").Policy,
     thread: ?std.Thread = null,
 
     const socks_token = std.math.maxInt(u64);
@@ -384,6 +402,7 @@ const Worker = struct {
     fn serve(w: *Worker) !void {
         const sys = @import("linux/sys.zig");
         const conn = @import("linux/conn.zig");
+        const kernel_crypto = @import("linux/kernel_crypto.zig");
         const allocator = std.heap.page_allocator;
         const ep = try sys.epollCreate();
         defer sys.close(ep);
@@ -391,7 +410,12 @@ const Worker = struct {
         defer allocator.free(conns);
         var loop = conn.Loop.init(ep, w.cfg, conns);
         loop.worker_id = w.id;
-        sys.log("worker {d}: {d} slots", .{ w.id, w.capacity });
+        var backend = kernel_crypto.Context.init(w.policy);
+        backend.limits = w.cfg.crypto_limits;
+        defer backend.deinit();
+        if (backend.enabled) kernel_crypto.current = &backend;
+        defer kernel_crypto.current = null;
+        sys.log("worker {d}: {d} slots, kernel crypto enabled {}", .{ w.id, w.capacity, backend.enabled });
         var registered = false;
         var events: [64]sys.Event = undefined;
         var last_sweep = sys.monotonicSeconds();
@@ -434,8 +458,8 @@ const Worker = struct {
             }
             if (w.cfg.stats_interval_s > 0 and now - last_stats >= w.cfg.stats_interval_s) {
                 const c = sys.counters;
-                sys.log("stats w{d} active={d}/{d} read={d} write={d} epoll_wait={d} epoll_mod={d} splice_calls={d} splice_bytes={d}", .{
-                    w.id, loop.active, conns.len, c.reads, c.writes, c.epoll_waits, c.epoll_mods, c.splice_calls, c.splice_bytes,
+                sys.log("stats w{d} active={d}/{d} read={d} write={d} epoll_wait={d} epoll_mod={d} splice_calls={d} splice_bytes={d} crypto_kernel={d} crypto_fallback={d} crypto_badmac={d}", .{
+                    w.id, loop.active, conns.len, c.reads, c.writes, c.epoll_waits, c.epoll_mods, c.splice_calls, c.splice_bytes, backend.backend_ops, backend.fallbacks, backend.auth_failures,
                 });
                 last_stats = now;
             }
@@ -614,4 +638,18 @@ test "worker configuration preserves single-worker defaults" {
     const parsed = try std.json.parseFromSlice(FileConfig, std.testing.allocator, "{\"workers\":0}", .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u16, 0), parsed.value.workers);
+}
+
+test "kernel crypto defaults off and payload limits parse from config" {
+    const defaults: FileConfig = .{};
+    try std.testing.expectEqual(@import("linux/kernel_crypto.zig").Policy.off, defaults.crypto_backend);
+    try std.testing.expectEqual(@as(u32, 4096), defaults.crypto_min_bytes);
+    try std.testing.expectEqual(@as(u32, 32768), defaults.crypto_max_bytes);
+    const parsed = try std.json.parseFromSlice(FileConfig, std.testing.allocator,
+        \\{"crypto_backend":"afalg","crypto_min_bytes":8192,"crypto_max_bytes":16384}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@import("linux/kernel_crypto.zig").Policy.afalg, parsed.value.crypto_backend);
+    try std.testing.expectEqual(@as(u32, 8192), parsed.value.crypto_min_bytes);
+    try std.testing.expectEqual(@as(u32, 16384), parsed.value.crypto_max_bytes);
 }

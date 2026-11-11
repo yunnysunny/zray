@@ -114,6 +114,9 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `sock_buf` | `0` | 每个 socket 的 `SO_SNDBUF` / `SO_RCVBUF`；`0` 用内核默认。 |
 | `stats_interval_s` | `60` | 统计输出间隔，单位秒；0 关闭定期统计。 |
 | `workers` | `1` | 网络 worker 数：1 保持原有单事件循环；0 自动选择、最多 4 个；2..16 指定数量，实际不超过 max_connections。 |
+| `crypto_backend` | `"off"` | 内核 AES-GCM 后端：off / auto / afalg / devcrypto；auto 依次尝试 devcrypto、AF_ALG、软件实现。 |
+| `crypto_min_bytes` | `4096` | 提交后端的 AEAD 明文字节数下限，含该值；小于该值时使用软件实现。 |
+| `crypto_max_bytes` | `32768` | 提交后端的 AEAD 明文字节数上限，含该值；大于该值时使用软件实现。 |
 
 上述运行参数全部写在配置 JSON 的**最外层**，与 `listen`、`max_connections`
 同级；使用多节点时也不要写进 `outbounds` 的节点对象。省略字段即采用表中默认值。
@@ -143,10 +146,44 @@ epoll、背压和关闭；内层 TLS 加密保留。已有配置中的 `splice` 
 `stats_interval_s` 默认 `60`，可设为 `10` 每十秒查看一次累计统计，
 或设为 `0` 关闭定期统计。它不控制其他连接日志。
 
+### 内核加密后端与阈值
+
+`crypto_backend` 默认 `"off"`，不会调用内核加密接口。可选值：
+
+| 模式 | 行为 |
+|---|---|
+| `off` | 使用原有软件加密。 |
+| `afalg` | 使用 AF_ALG 的通用 `gcm(aes)` 算法。 |
+| `devcrypto` | 使用 `/dev/crypto` 的 AES-GCM 接口。 |
+| `auto` | 依次尝试 devcrypto、AF_ALG，不可用时回退软件实现。 |
+
+例如把 `"crypto_backend": "off"` 改为 `"crypto_backend": "auto"` 即可启用。
+支持 AES-128/256-GCM，ChaCha20 保持软件实现。具体实现由内核选择，接口成功
+不代表一定使用硬件，也不保证提速。每个新会话先校验加密、解密和错误标签处理；
+后端不可用时回退软件，认证标签失败则拒绝记录。
+
+`crypto_min_bytes` 和 `crypto_max_bytes` 分别是单个 AEAD 请求的明文字节数
+下限与上限，**两个边界都包含**。默认 `4096..32768`，必须满足
+`1 <= crypto_min_bytes <= crypto_max_bytes <= 32768`，否则启动报错。
+例如下限改为 `8192`，只有至少 8192 字节的请求才提交后端。
+计量包含 TLS 内层内容、content-type 字节和 padding，不包含 record 头、标签和 AAD。
+不会合并记录来凑阈值；下限高于实际 record 大小时，该记录继续使用软件实现。
+Vision direct 的大块数据不再经过外层 TLS 加密，因此这些阈值不作用于该直传数据。
+
+环境变量 `ZRAY_CRYPTO_BACKEND` 可覆盖 JSON 的模式，取值同上。例如：
+
+```sh
+ZRAY_CRYPTO_BACKEND=afalg zray /path/to/config.json
+```
+
+如果配置里设成 `off` 仍发现后端启用，检查启动环境是否设置了此变量。
+修改模式、阈值或 worker 数后都需要重启。
+
 ### 完整 REALITY 配置示例
 
 下面展示四个网络 worker 的完整配置。必须替换 `server`、`sni`、`public_key`、
 `uuid`，并按服务端设置填写 `short_id`；占位值不能直接用于连接。
+示例保持内核加密关闭；测试后端时把 `crypto_backend` 改为上述模式之一。
 
 ```json
 {
@@ -161,7 +198,10 @@ epoll、背压和关闭；内层 TLS 加密保留。已有配置中的 `splice` 
   "flow": "xtls-rprx-vision",
   "max_connections": 64,
   "workers": 4,
-  "stats_interval_s": 60
+  "stats_interval_s": 60,
+  "crypto_backend": "off",
+  "crypto_min_bytes": 4096,
+  "crypto_max_bytes": 32768
 }
 ```
 

@@ -130,6 +130,9 @@ inner connection presents.
 | `sock_buf` | `0` | `SO_SNDBUF` / `SO_RCVBUF` per socket; `0` leaves kernel defaults. |
 | `stats_interval_s` | `60` | Periodic statistics interval in seconds; 0 disables periodic statistics. |
 | `workers` | `1` | Network workers: 1 keeps the original single loop; 0 selects automatically (up to 4); 2..16 requests a count, capped by max_connections. |
+| `crypto_backend` | `"off"` | Kernel AES-GCM backend: off / auto / afalg / devcrypto. auto tries devcrypto, then AF_ALG, then software. |
+| `crypto_min_bytes` | `4096` | Inclusive minimum AEAD plaintext size in bytes; requests below this stay in software. |
+| `crypto_max_bytes` | `32768` | Inclusive maximum AEAD plaintext size in bytes; requests above this stay in software. |
 
 All runtime controls above belong at the **top level** of the configuration JSON,
 alongside `listen` and `max_connections`, including when using multiple outbounds.
@@ -158,6 +161,42 @@ thread. Set `workers` to **0** to select automatically (at most four CPUs), or
 `max_connections`, which remains the total connection budget for the process and
 is divided among worker pools. Extra workers handle concurrent connections;
 one TCP connection is not split across network workers. Changes require restart.
+
+### Kernel crypto backends
+
+Kernel crypto is optional and defaults to **off**. Merge these top-level settings
+into your existing configuration (node credentials and routing are still needed):
+
+```json
+{
+  "workers": 1,
+  "crypto_backend": "off",
+  "crypto_min_bytes": 4096,
+  "crypto_max_bytes": 32768
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `crypto_backend` | `"off"` | `off`: software only; `afalg`: AF_ALG; `devcrypto`: `/dev/crypto`; `auto`: try devcrypto, then AF_ALG, then software. |
+| `crypto_min_bytes` | `4096` | Inclusive minimum AEAD plaintext size sent to the backend. |
+| `crypto_max_bytes` | `32768` | Inclusive maximum AEAD plaintext size sent to the backend. |
+
+For example, `"crypto_backend": "auto", "crypto_min_bytes": 8192` opts in only for
+records of at least 8192 bytes. Bounds must satisfy
+`1 <= crypto_min_bytes <= crypto_max_bytes <= 32768`; invalid values fail startup.
+Lengths include TLS inner content, its content-type byte and padding, and exclude
+the record header, authentication tag and AAD. Records are not combined to reach
+the threshold; a minimum above the record size keeps that record in software.
+
+`ZRAY_CRYPTO_BACKEND` overrides the JSON mode and accepts the same four values.
+Changes require restart. AES-128/256-GCM is supported; ChaCha20 stays in software.
+AF_ALG requests `gcm(aes)` and devcrypto requests AES-GCM; the kernel selects the
+implementation, with no board or driver-name restriction. Interface availability
+and per-key encryption/decryption/tag self-tests determine whether it can be used.
+Missing interfaces, unavailable algorithms or backend failures fall back to
+software. Authentication failures reject the record. Kernel completion counters
+(`crypto_kernel`) do not establish hardware use or a performance improvement.
 
 ### Vision direct splice
 

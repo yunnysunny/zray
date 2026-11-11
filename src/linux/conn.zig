@@ -25,6 +25,7 @@ const sniff = @import("../proxy/sniff.zig");
 const mux = @import("../proxy/mux.zig");
 const ws = @import("../proxy/ws.zig");
 const splice = @import("splice.zig");
+const kernel_crypto = @import("kernel_crypto.zig");
 
 const max_rec = tls.max_ciphertext_record_len;
 /// Largest chunk read from the SOCKS client per event (xray uses 8 KiB).
@@ -83,6 +84,7 @@ pub const Config = struct {
     fail_backoff_s: u64 = 30,
     stats_interval_s: u64 = 60,
     hops: ?*hop.Registry = null,
+    crypto_limits: kernel_crypto.Limits = .{},
 };
 
 /// Does `host` equal `suffix` or end in ".suffix"? (ASCII case-insensitive)

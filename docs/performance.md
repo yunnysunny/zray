@@ -48,7 +48,7 @@ and pipes drain, preserving the reverse direction.
 
 Pipe pairs share a process-wide atomic budget derived from the fd soft limit.
 Startup reserves existing descriptors, three sockets per connection slot, worker
-epolls and temporary headroom. If `/proc/self/fd` or the limit cannot be read,
+epolls, enabled crypto session descriptors and temporary headroom. If `/proc/self/fd` or the limit cannot be read,
 splice is skipped. Budget exhaustion falls back before allocating; closing a pipe
 or a failed allocation returns its quota. Idle pipes stay with their connection.
 
@@ -59,3 +59,24 @@ usually remains inside outer TLS and is not eligible for this direct path.
 
 A known Xray freedom peer limitation prevents certification of end-to-end VLESS
 half-close with that peer; direct Conn/epoll half-close is tested separately.
+
+## Kernel crypto (explicit opt-in)
+
+See [README configuration](../README.md#kernel-crypto-backends) for the complete
+JSON settings, defaults, environment override and payload-size semantics.
+`crypto_backend` defaults to `"off"`; `auto` tries devcrypto, AF_ALG and software
+in order. Both interfaces request AES-GCM by generic algorithm name; the kernel
+chooses its implementation. Availability is checked on the first eligible key,
+without a board, CPU-feature or driver-name gate.
+
+Requests must satisfy the inclusive `crypto_min_bytes` / `crypto_max_bytes` range
+(default 4096..32768), measured as AEAD plaintext bytes. AES-128/256-GCM is
+supported; ChaCha20 stays in software. Each session is checked against software
+for encryption, decryption and rejection of a corrupted tag. At most 64 keys are
+cached per executing context and 128 sessions process-wide.
+
+`crypto_kernel`, `crypto_fallback` and `crypto_badmac` count successful kernel
+operations, fallback events and authentication failures. Kernel completion does
+not prove hardware execution: the selected implementation can use software or
+CPU instructions. Throughput and backend behavior need testing on the target.
+No NEON AES/GHASH implementation or performance compiler options are added.

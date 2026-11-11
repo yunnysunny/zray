@@ -53,5 +53,8 @@
   "fail_backoff_s": 30,
   "max_connections": 64,
   "stats_interval_s": 60,
-  "workers": 1
+  "workers": 1,
+  "crypto_backend": "off",
+  "crypto_min_bytes": 4096,
+  "crypto_max_bytes": 32768
 }
