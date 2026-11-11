@@ -173,7 +173,7 @@ curl --socks5-hostname 127.0.0.1:1080 https://chatgpt.com/cdn-cgi/trace
 | 加密层数 | relay 用 Vision 时，稳态下基本不加密 | exit 是 ws 时，exit 那层 TLS 全程由路由器做 |
 | 延迟 | 1 次握手到 relay | 到 relay，再经 relay 到 exit，首包会慢一些 |
 
-在小米 AC2100（MT7621）上的实测，单个下载、relay 在日本：
+在小米 AC2100（MT7621）上的实测，单个下载、relay 与路由器之间 RTT 约 110 ms：
 
 | 路径 | 吞吐 | zray 每传 1 MB 的 CPU 时间 |
 |---|---|---|

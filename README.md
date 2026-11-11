@@ -13,8 +13,8 @@ not grow with traffic.
 
 Reference deployment: Xiaomi AC2100 (MT7621, MIPS 1004Kc, soft-float,
 ImmortalWrt 23.05): 802 KB static binary, 7.3 MB VSZ / ~2.2 MB RSS with
-64 slots. Measured on that box against a REALITY server in Japan (~110 ms
-RTT), pulling 50 MB through the tunnel:
+64 slots. Measured on that box against a REALITY server at ~110 ms RTT,
+pulling 50 MB through the tunnel:
 
 | Path                                      | Throughput | zray CPU (one 1004Kc thread) |
 |-------------------------------------------|-----------:|-----------------------------:|
@@ -238,7 +238,7 @@ and a rule might apply, zray waits up to one second for a TLS SNI or HTTP
 #### What WebSocket and chaining cost on a small router
 
 Measured on the MT7621 box above (single thread, one 20-30 MB download at a
-time, relay in Japan). CPU is zray's own CPU time per MB transferred.
+time, relay ~110 ms away). CPU is zray's own CPU time per MB transferred.
 
 | path | throughput | CPU per MB |
 |---|---|---|
