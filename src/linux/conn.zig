@@ -459,7 +459,7 @@ pub const Loop = struct {
         }
         if (c.up_fd < 0) return;
         var uev: u32 = 0;
-        if (c.state == .connecting or c.up_out_len > 0) uev |= sys.EPOLL.OUT;
+        if (c.state == .connecting or c.up_out_len > 0 or (c.state == .relay and c.cin_len > 0 and c.padder.direct)) uev |= sys.EPOLL.OUT;
         if (!c.up_eof and c.state != .connecting and c.c_out_len == 0) uev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
         if (uev != c.up_ev) {
             l.setInterest(c.up_fd, &c.up_ev, uev, c.token(.upstream));
@@ -484,6 +484,22 @@ pub const Loop = struct {
 
     fn readClient(l: *Loop, c: *Conn) !void {
         if (c.client_eof) return; // RDHUP can be reported more than once
+        if (c.state == .relay and !c.is_udp and c.padder.direct and c.cin_len == 0 and c.up_out_len == 0) {
+            // Read straight into the transmit queue: no cin -> up_out copy.
+            const n = sys.read(c.client_fd, &c.up_out) catch |err| switch (err) {
+                error.WouldBlock, error.Interrupted => return,
+                else => return err,
+            };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
+            if (n == 0) {
+                c.client_eof = true;
+                return l.finishDirections(c);
+            }
+            c.up_out_off = 0;
+            c.up_out_len = n;
+            return l.flushUpstream(c);
+        }
+
         if (c.is_udp) {
             // Control connection: nothing meaningful arrives, but its EOF ends
             // the association.
@@ -578,8 +594,13 @@ pub const Loop = struct {
         if (c.cin_len == 0 or c.up_out_len > 0) return;
         const data = c.cin[0..c.cin_len];
         if (c.padder.direct) {
-            @memcpy(c.up_out[0..data.len], data);
-            c.up_out_len = data.len;
+            const n = sys.write(c.up_fd, data) catch |err| switch (err) {
+                error.WouldBlock, error.Interrupted => return,
+                else => return err,
+            };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
+            c.consumeClient(n);
+            return l.finishDirections(c);
         } else {
             var padded_buf: [ws.max_header_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
             const off = ws.max_header_len;
@@ -948,6 +969,10 @@ pub const Loop = struct {
             return;
         }
         try l.flushUpstream(c);
+        if (c.state == .relay) {
+            if (c.cin_len > 0) try l.forwardClient(c);
+            try l.finishDirections(c);
+        }
     }
 
     fn startTls(l: *Loop, c: *Conn) !void {
@@ -1028,7 +1053,7 @@ pub const Loop = struct {
         if (c.c_out_len > 0) return; // back-pressure
         if (c.state == .relay and c.unpadder.direct) {
             // Raw inner stream: straight copy.
-            const n = sys.read(c.up_fd, c.c_out[0..max_rec]) catch |e| switch (e) {
+            const n = sys.read(c.up_fd, &c.c_out) catch |e| switch (e) {
                 error.WouldBlock => return,
                 else => return e,
             };
@@ -1343,6 +1368,7 @@ fn backpressureHalfClose(download: bool, expire: bool) !void {
             error.WouldBlock => continue,
             else => return err,
         };
+        if (n > 0) c.last_active = sys.monotonicSeconds();
         if (n == 0) {
             eof = true;
             break;
@@ -1365,6 +1391,7 @@ fn backpressureHalfClose(download: bool, expire: bool) !void {
             error.WouldBlock => continue,
             else => return err,
         };
+        if (n > 0) c.last_active = sys.monotonicSeconds();
         try std.testing.expectEqualSlices(u8, "rev", buf[0..n]);
         got_reverse = true;
         break;
