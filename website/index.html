@@ -152,67 +152,113 @@
       <span class="n">02</span>
       <h2><span lang="zh">做了什么</span><span lang="en">What is inside</span></h2>
       <p class="sub">
-        <span lang="zh">协议栈是自己写的，所以可以只为这一条路径优化：没有插件系统，没有通用抽象层，也没有为了兼容别的协议而存在的代码。</span>
-        <span lang="en">The protocol stack is hand-written, which is what makes it optimisable for exactly one path: no plugin system, no generic abstraction layers, no code that exists to support other protocols.</span>
+        <span lang="zh">协议栈是自己写的，所以可以只为这一条路径优化：没有插件系统，没有通用抽象层，也没有为了兼容别的协议而存在的代码。下面不是功能清单，是一条连接从 socket 向内走的六层剖面。</span>
+        <span lang="en">The protocol stack is hand-written, which is what makes it optimisable for exactly one path: no plugin system, no generic abstraction layers, no code that exists to support other protocols. What follows is not a feature list — it is one connection in cross-section, from the socket inward.</span>
       </p>
     </div>
 
-    <div class="features">
-      <div class="feature">
-        <div class="idx">01</div>
-        <div>
-          <h3><span lang="zh">从零实现的 TLS 1.3</span><span lang="en">TLS 1.3 from scratch</span></h3>
-          <p><span lang="zh">密钥调度、记录层、握手状态机、证书签名校验。与 RFC 8448 测试向量逐字节对照，不只是「能连上」。</span><span lang="en">Key schedule, record layer, handshake state machine, certificate signature checks — verified byte-for-byte against the RFC 8448 vectors, not just "it connects".</span></p>
+    <div class="stack-cap">
+      <span lang="zh">剖面方向：由外向内</span>
+      <span lang="en">Cross-section, outside in</span>
+      <span class="cap-r"><span lang="zh">右侧为该层的源码</span><span lang="en">source file for each ring</span></span>
+    </div>
+
+    <div class="stack">
+      <div class="layer" style="--depth:0">
+        <div class="rail"><span class="lname">TCP socket</span></div>
+        <div class="lbody">
+          <p class="ldesc">
+            <span lang="zh">非阻塞 socket，单线程 epoll 循环。每条连接的状态机都挂在这里，没有线程池，也没有后台线程可以甩锅。</span>
+            <span lang="en">Non-blocking sockets on one epoll loop. Every connection's state machine lives here; there is no thread pool and no worker thread to blame.</span>
+          </p>
+          <span class="lmeta">linux/conn.zig</span>
         </div>
       </div>
-      <div class="feature">
-        <div class="idx">02</div>
-        <div>
-          <h3><span lang="zh">REALITY 认证</span><span lang="en">REALITY authentication</span></h3>
-          <p><span lang="zh">对服务端公钥做临时 X25519，HKDF 派生 auth key，AEAD 封装 <code>session_id</code>，再用 HMAC-SHA512 校验证书。</span><span lang="en">Ephemeral X25519 against the server key, HKDF auth key, AEAD-sealed <code>session_id</code>, HMAC-SHA512 certificate check.</span></p>
+
+      <div class="layer" style="--depth:1">
+        <div class="rail"><span class="lname">TLS 1.3 record</span></div>
+        <div class="lbody">
+          <p class="ldesc">
+            <span lang="zh">记录层与密钥调度是自己写的：SHA-256 / SHA-384 两条路径、逐记录 nonce，与 RFC 8448 的测试向量逐字节对照——不只是「能连上」。</span>
+            <span lang="en">Record layer and key schedule written by hand: SHA-256 and SHA-384, per-record nonces, checked byte-for-byte against the RFC 8448 vectors — not just "it connects".</span>
+          </p>
+          <span class="lmeta">tls/record.zig · tls/key_schedule.zig</span>
         </div>
       </div>
-      <div class="feature">
-        <div class="idx">03</div>
-        <div>
-          <h3><span lang="zh">Chrome 指纹</span><span lang="en">Chrome fingerprint</span></h3>
-          <p><span lang="zh">GREASE、15 个 Chrome 套件、逐连接打乱的扩展顺序、GREASE ECH、ALPS、X25519MLKEM768 混合密钥交换。JA4 的 <code>_b</code> / <code>_c</code> 段与当前 Chrome 一致。</span><span lang="en">GREASE, 15 Chrome cipher suites, per-connection extension shuffle, GREASE ECH, ALPS, X25519MLKEM768 hybrid key share. JA4 <code>_b</code> and <code>_c</code> match current Chrome.</span></p>
+
+      <div class="layer is-key" style="--depth:2">
+        <div class="rail"><span class="lname">ClientHello</span></div>
+        <div class="lbody">
+          <p class="ldesc">
+            <span lang="zh">15 个 Chrome 套件、GREASE、GREASE ECH、ALPS、X25519MLKEM768，扩展顺序逐连接打乱，JA4 的 <code>_b</code> / <code>_c</code> 段与当前 Chrome 一致。REALITY 的 auth key 就在这同一个握手里派生，<code>session_id</code> 被 AEAD 封装，证书再用 HMAC-SHA512 反向校验——整条链路上唯一一处「证明对方是谁」的地方。</span>
+            <span lang="en">15 Chrome suites, GREASE, GREASE ECH, ALPS, X25519MLKEM768, extension order shuffled per connection, JA4 <code>_b</code> / <code>_c</code> matching current Chrome. The REALITY auth key is derived inside this same handshake: <code>session_id</code> sealed with AEAD, the certificate checked back with HMAC-SHA512 — the one place in the chain where anyone proves who they are.</span>
+          </p>
+          <span class="lmeta">tls/fingerprint.zig · tls/reality.zig · tls/signature.zig</span>
         </div>
       </div>
-      <div class="feature">
-        <div class="idx">04</div>
-        <div>
-          <h3><span lang="zh">VLESS + XTLS Vision</span><span lang="en">VLESS + XTLS Vision</span></h3>
-          <p><span lang="zh">完整的填充状态机，识别到内层 TLS 1.3 后双向切直接拷贝。这是它在这类设备上跑得动的根本原因。</span><span lang="en">The full padding state machine, switching both directions to direct copy once the inner TLS 1.3 handshake is seen. This is why it is fast on this class of hardware at all.</span></p>
+
+      <div class="layer" style="--depth:3">
+        <div class="rail"><span class="lname">VLESS</span></div>
+        <div class="lbody">
+          <p class="ldesc">
+            <span lang="zh">uuid、目标地址、flow 三个字段。目标是域名还是 IP，从这里开始走两套逻辑。</span>
+            <span lang="en">Three fields: uuid, target address, flow. From here on, a name and a literal IP take different paths.</span>
+          </p>
+          <span class="lmeta">proxy/vless.zig</span>
         </div>
       </div>
-      <div class="feature">
-        <div class="idx">05</div>
-        <div>
-          <h3><span lang="zh">两种入口</span><span lang="en">Two inbounds</span></h3>
-          <p><span lang="zh">SOCKS5（CONNECT 与 UDP ASSOCIATE，UDP 走 XUDP / full-cone）和透明 netfilter <code>REDIRECT</code>（<code>SO_ORIGINAL_DST</code>）。</span><span lang="en">SOCKS5 (CONNECT and UDP ASSOCIATE, UDP over XUDP, full-cone) and a transparent netfilter <code>REDIRECT</code> inbound via <code>SO_ORIGINAL_DST</code>.</span></p>
+
+      <div class="layer" style="--depth:4">
+        <div class="rail"><span class="lname">XTLS Vision</span></div>
+        <div class="lbody">
+          <p class="ldesc">
+            <span lang="zh">填充状态机认准内层 TLS 1.3 握手，之后双向切成直接拷贝：外层 TLS 在稳态不再碰你的字节。这颗核软算 AES-GCM 只到 1.5 MB/s，能跑到 9–10 MB/s 全靠这一层。</span>
+            <span lang="en">The padding state machine spots the inner TLS 1.3 handshake and switches both directions to direct copy: at steady state the outer TLS stops touching your bytes. Software AES-GCM on this core manages 1.5 MB/s; the 9–10 MB/s comes from this layer.</span>
+          </p>
+          <span class="lmeta">proxy/vision.zig</span>
         </div>
       </div>
-      <div class="feature">
-        <div class="idx">06</div>
-        <div>
-          <h3><span lang="zh">零延迟嗅探</span><span lang="en">Zero-latency sniffing</span></h3>
-          <p><span lang="zh">上游握手还在飞的时候，客户端的首包已经到了。顺手解出 TLS SNI 或 HTTP <code>Host</code>，服务端看到的是域名而不是 IP。</span><span lang="en">While the upstream handshake is still in flight, the client's first bytes have already arrived — the SNI or HTTP <code>Host</code> is read from them, so the server sees a name instead of an IP. No extra round trip.</span></p>
+
+      <div class="layer is-core" style="--depth:5">
+        <div class="rail"><span class="lname"><span lang="zh">你的流量</span><span lang="en">your traffic</span></span></div>
+        <div class="lbody">
+          <p class="ldesc">
+            <span lang="zh">客户端的首包在上游握手还没结束时就被解出了 SNI 或 <code>Host</code>，所以服务端看到的是域名。UDP 另走 XUDP 帧：DNS 通，QUIC 一般不通。</span>
+            <span lang="en">The client's first bytes are read for SNI or <code>Host</code> while the upstream handshake is still in flight, so the server sees a name. UDP rides XUDP frames separately: DNS works, QUIC generally does not.</span>
+          </p>
+          <span class="lmeta">proxy/sniff.zig · proxy/mux.zig</span>
         </div>
       </div>
-      <div class="feature">
-        <div class="idx">07</div>
-        <div>
-          <h3><span lang="zh">WebSocket、链式、分流</span><span lang="en">WebSocket, chaining, routing</span></h3>
-          <p><span lang="zh">节点可以骑在 TLS 里的 VLESS WebSocket 上；一个出口可以经另一个节点拨出（<code>dialer</code>）；<code>domain_suffix</code> 规则把域名分给一组出口，故障只在组内切换。</span><span lang="en">A node can ride VLESS over WebSocket inside TLS; an outbound can dial through another (<code>dialer</code>); <code>domain_suffix</code> rules send names to a group that fails over only within itself.</span></p>
-        </div>
+    </div>
+
+    <div class="bypass">
+      <div class="bypass-cap">
+        <span lang="zh">旁路——不在数据路径上，但决定了它怎么被用起来</span>
+        <span lang="en">Off the data path — but they decide how it gets used</span>
       </div>
-      <div class="feature">
-        <div class="idx">08</div>
-        <div>
-          <h3><span lang="zh">可预测的资源占用</span><span lang="en">Predictable footprint</span></h3>
-          <p><span lang="zh">固定内存池、单线程 epoll、没有后台线程也没有 GC。占用在启动那一行日志里就写完了：<code>N slots × 93 KiB</code>。</span><span lang="en">Fixed pool, single-threaded epoll, no worker threads and no GC. The whole footprint is printed on the startup line: <code>N slots × 93 KiB</code>.</span></p>
-        </div>
+      <div class="bypass-item">
+        <h3><span lang="zh">两个入口</span><span lang="en">Two inbounds</span></h3>
+        <p>
+          <span lang="zh">SOCKS5（CONNECT 与 UDP ASSOCIATE）和 netfilter <code>REDIRECT</code>（<code>SO_ORIGINAL_DST</code>）。入口没有认证，所以它只该活在回环上。</span>
+          <span lang="en">SOCKS5 (CONNECT and UDP ASSOCIATE) and a netfilter <code>REDIRECT</code> inbound via <code>SO_ORIGINAL_DST</code>. No authentication on the inbound, so it belongs on loopback.</span>
+        </p>
+        <span class="lmeta">proxy/socks5.zig · linux/sys.zig</span>
+      </div>
+      <div class="bypass-item">
+        <h3><span lang="zh">出口可以拐弯</span><span lang="en">Exits can bend</span></h3>
+        <p>
+          <span lang="zh">节点可以骑 ws，也可以经 <code>dialer</code> 串成链；<code>domain_suffix</code> 把域名分给一组出口，故障只在组内切换，绝不退回默认线路。</span>
+          <span lang="en">A node can ride ws or be chained through a <code>dialer</code>; <code>domain_suffix</code> hands names to a group of exits that fails over only within itself, never back to the default route.</span>
+        </p>
+        <span class="lmeta">proxy/ws.zig · linux/conn.zig</span>
+      </div>
+      <div class="bypass-item">
+        <h3><span lang="zh">占用是可算的</span><span lang="en">Footprint you can compute</span></h3>
+        <p>
+          <span lang="zh">槽位池启动时一次性分配，没有 GC、没有后台线程。总占用就写在启动那行日志里：<code>N slots × 93 KiB</code>。</span>
+          <span lang="en">The slot pool is allocated once at startup; no GC, no background threads. The whole footprint is on the startup line: <code>N slots × 93 KiB</code>.</span>
+        </p>
+        <span class="lmeta">main.zig</span>
       </div>
     </div>
 
