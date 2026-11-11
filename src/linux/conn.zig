@@ -24,6 +24,7 @@ const fingerprint = @import("../tls/fingerprint.zig");
 const sniff = @import("../proxy/sniff.zig");
 const mux = @import("../proxy/mux.zig");
 const ws = @import("../proxy/ws.zig");
+const splice = @import("splice.zig");
 
 const max_rec = tls.max_ciphertext_record_len;
 /// Largest chunk read from the SOCKS client per event (xray uses 8 KiB).
@@ -159,6 +160,8 @@ pub const Conn = struct {
     up_eof: bool = false,
     up_write_closed: bool = false,
     client_write_closed: bool = false,
+    upload_pipe: splice.Pipe = .{},
+    download_pipe: splice.Pipe = .{},
     cfg: *const Config = undefined,
 
     // client -> upstream
@@ -277,6 +280,8 @@ pub const Loop = struct {
         c.up_eof = false;
         c.up_write_closed = false;
         c.client_write_closed = false;
+        c.upload_pipe = .{};
+        c.download_pipe = .{};
         c.got_resp_hdr = false;
         c.sniff_enabled = l.cfg.sniff and forced == null;
         c.forced = forced;
@@ -341,7 +346,9 @@ pub const Loop = struct {
 
     pub fn close(l: *Loop, c: *Conn, why: []const u8) void {
         if (c.state == .free) return;
-        sys.log("[w{d}:{d}] close: {s}", .{ l.worker_id, c.slot, why });
+        sys.log("[w{d}:{d}] close: {s}; splice up={d} down={d}", .{ l.worker_id, c.slot, why, c.upload_pipe.bytes, c.download_pipe.bytes });
+        c.upload_pipe.deinit();
+        c.download_pipe.deinit();
         l.publishHop(c, why);
         if (c.chain_key != 0) if (l.cfg.hops) |r| r.release(c.chain_key);
         if (c.hop_key != 0) {
@@ -435,6 +442,28 @@ pub const Loop = struct {
     }
 
     /// Upstream has nothing more to send: deliver what is queued, then close.
+    fn pumpUpload(l: *Loop, c: *Conn) !bool {
+        if (c.state != .relay or c.is_udp or !c.padder.direct or c.up_out_len != 0 or c.cin_len != 0) return false;
+        const before = c.upload_pipe.bytes;
+        const pending = c.upload_pipe.pending;
+        if (!try c.upload_pipe.pump(c.client_fd, c.up_fd, 256 * 1024)) return false;
+        if (c.upload_pipe.bytes != before or c.upload_pipe.pending != pending) c.last_active = sys.monotonicSeconds();
+        if (c.upload_pipe.eof and c.upload_pipe.pending == 0) c.client_eof = true;
+        try l.finishDirections(c);
+        return true;
+    }
+
+    fn pumpDownload(l: *Loop, c: *Conn) !bool {
+        if (c.state != .relay or c.is_udp or !c.unpadder.direct or c.c_out_len != 0 or c.uin_len != 0) return false;
+        const before = c.download_pipe.bytes;
+        const pending = c.download_pipe.pending;
+        if (!try c.download_pipe.pump(c.up_fd, c.client_fd, 256 * 1024)) return false;
+        if (c.download_pipe.bytes != before or c.download_pipe.pending != pending) c.last_active = sys.monotonicSeconds();
+        if (c.download_pipe.eof and c.download_pipe.pending == 0) c.up_eof = true;
+        try l.finishDirections(c);
+        return true;
+    }
+
     fn upstreamDone(l: *Loop, c: *Conn) void {
         c.up_eof = true;
         l.finishDirections(c) catch |e| return l.close(c, @errorName(e));
@@ -443,11 +472,11 @@ pub const Loop = struct {
     }
 
     fn finishDirections(l: *Loop, c: *Conn) (sys.Error || client.Error)!void {
-        if (c.up_eof and c.c_out_len == 0 and !c.client_write_closed) {
+        if (c.up_eof and c.c_out_len == 0 and c.download_pipe.pending == 0 and !c.client_write_closed) {
             sys.shutdownWrite(c.client_fd);
             c.client_write_closed = true;
         }
-        if (c.client_eof and c.cin_len == 0 and c.up_out_len == 0 and !c.up_write_closed and c.state == .relay) {
+        if (c.client_eof and c.cin_len == 0 and c.up_out_len == 0 and c.upload_pipe.pending == 0 and !c.up_write_closed and c.state == .relay) {
             c.up_write_closed = true;
             if (c.padder.direct) sys.shutdownWrite(c.up_fd) else {
                 const rec = try c.tls.close(&c.up_out);
@@ -456,15 +485,15 @@ pub const Loop = struct {
                 try l.flushUpstream(c);
             }
         }
-        if (c.client_eof and c.up_eof and c.cin_len == 0 and c.c_out_len == 0 and c.up_out_len == 0) l.close(c, "eof");
+        if (c.client_eof and c.up_eof and c.cin_len == 0 and c.c_out_len == 0 and c.up_out_len == 0 and c.upload_pipe.pending == 0 and c.download_pipe.pending == 0) l.close(c, "eof");
     }
 
     /// Derive epoll interest sets from buffer state. Read a side only when the
     /// queue feeding the other side is empty.
     fn updateInterest(l: *Loop, c: *Conn) void {
         var cev: u32 = 0;
-        if (c.c_out_len > 0) cev |= sys.EPOLL.OUT;
-        if (c.is_udp or (!c.client_eof and c.up_out_len == 0 and c.cin_len < c.cin.len)) cev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
+        if (c.c_out_len > 0 or c.download_pipe.pending > 0) cev |= sys.EPOLL.OUT;
+        if (c.is_udp or (!c.client_eof and c.up_out_len == 0 and c.upload_pipe.pending == 0 and c.cin_len < c.cin.len)) cev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
         if (cev != c.client_ev) {
             l.setInterest(c.client_fd, &c.client_ev, cev, c.token(.client));
         }
@@ -479,8 +508,8 @@ pub const Loop = struct {
         }
         if (c.up_fd < 0) return;
         var uev: u32 = 0;
-        if (c.state == .connecting or c.up_out_len > 0 or (c.state == .relay and c.cin_len > 0 and c.padder.direct)) uev |= sys.EPOLL.OUT;
-        if (!c.up_eof and c.state != .connecting and c.c_out_len == 0) uev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
+        if (c.state == .connecting or c.up_out_len > 0 or c.upload_pipe.pending > 0 or (c.state == .relay and c.cin_len > 0 and c.padder.direct)) uev |= sys.EPOLL.OUT;
+        if (!c.up_eof and c.state != .connecting and c.c_out_len == 0 and c.download_pipe.pending == 0) uev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
         if (uev != c.up_ev) {
             l.setInterest(c.up_fd, &c.up_ev, uev, c.token(.upstream));
         }
@@ -512,6 +541,7 @@ pub const Loop = struct {
 
     fn readClientOnce(l: *Loop, c: *Conn) !void {
         if (c.client_eof) return; // RDHUP can be reported more than once
+        if (try l.pumpUpload(c)) return;
         if (c.state == .relay and !c.is_udp and c.padder.direct and c.cin_len == 0 and c.up_out_len == 0) {
             // Read straight into the transmit queue: no cin -> up_out copy.
             const n = sys.read(c.client_fd, &c.up_out) catch |err| switch (err) {
@@ -771,6 +801,7 @@ pub const Loop = struct {
         }
         c.c_out_off = 0;
         if (c.state == .relay) {
+            _ = try l.pumpDownload(c);
             try l.finishDirections(c);
             if (c.state == .free) return;
         }
@@ -1023,6 +1054,7 @@ pub const Loop = struct {
         try l.flushUpstream(c);
         if (c.state == .relay) {
             if (c.cin_len > 0) try l.forwardClient(c);
+            _ = try l.pumpUpload(c);
             try l.finishDirections(c);
         }
     }
@@ -1110,6 +1142,7 @@ pub const Loop = struct {
 
     fn readUpstreamOnce(l: *Loop, c: *Conn) !void {
         if (c.up_eof) return;
+        if (try l.pumpDownload(c)) return;
         if (c.c_out_len > 0) return; // back-pressure
         if (c.state == .relay and c.unpadder.direct) {
             // Raw inner stream: straight copy.
@@ -1353,7 +1386,7 @@ test "drain queued upload before FIN and preserve reverse traffic" {
 
 // Exercise real epoll readiness with unread data followed by FIN, rather than
 // pre-setting an EOF flag. Both directions must pause and later resume safely.
-fn backpressureHalfClose(download: bool, expire: bool) !void {
+fn backpressureHalfClose(download: bool, expire: bool, use_splice: bool) !void {
     const linux = std.os.linux;
     const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{}, .idle_timeout_s = 1 };
     const ep = try sys.epollCreate();
@@ -1393,8 +1426,35 @@ fn backpressureHalfClose(download: bool, expire: bool) !void {
         c.up_out[0..3].* = "abc".*;
         c.up_out_len = 3;
     }
-    try std.testing.expectEqual(@as(usize, 3), try sys.write(source, "xyz"));
+    var pipe_quota: @import("fd_budget.zig").Budget = .{ .limit = 2 };
+    if (use_splice) {
+        c.upload_pipe.budget = &pipe_quota;
+        c.download_pipe.budget = &pipe_quota;
+        c.up_out_len = 0;
+        c.c_out_len = 0;
+        const pipe = if (download) &c.download_pipe else &c.upload_pipe;
+        try std.testing.expect(try pipe.pump(if (download) up[0] else cp[0], dst, 0));
+        const pfds = pipe.fds.?;
+        // Unix sockets can still accept a spliced skb after write() reports
+        // EAGAIN. Saturate the splice path itself before testing its backlog.
+        while (true) {
+            const n = try sys.write(pfds[1], &filler);
+            const rc = linux.syscall6(.splice, @bitCast(@as(isize, pfds[0])), 0, @bitCast(@as(isize, dst)), 0, n, 2);
+            const err = linux.errno(rc);
+            if (err == .SUCCESS and rc == n) continue;
+            var scratch: [4096]u8 = undefined;
+            _ = try sys.read(pfds[0], &scratch);
+            if (err == .AGAIN) break;
+            try std.testing.expectEqual(linux.E.SUCCESS, err);
+        }
+    }
+    const tail: []const u8 = if (use_splice) "abcxyz" else "xyz";
+    try std.testing.expectEqual(tail.len, try sys.write(source, tail));
     sys.shutdownWrite(source);
+    if (use_splice) {
+        loop.handle(c.token(side), sys.EPOLL.RDHUP);
+        try std.testing.expectEqual(tail.len, if (download) c.download_pipe.pending else c.upload_pipe.pending);
+    }
     c.last_active = sys.monotonicSeconds() - 3;
     const before = c.last_active;
     // A stale RDHUP from the previous event batch must not extend idle life.
@@ -1460,16 +1520,16 @@ fn backpressureHalfClose(download: bool, expire: bool) !void {
 }
 
 test "upload backpressure and FIN pause epoll then preserve tail and reverse traffic" {
-    try backpressureHalfClose(false, false);
+    try backpressureHalfClose(false, false, false);
 }
 test "download backpressure and FIN pause epoll then preserve tail and reverse traffic" {
-    try backpressureHalfClose(true, false);
+    try backpressureHalfClose(true, false, false);
 }
 test "blocked half-closed upload still expires without progress" {
-    try backpressureHalfClose(false, true);
+    try backpressureHalfClose(false, true, false);
 }
 test "blocked half-closed download still expires without progress" {
-    try backpressureHalfClose(true, true);
+    try backpressureHalfClose(true, true, false);
 }
 
 fn crossWorkerHopFailure(exit_failure: bool) !void {
@@ -1549,4 +1609,17 @@ test "cross-worker chain attributes live and closed relay failures" {
 }
 test "cross-worker chain attributes live and closed exit failures" {
     try crossWorkerHopFailure(true);
+}
+
+test "splice upload backpressure and FIN preserve tail and reverse traffic" {
+    try backpressureHalfClose(false, false, true);
+}
+test "splice download backpressure and FIN preserve tail and reverse traffic" {
+    try backpressureHalfClose(true, false, true);
+}
+test "blocked half-closed splice upload still expires" {
+    try backpressureHalfClose(false, true, true);
+}
+test "blocked half-closed splice download still expires" {
+    try backpressureHalfClose(true, true, true);
 }

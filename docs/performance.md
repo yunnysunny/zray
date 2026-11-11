@@ -35,3 +35,27 @@ cumulative per worker. Shared listeners use EPOLLEXCLUSIVE when available.
 
 The build still uses the original ReleaseSmall preference. Only the compiler's
 single-thread-only assumption is removed so configured workers can run.
+
+## Vision direct relay
+
+Splice is enabled automatically for eligible Vision direct traffic, with no
+configuration switch. Remove any old `splice` JSON field before restarting.
+Upload and download switch independently after the Vision direct command and
+all prior protocol buffers have drained. Each direction owns a lazy nonblocking
+pipe. The per-event transfer budget is 256 KiB; destination backpressure retains
+pending bytes before any further source read. EOF is propagated after buffers
+and pipes drain, preserving the reverse direction.
+
+Pipe pairs share a process-wide atomic budget derived from the fd soft limit.
+Startup reserves existing descriptors, three sockets per connection slot, worker
+epolls and temporary headroom. If `/proc/self/fd` or the limit cannot be read,
+splice is skipped. Budget exhaustion falls back before allocating; closing a pipe
+or a failed allocation returns its quota. Idle pipes stay with their connection.
+
+Pipe allocation failures and unsupported source splice calls fall back to copying
+before source data is consumed. Statistics include syscall counts and transferred
+bytes; close logs show spliced upload/download totals. Plain inner HTTP traffic
+usually remains inside outer TLS and is not eligible for this direct path.
+
+A known Xray freedom peer limitation prevents certification of end-to-end VLESS
+half-close with that peer; direct Conn/epoll half-close is tested separately.

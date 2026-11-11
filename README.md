@@ -159,6 +159,16 @@ thread. Set `workers` to **0** to select automatically (at most four CPUs), or
 is divided among worker pools. Extra workers handle concurrent connections;
 one TCP connection is not split across network workers. Changes require restart.
 
+### Vision direct splice
+
+Vision direct automatically uses splice in each eligible direction through
+`socket -> kernel pipe -> socket` after earlier buffers drain. There is no
+configuration switch. Unsupported source calls or pipe allocation failure fall
+back to ordinary forwarding before consuming source data. The payload bypasses
+user buffers; the process still handles readiness and backpressure. Inner TLS
+protection remains in place. Remove any old `splice` field from your JSON config;
+unknown fields are rejected at startup.
+
 ### Plain VLESS + TLS (no REALITY)
 
 ```json

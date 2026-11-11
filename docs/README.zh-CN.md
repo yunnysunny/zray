@@ -134,6 +134,12 @@ REALITY 服务端会校验客户端时钟（封在 `session_id` 里的时间戳�
 `max_connections` 始终是整个进程的连接总额度，不会乘以 worker 数。
 每条连接归属于一个 worker，多核用于处理并发连接，不会把一条 TCP 流拆给多个核心。
 
+splice 默认启用，无需配置开关。在对应方向进入 Vision direct 且旧缓冲区排空后，
+通过 `socket → 内核 pipe → socket` 转发。源端不支持 splice 或 pipe 分配失败时，
+会在消费源数据之前自动回退普通转发。数据不进入用户缓冲区，进程仍负责 syscall、
+epoll、背压和关闭；内层 TLS 加密保留。已有配置中的 `splice` 字段请删除，
+否则会因未知字段导致启动报错。
+
 `stats_interval_s` 默认 `60`，可设为 `10` 每十秒查看一次累计统计，
 或设为 `0` 关闭定期统计。它不控制其他连接日志。
 

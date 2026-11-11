@@ -14,6 +14,8 @@ pub const Counters = struct {
     writes: u64 = 0,
     epoll_waits: u64 = 0,
     epoll_mods: u64 = 0,
+    splice_calls: u64 = 0,
+    splice_bytes: u64 = 0,
 };
 pub threadlocal var counters: Counters = .{};
 

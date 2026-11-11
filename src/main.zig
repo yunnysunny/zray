@@ -299,7 +299,8 @@ fn linuxMain(init: std.process.Init) !void {
     const socks_fd: ?sys.fd_t = if (parsed.listen.len > 0) try listenOn(parsed.listen) else null;
     const redirect_fd: ?sys.fd_t = if (parsed.redirect.len > 0) try listenOn(parsed.redirect) else null;
     const worker_count = @min(parsed.max_connections, if (parsed.workers == 0) @min(@as(usize, 4), std.Thread.getCpuCount() catch 1) else @as(usize, parsed.workers));
-    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers", .{
+    @import("linux/fd_budget.zig").configure(parsed.max_connections, worker_count, 0);
+    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers, splice enabled", .{
         version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, worker_count,
     });
     for (obs, node_cfgs) |ob, oc| {
@@ -433,8 +434,8 @@ const Worker = struct {
             }
             if (w.cfg.stats_interval_s > 0 and now - last_stats >= w.cfg.stats_interval_s) {
                 const c = sys.counters;
-                sys.log("stats w{d} active={d}/{d} read={d} write={d} epoll_wait={d} epoll_mod={d}", .{
-                    w.id, loop.active, conns.len, c.reads, c.writes, c.epoll_waits, c.epoll_mods,
+                sys.log("stats w{d} active={d}/{d} read={d} write={d} epoll_wait={d} epoll_mod={d} splice_calls={d} splice_bytes={d}", .{
+                    w.id, loop.active, conns.len, c.reads, c.writes, c.epoll_waits, c.epoll_mods, c.splice_calls, c.splice_bytes,
                 });
                 last_stats = now;
             }
