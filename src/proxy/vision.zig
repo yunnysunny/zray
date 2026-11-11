@@ -35,40 +35,89 @@ pub const State = struct {
     cipher: u16 = 0,
     remaining_server_hello: i32 = -1,
 
+    upload_inspector: Inspector = .{},
+    download_inspector: Inspector = .{},
+
     pub fn init(uuid: [16]u8) State {
         return .{ .uuid = uuid };
     }
+};
 
-    /// XtlsFilterTls for one buffer.
-    pub fn filter(s: *State, b: []const u8) void {
-        s.packets_to_filter -= 1;
-        if (b.len >= 6) {
-            if (b[0] == 0x16 and b[1] == 0x03 and b[2] == 0x03 and b[5] == 0x02) {
-                s.remaining_server_hello = (@as(i32, b[3]) << 8 | b[4]) + 5;
-                s.is_tls12_or_above = true;
-                s.is_tls = true;
-                if (b.len >= 79 and s.remaining_server_hello >= 79) {
-                    const sid_len: usize = b[43];
-                    if (b.len >= 43 + sid_len + 3) {
-                        s.cipher = mem.readInt(u16, b[43 + sid_len + 1 ..][0..2], .big);
-                    }
-                }
-            } else if (b[0] == 0x16 and b[1] == 0x03 and b[5] == 0x01) {
-                s.is_tls = true;
-            }
+/// Observe whole TLS records rather than spending the classification budget
+/// on arbitrary TCP reads. Each direction has its own parser. Only a bounded
+/// prefix of plaintext handshake records is retained; application data is
+/// skipped without copying. Oversized/unknown hellos retain outer encryption.
+const Inspector = struct {
+    header: [5]u8 = undefined,
+    used: usize = 0,
+    remaining: usize = 0,
+    body: [2048]u8 = undefined,
+    body_len: usize = 0,
+    invalid: bool = false,
+
+    fn feed(p: *Inspector, state: *State, data: []const u8) void {
+        if (p.invalid) {
+            state.packets_to_filter -= 1;
+            return;
         }
-        if (s.remaining_server_hello > 0) {
-            const end: usize = @min(@as(usize, @intCast(s.remaining_server_hello)), b.len);
-            s.remaining_server_hello -= @intCast(b.len);
-            if (mem.indexOf(u8, b[0..end], &tls13_supported_versions) != null) {
-                switch (s.cipher) {
-                    0x1301, 0x1302, 0x1303, 0x1304 => s.enable_xtls = true,
-                    else => {}, // 0x1305 (CCM_8) and unknown: no direct copy
+        var pos: usize = 0;
+        while (pos < data.len and state.packets_to_filter > 0) {
+            if (p.used < 5) {
+                const n = @min(5 - p.used, data.len - pos);
+                @memcpy(p.header[p.used..][0..n], data[pos..][0..n]);
+                p.used += n;
+                pos += n;
+                if (p.header[0] < 0x14 or p.header[0] > 0x17 or
+                    (p.used >= 2 and p.header[1] != 3) or (p.used >= 3 and p.header[2] > 3))
+                {
+                    p.invalid = true;
+                    state.packets_to_filter -= 1;
+                    return;
                 }
-                s.packets_to_filter = 0;
-            } else if (s.remaining_server_hello <= 0) {
-                s.packets_to_filter = 0; // TLS 1.2
+                if (p.used < 5) return;
+                const h = p.header;
+                if (h[0] < 0x14 or h[0] > 0x17 or h[1] != 3 or h[2] > 3) {
+                    p.invalid = true;
+                    state.packets_to_filter -= 1;
+                    return;
+                }
+                p.remaining = mem.readInt(u16, h[3..5], .big);
+                if (p.remaining > 18432) {
+                    p.invalid = true;
+                    return;
+                }
+                p.body_len = 0;
             }
+            const n = @min(p.remaining, data.len - pos);
+            if (p.header[0] == 0x16) {
+                const keep = @min(n, p.body.len - p.body_len);
+                @memcpy(p.body[p.body_len..][0..keep], data[pos..][0..keep]);
+                p.body_len += keep;
+            }
+            p.remaining -= n;
+            pos += n;
+            if (p.remaining > 0) return;
+            state.packets_to_filter -= 1;
+            if (p.header[0] == 0x16 and p.body_len > 0) {
+                const body = p.body[0..p.body_len];
+                if (body[0] == 1) state.is_tls = true;
+                if (body[0] == 2) {
+                    state.is_tls = true;
+                    state.is_tls12_or_above = true;
+                    if (body.len >= 41) {
+                        const sid: usize = body[38];
+                        if (body.len >= 41 + sid) state.cipher = mem.readInt(u16, body[39 + sid ..][0..2], .big);
+                    }
+                    if (mem.indexOf(u8, body, &tls13_supported_versions) != null) {
+                        state.enable_xtls = switch (state.cipher) {
+                            0x1301, 0x1302, 0x1303, 0x1304 => true,
+                            else => false,
+                        };
+                    }
+                    state.packets_to_filter = 0;
+                }
+            }
+            p.used = 0;
         }
     }
 };
@@ -111,7 +160,7 @@ pub const Padder = struct {
             @memcpy(out[0..payload.len], payload);
             return out[0..payload.len];
         }
-        if (p.state.packets_to_filter > 0) p.state.filter(payload);
+        if (p.state.packets_to_filter > 0) p.state.upload_inspector.feed(p.state, payload);
 
         // ReshapeMultiBuffer: split oversized payloads into two pieces.
         var pieces: [2][]const u8 = .{ payload, &.{} };
@@ -225,7 +274,7 @@ pub const Unpadder = struct {
                 u.direct = true;
             }
         }
-        if (u.state.packets_to_filter > 0 and content.len > 0) u.state.filter(content);
+        if (u.state.packets_to_filter > 0 and content.len > 0) u.state.download_inspector.feed(u.state, content);
         return content;
     }
 
@@ -436,4 +485,22 @@ test "isCompleteRecord" {
     try testing.expect(!isCompleteRecord(&.{ 0x17, 3, 3, 0, 2, 0xaa }));
     try testing.expect(!isCompleteRecord(&.{ 0x14, 3, 3, 0, 1, 1 }));
     try testing.expect(isCompleteRecord(&.{}));
+}
+
+test "one-byte fragmented hellos preserve classification budget and enable Vision" {
+    var st = State.init(@splat(0));
+    var ch: [100]u8 = @splat(0);
+    ch[0..6].* = .{ 0x16, 3, 1, 0, 95, 1 };
+    for (ch) |b| st.upload_inspector.feed(&st, &.{b});
+    try testing.expect(st.is_tls);
+    try testing.expectEqual(@as(i32, 7), st.packets_to_filter);
+    var sh: [120]u8 = @splat(0);
+    sh[0..6].* = .{ 0x16, 3, 3, 0, 115, 2 };
+    sh[43] = 32;
+    sh[76..78].* = .{ 0x13, 1 };
+    sh[90..96].* = tls13_supported_versions;
+    for (sh) |b| st.download_inspector.feed(&st, &.{b});
+    try testing.expect(st.enable_xtls);
+    try testing.expectEqual(@as(u16, 0x1301), st.cipher);
+    try testing.expectEqual(@as(i32, 0), st.packets_to_filter);
 }
