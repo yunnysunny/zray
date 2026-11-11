@@ -280,6 +280,26 @@ pub fn epollWait(ep: fd_t, events: []Event, timeout_ms: i32) Error!usize {
     };
 }
 
+pub fn eventCreate(nonblock: bool) Error!fd_t {
+    return @intCast(try check(linux.eventfd(0, linux.EFD.CLOEXEC | @as(u32, if (nonblock) linux.EFD.NONBLOCK else 0))));
+}
+
+pub fn eventNotify(fd: fd_t) void {
+    var one: u64 = 1;
+    while (true) {
+        const rc = linux.write(fd, std.mem.asBytes(&one), 8);
+        if (linux.errno(rc) != .INTR) return;
+    }
+}
+
+pub fn eventDrain(fd: fd_t) void {
+    var value: u64 = undefined;
+    while (true) {
+        const rc = linux.read(fd, std.mem.asBytes(&value), 8);
+        if (linux.errno(rc) != .INTR) return;
+    }
+}
+
 // ---- misc -------------------------------------------------------------------
 
 pub fn monotonicSeconds() u64 {

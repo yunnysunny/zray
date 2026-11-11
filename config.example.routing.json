@@ -56,5 +56,6 @@
   "workers": 1,
   "crypto_backend": "off",
   "crypto_min_bytes": 4096,
-  "crypto_max_bytes": 32768
+  "crypto_max_bytes": 32768,
+  "crypto_async": true
 }

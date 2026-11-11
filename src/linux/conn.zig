@@ -26,6 +26,7 @@ const mux = @import("../proxy/mux.zig");
 const ws = @import("../proxy/ws.zig");
 const splice = @import("splice.zig");
 const kernel_crypto = @import("kernel_crypto.zig");
+const crypto = @import("crypto.zig");
 
 const max_rec = tls.max_ciphertext_record_len;
 /// Largest chunk read from the SOCKS client per event (xray uses 8 KiB).
@@ -165,6 +166,10 @@ pub const Conn = struct {
     upload_pipe: splice.Pipe = .{},
     download_pipe: splice.Pipe = .{},
     cfg: *const Config = undefined,
+    crypto_job: ?*crypto.Job = null,
+    crypto_ready: bool = false,
+    paused: bool = false,
+    close_wait: ?[]const u8 = null,
 
     // client -> upstream
     cin: [client_chunk]u8 = undefined,
@@ -244,12 +249,59 @@ pub const Loop = struct {
     active: usize = 0,
     bad_until: [max_outbounds]u64 = @splat(0),
     worker_id: usize = 0,
+    executor: ?*crypto.Executor = null,
 
     pub fn init(ep: sys.fd_t, cfg: *const Config, conns: []Conn) Loop {
         var seed: [32]u8 = undefined;
         sys.randomBytes(&seed);
         for (conns, 0..) |*c, i| c.* = .{ .slot = @intCast(i), .cfg = cfg };
         return .{ .ep = ep, .cfg = cfg, .conns = conns, .csprng = std.Random.DefaultCsprng.init(seed) };
+    }
+
+    pub fn attachCrypto(l: *Loop, executor: *crypto.Executor) void {
+        l.executor = executor;
+        for (l.conns, executor.jobs) |*c, *j| c.crypto_job = j;
+    }
+
+    pub fn cryptoCompleted(l: *Loop) void {
+        const ex = l.executor orelse return;
+        sys.eventDrain(ex.completed_fd);
+        for (l.conns) |*c| {
+            const j = c.crypto_job orelse continue;
+            if (j.status.load(.acquire) != .done) continue;
+            j.status.store(.idle, .release);
+            ex.completed += 1;
+            if (c.close_wait) |why| {
+                c.close_wait = null;
+                l.close(c, why);
+                continue;
+            }
+            if (j.failure) |err| {
+                l.close(c, @errorName(err));
+                continue;
+            }
+            switch (j.operation) {
+                .encrypt => {
+                    c.up_out_off = 0;
+                    c.up_out_len = j.produced;
+                    l.flushUpstream(c) catch |err| {
+                        l.close(c, @errorName(err));
+                        continue;
+                    };
+                },
+                .decrypt => {
+                    c.crypto_ready = true;
+                    l.processUpstream(c) catch |err| {
+                        if (err == error.UpstreamEof or err == error.UpstreamCloseNotify) l.upstreamDone(c) else l.close(c, @errorName(err));
+                        continue;
+                    };
+                },
+            }
+            if (c.state != .free) {
+                l.publishHop(c, "");
+                l.updateInterest(c);
+            }
+        }
     }
 
     // ---- lifecycle -----------------------------------------------------------
@@ -284,6 +336,9 @@ pub const Loop = struct {
         c.client_write_closed = false;
         c.upload_pipe = .{};
         c.download_pipe = .{};
+        c.crypto_ready = false;
+        c.paused = false;
+        c.close_wait = null;
         c.got_resp_hdr = false;
         c.sniff_enabled = l.cfg.sniff and forced == null;
         c.forced = forced;
@@ -348,6 +403,11 @@ pub const Loop = struct {
 
     pub fn close(l: *Loop, c: *Conn, why: []const u8) void {
         if (c.state == .free) return;
+        if (c.crypto_job) |j| if (j.pending()) {
+            c.close_wait = why;
+            l.updateInterest(c);
+            return;
+        };
         sys.log("[w{d}:{d}] close: {s}; splice up={d} down={d}", .{ l.worker_id, c.slot, why, c.upload_pipe.bytes, c.download_pipe.bytes });
         c.upload_pipe.deinit();
         c.download_pipe.deinit();
@@ -410,12 +470,23 @@ pub const Loop = struct {
         if (slot >= l.conns.len) return;
         const c = &l.conns[slot];
         if (c.state == .free or c.gen != gen) return; // stale
+        if (c.close_wait != null) return;
+        if (c.crypto_job) |j| if (j.pending()) return;
+
         defer if (c.state != .free) l.publishHop(c, "");
         switch (side) {
             .client => {
                 if (events & sys.EPOLL.OUT != 0) l.flushClient(c) catch |e| return l.close(c, @errorName(e));
                 if (c.state == .free) return;
+                if (c.crypto_job) |j| if (j.pending()) {
+                    l.updateInterest(c);
+                    return;
+                };
                 if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP | sys.EPOLL.HUP) != 0) l.readClient(c) catch |e| return l.close(c, @errorName(e));
+                if (c.crypto_job) |j| if (j.pending()) {
+                    l.updateInterest(c);
+                    return;
+                };
                 if (events & sys.EPOLL.ERR != 0 and c.state != .free) return l.close(c, "client error");
             },
             .upstream => {
@@ -423,12 +494,20 @@ pub const Loop = struct {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, @errorName(e));
                     return l.close(c, @errorName(e));
                 };
+                if (c.crypto_job) |j| if (j.pending()) {
+                    l.updateInterest(c);
+                    return;
+                };
                 if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP | sys.EPOLL.HUP) != 0) l.readUpstream(c) catch |e| {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, @errorName(e));
                     switch (e) {
                         error.UpstreamEof, error.UpstreamCloseNotify => return l.upstreamDone(c),
                         else => return l.close(c, @errorName(e)),
                     }
+                };
+                if (c.crypto_job) |j| if (j.pending()) {
+                    l.updateInterest(c);
+                    return;
                 };
                 if (events & sys.EPOLL.ERR != 0 and c.state != .free) {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, "upstream hup");
@@ -445,6 +524,7 @@ pub const Loop = struct {
 
     /// Upstream has nothing more to send: deliver what is queued, then close.
     fn pumpUpload(l: *Loop, c: *Conn) !bool {
+        if (c.crypto_job) |j| if (j.pending()) return false;
         if (c.state != .relay or c.is_udp or !c.padder.direct or c.up_out_len != 0 or c.cin_len != 0) return false;
         const before = c.upload_pipe.bytes;
         const pending = c.upload_pipe.pending;
@@ -456,6 +536,7 @@ pub const Loop = struct {
     }
 
     fn pumpDownload(l: *Loop, c: *Conn) !bool {
+        if (c.crypto_job) |j| if (j.pending()) return false;
         if (c.state != .relay or c.is_udp or !c.unpadder.direct or c.c_out_len != 0 or c.uin_len != 0) return false;
         const before = c.download_pipe.bytes;
         const pending = c.download_pipe.pending;
@@ -474,6 +555,7 @@ pub const Loop = struct {
     }
 
     fn finishDirections(l: *Loop, c: *Conn) (sys.Error || client.Error)!void {
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.up_eof and c.c_out_len == 0 and c.download_pipe.pending == 0 and !c.client_write_closed) {
             sys.shutdownWrite(c.client_fd);
             c.client_write_closed = true;
@@ -493,6 +575,20 @@ pub const Loop = struct {
     /// Derive epoll interest sets from buffer state. Read a side only when the
     /// queue feeding the other side is empty.
     fn updateInterest(l: *Loop, c: *Conn) void {
+        if (c.crypto_job) |j| if (j.pending()) {
+            if (!c.paused) {
+                for ([_]sys.fd_t{ c.client_fd, c.up_fd, c.udp_fd }) |fd| if (fd >= 0) sys.epollDel(l.ep, fd);
+                c.paused = true;
+            }
+            return;
+        };
+        if (c.paused) {
+            if (c.udp_fd >= 0) sys.epollAdd(l.ep, c.udp_fd, 0, c.token(.udp)) catch {};
+            c.client_ev = 0;
+            c.up_ev = 0;
+            c.udp_ev = 0;
+            c.paused = false;
+        }
         var cev: u32 = 0;
         if (c.c_out_len > 0 or c.download_pipe.pending > 0) cev |= sys.EPOLL.OUT;
         if (c.is_udp or (!c.client_eof and c.up_out_len == 0 and c.upload_pipe.pending == 0 and c.cin_len < c.cin.len)) cev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
@@ -538,10 +634,12 @@ pub const Loop = struct {
             const reads = sys.counters.reads;
             try l.readClientOnce(c);
             if (c.state != .relay or c.client_eof or c.up_out_len > 0 or c.cin_len > 0 or sys.counters.reads == reads) break;
+            if (c.crypto_job) |j| if (j.pending()) break;
         }
     }
 
     fn readClientOnce(l: *Loop, c: *Conn) !void {
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.client_eof) return; // RDHUP can be reported more than once
         if (try l.pumpUpload(c)) return;
         if (c.state == .relay and !c.is_udp and c.padder.direct and c.cin_len == 0 and c.up_out_len == 0) {
@@ -651,6 +749,7 @@ pub const Loop = struct {
 
     /// Encode everything buffered in `cin` for the upstream and start writing.
     fn forwardClient(l: *Loop, c: *Conn) !void {
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.cin_len == 0 or c.up_out_len > 0) return;
         const data = c.cin[0..c.cin_len];
         if (c.padder.direct) {
@@ -671,6 +770,15 @@ pub const Loop = struct {
                 break :blk padded_buf[off..][0..data.len];
             };
             const plain = if (c.ws_on) ws.frameInPlace(&padded_buf, off, padded.len, maskOf(c)) else padded;
+            if (c.crypto_job) |j| {
+                if (c.cfg.crypto_limits.accepts(plain.len + 1) and c.tls.suite != .chacha20_poly1305_sha256) {
+                    @memcpy(j.input[0..plain.len], plain);
+                    c.cin_len = 0;
+                    j.submit(.encrypt, &c.tls, j.input[0..plain.len], &c.up_out);
+                    if (l.executor) |ex| ex.submitted += 1;
+                    return;
+                }
+            }
             const rec = c.tls.encrypt(plain, &c.up_out) catch return error.TlsEncrypt;
             c.up_out_len = rec.len;
             if (c.padder.direct) sys.log("[{d}] vision uplink -> direct", .{c.slot});
@@ -1139,10 +1247,12 @@ pub const Loop = struct {
             const reads = sys.counters.reads;
             try l.readUpstreamOnce(c);
             if (c.state != .relay or c.up_eof or c.c_out_len > 0 or sys.counters.reads == reads) break;
+            if (c.crypto_job) |j| if (j.pending()) break;
         }
     }
 
     fn readUpstreamOnce(l: *Loop, c: *Conn) !void {
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.up_eof) return;
         if (try l.pumpDownload(c)) return;
         if (c.c_out_len > 0) return; // back-pressure
@@ -1173,7 +1283,9 @@ pub const Loop = struct {
 
     fn processUpstream(l: *Loop, c: *Conn) !void {
         try processRecords(c);
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.c_out_len > 0) try l.flushClient(c);
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.up_out_len > 0) try l.flushUpstream(c);
         if (c.state == .relay and c.cin_len > 0) try l.forwardClient(c);
     }
@@ -1190,9 +1302,20 @@ pub const Loop = struct {
             if (c.uin_len < total) break;
 
             var scratch: [max_rec]u8 = undefined;
-            const res = c.tls.handleRecord(c.uin[0..total], &scratch) catch |e| {
-                if (c.tls.last_alert) |a| sys.log("[{d}] tls alert {s}", .{ c.slot, @tagName(a.description) });
-                return e;
+            const res = if (c.crypto_ready) blk: {
+                c.crypto_ready = false;
+                break :blk c.crypto_job.?.result;
+            } else blk: {
+                if (c.crypto_job) |j| {
+                    if (c.state == .relay and c.tls.state == .connected and hdr.content_type == .application_data and total >= 22 and c.cfg.crypto_limits.accepts(total - 21) and c.tls.suite != .chacha20_poly1305_sha256) {
+                        j.submit(.decrypt, &c.tls, c.uin[0..total], &j.reply);
+                        return;
+                    }
+                }
+                break :blk c.tls.handleRecord(c.uin[0..total], &scratch) catch |e| {
+                    if (c.tls.last_alert) |a| sys.log("[{d}] tls alert {s}", .{ c.slot, @tagName(a.description) });
+                    return e;
+                };
             };
             if (res.to_send.len > 0) {
                 if (c.up_out_len + res.to_send.len > c.up_out.len) return error.UpstreamQueueFull;
@@ -1624,4 +1747,99 @@ test "blocked half-closed splice upload still expires" {
 }
 test "blocked half-closed splice download still expires" {
     try backpressureHalfClose(true, true, true);
+}
+
+test "deferred close keeps crypto-owned slot alive and rejects stale events after reuse" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    var executor = try crypto.Executor.init(std.testing.allocator, 1, .off);
+    defer executor.stop(std.testing.allocator);
+    loop.attachCrypto(&executor);
+    const c = &conns[0];
+    const job = &executor.jobs[0];
+    c.state = .relay;
+    loop.active = 1;
+    const stale = c.token(.client);
+    // The crypto thread owns TLS and buffers until its release publication.
+    job.status.store(.running, .release);
+    loop.close(c, "cancelled during crypto");
+    try std.testing.expectEqual(@as(usize, 1), loop.active);
+    try std.testing.expect(c.close_wait != null);
+    try std.testing.expect(c.paused);
+    loop.handle(stale, sys.EPOLL.IN | sys.EPOLL.HUP);
+    try std.testing.expectEqual(State.relay, c.state);
+    job.status.store(.done, .release);
+    loop.cryptoCompleted();
+    try std.testing.expectEqual(State.free, c.state);
+    try std.testing.expectEqual(@as(usize, 0), loop.active);
+    try std.testing.expectEqual(crypto.Status.idle, job.status.load(.acquire));
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+    loop.accept(pair[0], .socks5, null);
+    defer loop.close(c, "test finished");
+    try std.testing.expectEqual(State.socks_greeting, c.state);
+    try std.testing.expect(c.token(.client) != stale);
+    loop.handle(stale, sys.EPOLL.IN | sys.EPOLL.ERR);
+    try std.testing.expectEqual(State.socks_greeting, c.state);
+    try std.testing.expectEqual(@as(usize, 1), loop.active);
+}
+
+test "crypto completion restores real epoll readiness after socket removal" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var cp: [2]sys.fd_t = undefined;
+    var up: [2]sys.fd_t = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &cp)));
+    defer sys.close(cp[1]);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &up)));
+    defer sys.close(up[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    var executor = try crypto.Executor.init(std.testing.allocator, 1, .off);
+    defer executor.stop(std.testing.allocator);
+    loop.attachCrypto(&executor);
+    loop.accept(cp[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    c.state = .relay;
+    c.up_fd = up[0];
+    c.padder.direct = true;
+    c.unpadder.direct = true;
+    loop.updateInterest(c);
+    const j = &executor.jobs[0];
+    j.status.store(.running, .release);
+    loop.updateInterest(c);
+    try std.testing.expect(c.paused);
+    try std.testing.expectEqual(@as(usize, 4), try sys.write(cp[1], "tail"));
+    sys.shutdownWrite(cp[1]);
+    var events: [4]sys.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try sys.epollWait(ep, &events, 10));
+    j.operation = .encrypt;
+    j.produced = 0;
+    j.status.store(.done, .release);
+    loop.cryptoCompleted();
+    try std.testing.expect(!c.paused);
+    var buf: [8]u8 = undefined;
+    var got = false;
+    for (0..10) |_| {
+        const count = try sys.epollWait(ep, &events, 10);
+        for (events[0..count]) |ev| loop.handle(ev.data.u64, ev.events);
+        const n = sys.read(up[1], &buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        try std.testing.expectEqualSlices(u8, "tail", buf[0..n]);
+        got = true;
+        break;
+    }
+    try std.testing.expect(got);
+    try std.testing.expect(c.client_eof);
 }
