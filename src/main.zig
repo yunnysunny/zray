@@ -96,6 +96,7 @@ const FileConfig = struct {
     idle_timeout_s: u64 = 600,
     connect_timeout_s: u64 = 5,
     sock_buf: i32 = 0,
+    stats_interval_s: u64 = 60,
 };
 
 const Upstream = union(enum) {
@@ -277,6 +278,7 @@ fn linuxMain(init: std.process.Init) !void {
         .sock_buf = parsed.sock_buf,
         .sniff = parsed.sniff,
         .fail_backoff_s = parsed.fail_backoff_s,
+        .stats_interval_s = parsed.stats_interval_s,
     };
 
     if (parsed.listen.len == 0 and parsed.redirect.len == 0) {
@@ -330,6 +332,7 @@ fn linuxMain(init: std.process.Init) !void {
 
     var events: [64]sys.Event = undefined;
     var last_sweep = sys.monotonicSeconds();
+    var last_stats = last_sweep;
     while (true) {
         const n = sys.epollWait(ep, &events, 1000) catch |e| {
             sys.log("epoll_wait: {s}", .{@errorName(e)});
@@ -357,6 +360,13 @@ fn linuxMain(init: std.process.Init) !void {
         if (now != last_sweep) {
             last_sweep = now;
             loop.sweep();
+        }
+        if (cfg.stats_interval_s > 0 and now - last_stats >= cfg.stats_interval_s) {
+            const c = sys.counters;
+            sys.log("stats active={d}/{d} read={d} write={d} epoll_wait={d} epoll_mod={d}", .{
+                loop.active, conns.len, c.reads, c.writes, c.epoll_waits, c.epoll_mods,
+            });
+            last_stats = now;
         }
     }
 }

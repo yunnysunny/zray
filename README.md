@@ -128,6 +128,14 @@ inner connection presents.
 | `connect_timeout_s` | `5` | Hard deadline for one upstream attempt (TCP connect, hop SOCKS, TLS, WS upgrade), not extended by traffic. On expiry the next group member is tried. |
 | `idle_timeout_s` | `600` | Close a relay with no traffic in either direction. |
 | `sock_buf` | `0` | `SO_SNDBUF` / `SO_RCVBUF` per socket; `0` leaves kernel defaults. |
+| `stats_interval_s` | `60` | Periodic statistics interval in seconds; 0 disables periodic statistics. |
+
+All runtime controls above belong at the **top level** of the configuration JSON,
+alongside `listen` and `max_connections`, including when using multiple outbounds.
+Do not put them inside an outbound object. Omitted controls use the listed defaults.
+Edit the file passed to `zray /path/to/config.json`, then restart the process.
+The supplied OpenWrt init script reads `/mnt/zray/config.json`; after editing that
+file, run `/etc/init.d/zray restart`. JSON does not allow comments.
 
 The REALITY server checks the client's clock (timestamp inside the sealed
 `session_id`). A router whose time is not synced will fail every handshake
@@ -336,3 +344,5 @@ Everything in `tls/` and `proxy/` is sans-I/O and unit tested
 ## License
 
 [MIT](LICENSE).
+
+Relay performance controls and measurement: [docs/performance.md](docs/performance.md).

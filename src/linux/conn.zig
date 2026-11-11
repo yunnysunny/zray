@@ -79,6 +79,7 @@ pub const Config = struct {
     sniff: bool = true,
     /// Seconds an outbound is skipped after it failed to connect.
     fail_backoff_s: u64 = 30,
+    stats_interval_s: u64 = 60,
 };
 
 /// Does `host` equal `suffix` or end in ".suffix"? (ASCII case-insensitive)

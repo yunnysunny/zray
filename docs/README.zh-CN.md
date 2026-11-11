@@ -112,6 +112,15 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `connect_timeout_s` | `5` | 单次上游尝试（TCP 连接、hop SOCKS、TLS、WS 升级）的硬时限，有流量也不延长；超时即换组内下一个成员。 |
 | `idle_timeout_s` | `600` | 双向都无流量多久后关闭。 |
 | `sock_buf` | `0` | 每个 socket 的 `SO_SNDBUF` / `SO_RCVBUF`；`0` 用内核默认。 |
+| `stats_interval_s` | `60` | 统计输出间隔，单位秒；0 关闭定期统计。 |
+
+上述运行参数全部写在配置 JSON 的**最外层**，与 `listen`、`max_connections`
+同级；使用多节点时也不要写进 `outbounds` 的节点对象。省略字段即采用表中默认值。
+修改实际启动命令使用的文件后，需要重启进程才生效。
+
+直接运行：`zray /path/to/config.json`。仓库的 OpenWrt init 脚本读取
+`/mnt/zray/config.json`；按该方式部署时修改此文件，然后执行
+`/etc/init.d/zray restart`。JSON 不支持注释，布尔值使用 `true` / `false`。
 
 REALITY 服务端会校验客户端时钟（封在 `session_id` 里的时间戳）。路由器时间
 没同步时所有握手都会以 `CertificateRejected` 失败。
