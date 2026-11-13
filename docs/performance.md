@@ -48,7 +48,7 @@ and pipes drain, preserving the reverse direction.
 
 Pipe pairs share a process-wide atomic budget derived from the fd soft limit.
 Startup reserves existing descriptors, three sockets per connection slot, worker
-epolls, enabled crypto session and executor event descriptors and temporary headroom. If `/proc/self/fd` or the limit cannot be read,
+epolls, enabled crypto session descriptors and temporary headroom. If `/proc/self/fd` or the limit cannot be read,
 splice is skipped. Budget exhaustion falls back before allocating; closing a pipe
 or a failed allocation returns its quota. Idle pipes stay with their connection.
 
@@ -81,19 +81,12 @@ not prove hardware execution: the selected implementation can use software or
 CPU instructions. Throughput and backend behavior need testing on the target.
 No NEON AES/GHASH implementation or performance compiler options are added.
 
-## Async kernel requests
+## Synchronous kernel requests
 
-`crypto_async` defaults to true. Explicitly enabling a kernel crypto backend on
-Linux creates one crypto executor per network worker. Set `crypto_async` false
-for synchronous comparison. With `workers: 1` and `crypto_backend: "off"`, the
-main thread runs the single network loop without additional threads.
+Each network worker executes kernel crypto requests synchronously using its own
+context and backend counters. Only records within the configured byte limits
+use the backend. With `workers: 1`, the main thread runs a single network loop.
 
-Complete TLS operations publish through bounded per-connection jobs and eventfd
-notifications. Sockets pause while the executor owns their TLS state and buffers;
-close/reuse waits for completion. Only records within the configured byte limits
-are delegated. Diagnostics read atomically published backend counts.
-
-Async mode does not split a record across cores. Outer handshakes and small
-records continue through the ordinary TLS path; Vision direct traffic bypasses
-outer record encryption. `crypto_completed` counts completed jobs, including
-those that fell back to software. See the [worker example](../README.md#async-crypto-and-worker-counts).
+Vision direct traffic bypasses outer record encryption. `crypto_kernel` counts
+successful kernel operations; `crypto_fallback` and `crypto_badmac` count software
+fallbacks and authentication failures. See the [worker example](../README.md#crypto-and-worker-counts).

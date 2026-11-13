@@ -16,7 +16,6 @@
   "crypto_backend": "off",
   "crypto_min_bytes": 4096,
   "crypto_max_bytes": 32768,
-  "crypto_async": true,
   "handshake_timeout_s": 15,
   "idle_timeout_s": 300,
   "sock_buf": 0
