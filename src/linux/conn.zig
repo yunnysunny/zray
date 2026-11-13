@@ -1,4 +1,4 @@
-//! One proxied connection: SOCKS5 client <-> REALITY/VLESS/Vision upstream.
+//! One proxied connection: SOCKS5 / HTTP client <-> REALITY/VLESS/Vision upstream.
 //!
 //! Non-blocking, owned by one worker and driven by its `Loop`. All buffers are fixed
 //! size members so a connection's memory footprint is a compile-time constant
@@ -20,6 +20,7 @@ const reality = @import("../tls/reality.zig");
 const vless = @import("../proxy/vless.zig");
 const vision = @import("../proxy/vision.zig");
 const socks5 = @import("../proxy/socks5.zig");
+const http = @import("../proxy/http.zig");
 const fingerprint = @import("../tls/fingerprint.zig");
 const sniff = @import("../proxy/sniff.zig");
 const mux = @import("../proxy/mux.zig");
@@ -31,6 +32,8 @@ const crypto = @import("crypto.zig");
 const max_rec = tls.max_ciphertext_record_len;
 /// Largest chunk read from the SOCKS client per event (xray uses 8 KiB).
 const client_chunk = 8192;
+// Absolute-URL rewriting may add Host / Connection headers to a full read.
+const client_buffer = client_chunk + 64;
 
 pub const max_outbounds = 16;
 /// ob_index[i..][0..1] is a static one-element group for outbound i.
@@ -118,6 +121,9 @@ pub const State = enum {
     free,
     socks_greeting,
     socks_request,
+    http_request,
+    /// Drain an HTTP error response before closing.
+    http_error,
     /// Waiting for the first client bytes to pick an outbound by SNI/Host.
     sniffing,
     connecting,
@@ -148,6 +154,9 @@ pub const Conn = struct {
     up_ev: u32 = 0,
     udp_ev: u32 = 0,
 
+    http_plain: bool = false,
+    http_body: http.Body = .{},
+
     // SOCKS5 UDP ASSOCIATE: `client_fd` is only the control connection, packets
     // flow on `udp_fd` and are carried upstream as XUDP mux frames.
     is_udp: bool = false,
@@ -172,7 +181,7 @@ pub const Conn = struct {
     close_wait: ?[]const u8 = null,
 
     // client -> upstream
-    cin: [client_chunk]u8 = undefined,
+    cin: [client_buffer]u8 = undefined,
     cin_len: usize = 0,
     up_out: [max_rec]u8 = undefined,
     up_out_off: usize = 0,
@@ -319,6 +328,8 @@ pub const Loop = struct {
         c.client_ev = 0;
         c.up_ev = 0;
         c.udp_ev = 0;
+        c.http_plain = false;
+        c.http_body = .{};
         c.is_udp = false;
         c.udp_fd = -1;
         c.udp_peer = null;
@@ -525,7 +536,7 @@ pub const Loop = struct {
     /// Upstream has nothing more to send: deliver what is queued, then close.
     fn pumpUpload(l: *Loop, c: *Conn) !bool {
         if (c.crypto_job) |j| if (j.pending()) return false;
-        if (c.state != .relay or c.is_udp or !c.padder.direct or c.up_out_len != 0 or c.cin_len != 0) return false;
+        if (c.state != .relay or c.is_udp or c.http_plain or !c.padder.direct or c.up_out_len != 0 or c.cin_len != 0) return false;
         const before = c.upload_pipe.bytes;
         const pending = c.upload_pipe.pending;
         if (!try c.upload_pipe.pump(c.client_fd, c.up_fd, 256 * 1024)) return false;
@@ -556,6 +567,7 @@ pub const Loop = struct {
 
     fn finishDirections(l: *Loop, c: *Conn) (sys.Error || client.Error)!void {
         if (c.crypto_job) |j| if (j.pending()) return;
+        if (c.http_plain and c.up_eof) c.client_eof = true;
         if (c.up_eof and c.c_out_len == 0 and c.download_pipe.pending == 0 and !c.client_write_closed) {
             sys.shutdownWrite(c.client_fd);
             c.client_write_closed = true;
@@ -591,7 +603,7 @@ pub const Loop = struct {
         }
         var cev: u32 = 0;
         if (c.c_out_len > 0 or c.download_pipe.pending > 0) cev |= sys.EPOLL.OUT;
-        if (c.is_udp or (!c.client_eof and c.up_out_len == 0 and c.upload_pipe.pending == 0 and c.cin_len < c.cin.len)) cev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
+        if (c.state != .http_error and (c.is_udp or (!c.client_eof and !(c.http_plain and c.http_body.done()) and c.up_out_len == 0 and c.upload_pipe.pending == 0 and c.cin_len < client_chunk))) cev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
         if (cev != c.client_ev) {
             l.setInterest(c.client_fd, &c.client_ev, cev, c.token(.client));
         }
@@ -640,9 +652,10 @@ pub const Loop = struct {
 
     fn readClientOnce(l: *Loop, c: *Conn) !void {
         if (c.crypto_job) |j| if (j.pending()) return;
+        if (c.state == .http_error or (c.http_plain and c.http_body.done())) return;
         if (c.client_eof) return; // RDHUP can be reported more than once
         if (try l.pumpUpload(c)) return;
-        if (c.state == .relay and !c.is_udp and c.padder.direct and c.cin_len == 0 and c.up_out_len == 0) {
+        if (c.state == .relay and !c.is_udp and !c.http_plain and c.padder.direct and c.cin_len == 0 and c.up_out_len == 0) {
             // Read straight into the transmit queue: no cin -> up_out copy.
             const n = sys.read(c.client_fd, &c.up_out) catch |err| switch (err) {
                 error.WouldBlock, error.Interrupted => return,
@@ -670,13 +683,14 @@ pub const Loop = struct {
             if (n == 0) return error.UdpControlClosed;
             return;
         }
-        if (c.up_out_len > 0 or c.cin_len == c.cin.len) return; // back-pressure
-        const n = sys.read(c.client_fd, c.cin[c.cin_len..]) catch |e| switch (e) {
+        if (c.up_out_len > 0 or c.cin_len >= client_chunk) return; // back-pressure
+        const n = sys.read(c.client_fd, c.cin[c.cin_len..client_chunk]) catch |e| switch (e) {
             error.WouldBlock => return,
             else => return e,
         };
         if (n > 0) c.last_active = sys.monotonicSeconds();
         if (n == 0) {
+            if (c.http_plain and !c.http_body.done()) return error.HttpTruncatedBody;
             c.client_eof = true;
             // Hop connection whose chained outbound gave up before the relay
             // answered (dead exit): nobody is left to read the reply, and the
@@ -685,13 +699,19 @@ pub const Loop = struct {
             if (c.state == .relay) try l.finishDirections(c) else return error.ClientClosedEarly;
             return;
         }
-        c.cin_len += n;
+        // Only the first HTTP request belongs to this upstream connection.
+        const used = if (c.http_plain) try c.http_body.feed(c.cin[c.cin_len..][0..n]) else n;
+        c.cin_len += used;
         try l.processClient(c);
     }
 
     fn processClient(l: *Loop, c: *Conn) !void {
         switch (c.state) {
             .socks_greeting => {
+                if (c.cin_len > 0 and c.cin[0] != 5 and c.forced == null) {
+                    c.state = .http_request;
+                    return l.processClient(c);
+                }
                 const used = (socks5.parseGreeting(c.cin[0..c.cin_len]) catch {
                     l.queueClient(c, &socks5.greeting_reject);
                     return error.SocksGreeting;
@@ -740,11 +760,68 @@ pub const Loop = struct {
                 try l.flushClient(c);
                 try l.routeOrSniff(c);
             },
+            .http_request => {
+                const req = (http.parse(c.cin[0..c.cin_len]) catch |err| return l.httpError(c, err)) orelse return;
+                switch (req.target.address) {
+                    .ipv4 => |a| {
+                        c.target_kind = .ipv4;
+                        c.target_buf[0..4].* = a;
+                        c.target_len = 4;
+                    },
+                    .ipv6 => |a| {
+                        c.target_kind = .ipv6;
+                        c.target_buf[0..16].* = a;
+                        c.target_len = 16;
+                    },
+                    .domain => |d| {
+                        c.target_kind = .domain;
+                        @memcpy(c.target_buf[0..d.len], d);
+                        c.target_len = @intCast(d.len);
+                    },
+                }
+                c.target_port = req.target.port;
+                // HTTP supplies an explicit authority; do not replace it by Host/SNI.
+                c.sniff_enabled = false;
+                if (req.connect) {
+                    c.consumeClient(req.len);
+                    l.queueClient(c, http.connected);
+                    try l.flushClient(c);
+                } else {
+                    var rewritten: [client_chunk]u8 = undefined;
+                    const head = http.rewrite(req, &rewritten) catch |err| return l.httpError(c, err);
+                    c.http_body = req.body;
+                    const body_len = c.http_body.feed(c.cin[req.len..c.cin_len]) catch |err| return l.httpError(c, err);
+                    if (head.len + body_len > c.cin.len) return l.httpError(c, error.HeaderTooLarge);
+                    if (head.len > req.len)
+                        mem.copyBackwards(u8, c.cin[head.len..][0..body_len], c.cin[req.len..][0..body_len])
+                    else
+                        mem.copyForwards(u8, c.cin[head.len..][0..body_len], c.cin[req.len..][0..body_len]);
+                    @memcpy(c.cin[0..head.len], head);
+                    c.cin_len = head.len + body_len;
+                    c.http_plain = true;
+                }
+                try l.routeOrSniff(c);
+            },
+            .http_error => {},
             .sniffing => try l.sniffRoute(c),
             .connecting, .socks_dial, .tls_handshake, .ws_upgrade => {}, // buffer in cin until the tunnel is up
             .relay => try l.forwardClient(c),
             .free => unreachable,
         }
+    }
+
+    fn httpError(l: *Loop, c: *Conn, err: http.Error) !void {
+        const status = switch (err) {
+            error.HeaderTooLarge, error.BufferTooSmall => "431 Request Header Fields Too Large",
+            error.Unsupported => "501 Not Implemented",
+            else => "400 Bad Request",
+        };
+        var buf: [160]u8 = undefined;
+        const reply = try std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", .{status});
+        c.state = .http_error;
+        c.cin_len = 0;
+        l.queueClient(c, reply);
+        try l.flushClient(c);
     }
 
     /// Encode everything buffered in `cin` for the upstream and start writing.
@@ -761,7 +838,7 @@ pub const Loop = struct {
             c.consumeClient(n);
             return l.finishDirections(c);
         } else {
-            var padded_buf: [ws.max_header_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
+            var padded_buf: [ws.max_header_len + client_buffer + 2 * vision.max_overhead]u8 = undefined;
             const off = ws.max_header_len;
             const padded = if (c.vision_on)
                 c.padder.pad(data, padded_buf[off..]) catch return error.VisionPad
@@ -910,6 +987,10 @@ pub const Loop = struct {
             c.c_out_len -= n;
         }
         c.c_out_off = 0;
+        if (c.state == .http_error) {
+            l.close(c, "HTTP request rejected");
+            return;
+        }
         if (c.state == .relay) {
             _ = try l.pumpDownload(c);
             try l.finishDirections(c);
@@ -1384,7 +1465,7 @@ pub const Loop = struct {
     /// padding block) in one record.
     fn sendVlessRequest(c: *Conn) !void {
         c.state = .relay;
-        var wbuf: [ws.max_header_len + vless.max_request_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
+        var wbuf: [ws.max_header_len + vless.max_request_len + client_buffer + 2 * vision.max_overhead]u8 = undefined;
         const buf = wbuf[ws.max_header_len..];
         var addr: vless.Address = switch (c.target_kind) {
             .ipv4 => .{ .ipv4 = c.target_buf[0..4].* },
@@ -1842,4 +1923,161 @@ test "crypto completion restores real epoll readiness after socket removal" {
     }
     try std.testing.expect(got);
     try std.testing.expect(c.client_eof);
+}
+
+fn httpIngressTest(tunnel: bool) !void {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var cp: [2]sys.fd_t = undefined;
+    var up: [2]sys.fd_t = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &cp)));
+    defer sys.close(cp[1]);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &up)));
+    defer sys.close(up[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(cp[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    // A fragmented request must not trigger an upstream attempt.
+    _ = try sys.write(cp[1], if (tunnel) "CON" else "POS");
+    try loop.readClient(c);
+    try std.testing.expectEqual(State.http_request, c.state);
+    try std.testing.expectEqual(@as(usize, 0), c.tries);
+    _ = try sys.write(cp[1], if (tunnel)
+        "NECT [::1]:443 HTTP/1.1\r\n\r\nhello"
+    else
+        "T http://example.com:8080/upload HTTP/1.1\r\nProxy-Authorization: Basic secret\r\nContent-Length: 10\r\n\r\nhello");
+    // No configured outbounds: inspect the parsed request before attaching a
+    // raw socket peer to exercise the established data path deterministically.
+    try std.testing.expectError(error.AllOutboundsFailed, loop.readClient(c));
+    try std.testing.expectEqual(@as(u16, if (tunnel) 443 else 8080), c.target_port);
+    if (tunnel) {
+        try std.testing.expectEqual(@as(u8, 1), c.target_buf[15]);
+    } else try std.testing.expectEqualStrings("example.com", c.target_buf[0..c.target_len]);
+    c.state = .relay;
+    c.up_fd = up[0];
+    c.padder.direct = true;
+    c.unpadder.direct = true;
+    var buf: [1024]u8 = undefined;
+    if (tunnel) {
+        const n = try sys.read(cp[1], &buf);
+        try std.testing.expectEqualStrings(http.connected, buf[0..n]);
+    }
+    try loop.forwardClient(c);
+    const n = try sys.read(up[1], &buf);
+    try std.testing.expectEqualStrings(if (tunnel) "hello" else "POST /upload HTTP/1.1\r\nHost: example.com:8080\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello", buf[0..n]);
+    _ = try sys.write(cp[1], if (tunnel) "world" else "worldGET http://other.example/ HTTP/1.1\r\n\r\n");
+    try loop.readClient(c);
+    const tail = try sys.read(up[1], &buf);
+    try std.testing.expectEqualStrings("world", buf[0..tail]);
+    if (!tunnel) {
+        try std.testing.expect(c.http_body.done());
+        try std.testing.expectError(error.WouldBlock, sys.read(up[1], &buf));
+    }
+    _ = try sys.write(up[1], "response");
+    try loop.readUpstream(c);
+    const reply = try sys.read(cp[1], &buf);
+    try std.testing.expectEqualStrings("response", buf[0..reply]);
+    if (!tunnel) {
+        sys.shutdownWrite(up[1]);
+        loop.handle(c.token(.upstream), sys.EPOLL.IN);
+        try std.testing.expectEqual(State.free, c.state);
+    }
+}
+
+test "HTTP CONNECT ingress preserves early data and bidirectional relay" {
+    try httpIngressTest(true);
+}
+
+test "HTTP forward ingress rewrites headers streams body and closes on response EOF" {
+    try httpIngressTest(false);
+}
+
+test "mixed listener retains fragmented SOCKS5 handshake" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(pair[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    _ = try sys.write(pair[1], "\x05");
+    try loop.readClient(c);
+    try std.testing.expectEqual(State.socks_greeting, c.state);
+    _ = try sys.write(pair[1], "\x01\x00");
+    try loop.readClient(c);
+    try std.testing.expectEqual(State.socks_request, c.state);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try sys.read(pair[1], &buf));
+    try std.testing.expectEqualSlices(u8, &socks5.greeting_reply, buf[0..2]);
+}
+
+test "HTTP error response drains under backpressure before closing" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(pair[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    const filler: [4096]u8 = @splat('x');
+    while (true) {
+        _ = sys.write(pair[0], &filler) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    _ = try sys.write(pair[1], "GET http://x/ HTTP/1.1\r\nContent-Length: -1\r\n\r\n");
+    try loop.readClient(c);
+    try std.testing.expectEqual(State.http_error, c.state);
+    try std.testing.expect(c.c_out_len > 0);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        _ = sys.read(pair[1], &buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    try loop.flushClient(c);
+    try std.testing.expectEqual(State.free, c.state);
+    const n = try sys.read(pair[1], &buf);
+    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", buf[0..n]);
+}
+
+test "HTTP rewrite has headroom when headers and POST body fill the first read" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(pair[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    const original = "POST http://x/ HTTP/1.1\r\nContent-Length: 40000\r\n\r\n";
+    var wire: [client_chunk]u8 = @splat('x');
+    @memcpy(wire[0..original.len], original);
+    _ = try sys.write(pair[1], &wire);
+    try std.testing.expectError(error.AllOutboundsFailed, loop.readClient(c));
+    try std.testing.expect(c.http_plain);
+    try std.testing.expect(c.cin_len > client_chunk);
+    try std.testing.expectEqual(@as(u64, 40000 - (client_chunk - original.len)), c.http_body.remaining);
+    try std.testing.expect(mem.startsWith(u8, c.cin[0..c.cin_len], "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 40000\r\nConnection: close\r\n\r\n"));
 }

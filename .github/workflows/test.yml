@@ -24,6 +24,9 @@ jobs:
       - name: host build (debug, catches Linux-only code paths)
         run: zig build
 
+      - name: mixed SOCKS5 / HTTP integration test
+        run: python3 tools/httptest.py zig-out/bin/zray
+
       - name: startup smoke test
         run: sh .github/scripts/smoke.sh zig-out/bin/zray
 

@@ -51,7 +51,8 @@ by `net.core.rmem_max`.
   key share. JA4 `_b` and `_c` segments match current Chrome.
 - **VLESS + XTLS Vision**: padding state machine, switch to direct copy once
   the inner TLS 1.3 handshake is seen, so bulk traffic is not double-encrypted.
-- **Inbounds**: SOCKS5 (CONNECT and UDP ASSOCIATE) and transparent
+- **Inbounds**: mixed SOCKS5 (CONNECT and UDP ASSOCIATE) / HTTP proxy
+  (CONNECT tunnels and plain HTTP/1.x forward requests) on one port, and transparent
   netfilter `REDIRECT` with `SO_ORIGINAL_DST`.
 - **UDP** over XUDP (VLESS mux), full-cone, as xray does for Vision.
 - **Zero-latency sniffing**: TLS SNI and HTTP `Host` are read from the first
@@ -111,7 +112,7 @@ inner connection presents.
 
 | key | default | meaning |
 |---|---|---|
-| `listen` | `127.0.0.1:1080` | SOCKS5 inbound. `""` disables it. |
+| `listen` | `127.0.0.1:1080` | Mixed SOCKS5 / HTTP proxy inbound (automatic detection). `""` disables it. |
 | `redirect` | `""` | Transparent inbound for `REDIRECT` rules. `""` disables it. At least one of `listen` / `redirect` must be set. |
 | `sniff` | `true` | Replace the destination IP with the TLS SNI / HTTP Host when present. |
 | `server` | ? | Upstream server hostname or IP (REALITY or plain TLS). Resolved once at startup. |
@@ -124,7 +125,7 @@ inner connection presents.
 | `tls_verify` | ? | `security = "tls"` only, and then mandatory. Only `"none"` (no certificate verification, like `allowInsecure`) is implemented; `"ca"` and `"pin"` are reserved and rejected for now. |
 | `uuid` | ? | VLESS user id. |
 | `max_connections` | `128` | Connection slots. Each slot is ~92 KiB, allocated at startup. |
-| `handshake_timeout_s` | `15` | Inbound side: SOCKS5 handshake / waiting for the client before an upstream is chosen. |
+| `handshake_timeout_s` | `15` | Inbound side: SOCKS5 / HTTP handshake / waiting for the client before an upstream is chosen. |
 | `connect_timeout_s` | `5` | Hard deadline for one upstream attempt (TCP connect, hop SOCKS, TLS, WS upgrade), not extended by traffic. On expiry the next group member is tried. |
 | `idle_timeout_s` | `600` | Close a relay with no traffic in either direction. |
 | `sock_buf` | `0` | `SO_SNDBUF` / `SO_RCVBUF` per socket; `0` leaves kernel defaults. |
@@ -414,6 +415,7 @@ src/
     vision.zig        XTLS Vision padding state machine
     mux.zig           XUDP (Mux.Cool) frames
     socks5.zig        SOCKS5 greeting / CONNECT / UDP ASSOCIATE
+    http.zig          HTTP CONNECT / forward request parsing and body framing
     sniff.zig         TLS SNI and HTTP Host extraction
     ws.zig            WebSocket client framing (VLESS `ws` transport)
   linux/
@@ -423,10 +425,45 @@ src/
     crypto.zig        bounded asynchronous TLS record executor
 deploy/               OpenWrt procd script and config template
 tools/udptest.py      SOCKS5 UDP ASSOCIATE smoke test
+tools/httptest.py     Offline mixed-inbound TLS/VLESS integration test
 ```
 
 Everything in `tls/` and `proxy/` is sans-I/O and unit tested
 (`zig build test`); `linux/` is the only part that touches sockets.
+
+### HTTP proxy inbound
+
+`listen` accepts SOCKS5 and HTTP automatically; existing configurations need no
+changes. For example, with `"listen": "127.0.0.1:1080"`:
+
+```sh
+curl --proxy http://127.0.0.1:1080 http://example.com/
+curl --proxy http://127.0.0.1:1080 https://example.com/
+curl --proxy socks5h://127.0.0.1:1080 https://example.com/
+```
+
+HTTP CONNECT accepts domain, IPv4 and bracketed IPv6 targets, including bytes
+sent immediately after the request headers. Plain HTTP supports HTTP/1.0 and
+HTTP/1.1 absolute URLs, Content-Length and chunked streaming uploads. The URL
+authority determines the destination and outgoing Host header; proxy credentials
+and hop-by-hop request headers are removed. HTTP targets use existing routing
+and outbounds without SNI/Host overriding the explicit destination.
+
+Plain HTTP uses one request per connection and sends `Connection: close` to the
+origin. HTTP keep-alive/pipelining and Upgrade are not supported; HTTPS uses
+CONNECT. Request headers are limited to 8 KiB (including the rewritten head),
+chunk-size/trailer lines to 1 KiB and total trailers to 8 KiB. Malformed headers
+return 400, unsupported request forms return 501 and oversized headers return
+431. Like the existing SOCKS5 inbound, HTTP has no authentication.
+
+Run the offline integration test after building (Python 3.8+ with TLS 1.3 support
+and the `openssl` command are required):
+
+```sh
+zig build test --summary all
+zig build
+python3 tools/httptest.py zig-out/bin/zray
+```
 
 ## Status and known limits
 

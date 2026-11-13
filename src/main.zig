@@ -60,7 +60,7 @@ const FileConfig = struct {
     /// Tags for traffic no rule matches; default: the first outbound.
     default: []const []const u8 = &.{},
     fail_backoff_s: u64 = 30,
-    /// SOCKS5 inbound; empty string disables it.
+    /// Mixed SOCKS5 / HTTP inbound; empty string disables it.
     listen: []const u8 = "127.0.0.1:1080",
     /// Transparent inbound for netfilter REDIRECT (iptables -j REDIRECT /
     /// nft redirect to); empty string disables it.
@@ -319,7 +319,7 @@ fn linuxMain(init: std.process.Init) !void {
     const crypto_fds = @import("linux/kernel_crypto.zig").fdReserve(policy, worker_count);
     const event_fds = if (policy != .off and parsed.crypto_async) 2 * worker_count else 0;
     @import("linux/fd_budget.zig").configure(parsed.max_connections, worker_count, crypto_fds + event_fds);
-    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers, splice enabled, crypto_backend {s} bytes={d}..{d} async {}", .{
+    sys.log("zray {s} socks5/http [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers, splice enabled, crypto_backend {s} bytes={d}..{d} async {}", .{
         version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, worker_count, @tagName(policy), limits.min_bytes, limits.max_bytes, parsed.crypto_async,
     });
     for (obs, node_cfgs) |ob, oc| {
