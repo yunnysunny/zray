@@ -55,7 +55,7 @@ AES-GCM 的上限约 1.5 MB/s，这正是 Vision 的 direct 直拷在这类设�
 ## 构建
 
 需要 Zig 0.17.0。每个 tag 发布都附带 mipsel / mips / aarch64 / armv7 / x86_64
-的预编译二进制（全部静态 musl）；CI 对每次 push 都会构建（见
+的预编译二进制（全部静态，不依赖 libc）；CI 对每次 push 都会构建（见
 .github/workflows/）。
 
 ```sh
@@ -70,6 +70,19 @@ zig build --release -Dtarget=x86_64-linux-musl  -p zig-out/x86_64
 
 `--release` 对应 `ReleaseSmall`。代理服务只在 Linux 上运行；下面的 probe
 可在任何平台运行。
+
+默认静态构建（`-Ddynamic=false`）。传入 `-Ddynamic=true` 可改为动态链接
+目标系统的 C 标准库；该选项也适用于 `run`、`probe` 和 `test`：
+
+```sh
+zig build --release -Ddynamic=true
+zig build test -Ddynamic=true
+# OpenWrt：复用路由器上的 musl 共享库
+zig build --release -Dtarget=mipsel-linux-musleabi -Dcpu=mips32r2+soft_float -Ddynamic=true -p zig-out/mipsel-dynamic
+```
+
+动态版要求目标设备提供匹配的 libc 和动态加载器，包括相同的架构与软硬浮点 ABI。
+MIPS musl 动态构建的软浮点 ABI 使用 `musleabi`，硬浮点使用 `musleabihf`。
 
 ### Probe
 

@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const dynamic = b.option(bool, "dynamic", "Dynamically link the system C library") orelse false;
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .small });
 
     const root_mod = b.createModule(.{
@@ -10,10 +11,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // Routers have small flash; keep the binary lean.
         .strip = optimize != .debug,
+        .link_libc = dynamic,
     });
 
     const exe = b.addExecutable(.{
         .name = "zray",
+        .linkage = if (dynamic) .dynamic else .static,
         .root_module = root_mod,
     });
     b.installArtifact(exe);
@@ -27,10 +30,15 @@ pub fn build(b: *std.Build) void {
     // Live REALITY handshake probe: zig build probe -- <ip> <port> <sni> <pk> [short_id]
     const probe_mod = b.createModule(.{
         .root_source_file = b.path("src/probe.zig"),
+        .link_libc = dynamic,
         .target = target,
         .optimize = optimize,
     });
-    const probe = b.addExecutable(.{ .name = "probe", .root_module = probe_mod });
+    const probe = b.addExecutable(.{
+        .name = "probe",
+        .root_module = probe_mod,
+        .linkage = if (dynamic) .dynamic else .static,
+    });
     const probe_run = b.addRunArtifact(probe);
     probe_run.addPassthruArgs();
     const probe_step = b.step("probe", "Run a live REALITY handshake probe");
@@ -38,10 +46,12 @@ pub fn build(b: *std.Build) void {
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
+        .link_libc = dynamic,
         .target = target,
         .optimize = optimize,
     });
     const unit_tests = b.addTest(.{ .root_module = test_mod });
+    unit_tests.linkage = if (dynamic) .dynamic else .static;
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

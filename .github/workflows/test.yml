@@ -30,6 +30,13 @@ jobs:
       - name: startup smoke test
         run: sh .github/scripts/smoke.sh zig-out/bin/zray
 
+      - name: dynamic build and tests
+        run: |
+          zig build test -Ddynamic=true --summary all
+          zig build --release -Ddynamic=true -p out-dynamic
+          python3 tools/httptest.py out-dynamic/bin/zray
+          sh .github/scripts/smoke.sh out-dynamic/bin/zray
+
   # The same tests on the router targets, run through qemu-user. Static musl
   # binaries need no foreign sysroot, so `-fqemu` is all the build needs.
   qemu:

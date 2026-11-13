@@ -70,8 +70,8 @@ it), TPROXY, SOCKS5 UDP fragmentation.
 ## Building
 
 Requires Zig 0.17.0. Prebuilt binaries for mipsel / mips / aarch64 / armv7 /
-x86_64 (all static musl) are attached to each tagged release; CI builds every
-push (see .github/workflows/).
+x86_64 (all static, with no libc dependency) are attached to each tagged
+release; CI builds every push (see .github/workflows/).
 
 ```sh
 zig build test                                   # unit tests (host)
@@ -85,6 +85,22 @@ zig build --release -Dtarget=x86_64-linux-musl  -p zig-out/x86_64
 
 `--release` uses `ReleaseSmall`. The proxy service is Linux-only; the probe
 below runs anywhere.
+
+Builds are static by default (`-Ddynamic=false`). Pass `-Ddynamic=true` to
+dynamically link the target system's C library instead; the option also
+applies to `run`, `probe`, and `test`:
+
+```sh
+zig build --release -Ddynamic=true
+zig build test -Ddynamic=true
+# OpenWrt: reuse the router's musl shared library
+zig build --release -Dtarget=mipsel-linux-musleabi -Dcpu=mips32r2+soft_float -Ddynamic=true -p zig-out/mipsel-dynamic
+```
+
+Dynamic binaries require a matching libc and dynamic loader on the target
+device, including the same architecture and floating-point ABI.
+For MIPS musl dynamic builds, use `musleabi` for soft-float or `musleabihf`
+for hard-float.
 
 ### Probe
 
