@@ -69,12 +69,12 @@ pub fn main(init: std.process.Init) !void {
     try io.randomSecure(&seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
 
-    var entropy: [128]u8 = undefined;
+    var entropy: [160]u8 = undefined;
     try io.randomSecure(&entropy);
     var hs_buf: [8 * 1024]u8 = undefined;
     var c = client.Client.init(.{
         .entropy = entropy[0..64].*,
-        .ml_kem_seed = entropy[64..128].*,
+        .hybrid_seed = entropy[64..160].*,
         .verifier = rl.verifier(),
         .handshake_buf = &hs_buf,
     });
@@ -158,13 +158,13 @@ pub fn main(init: std.process.Init) !void {
     var n: usize = hdr_bytes.len;
 
     var inner_hs_buf: [16 * 1024]u8 = undefined;
-    var inner_entropy: [128]u8 = undefined;
+    var inner_entropy: [160]u8 = undefined;
     try io.randomSecure(&inner_entropy);
     var inner_sid: [32]u8 = undefined;
     try io.randomSecure(&inner_sid);
     var inner = client.Client.init(.{
         .entropy = inner_entropy[0..64].*,
-        .ml_kem_seed = inner_entropy[64..128].*,
+        .hybrid_seed = inner_entropy[64..160].*,
         .verifier = client.Verifier.insecure, // probe only; REALITY authenticates the proxy, not the origin
         .handshake_buf = &inner_hs_buf,
     });

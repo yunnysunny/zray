@@ -1148,7 +1148,7 @@ pub const Loop = struct {
         c.ws_on = ob.ws;
         c.wsd = .{};
         c.ws_hs_len = 0;
-        var entropy: [128]u8 = undefined;
+        var entropy: [160]u8 = undefined;
         sys.randomBytes(&entropy);
 
         // REALITY: the hook back-fills session_id and the verifier checks the
@@ -1169,7 +1169,7 @@ pub const Loop = struct {
 
         c.tls = client.Client.init(.{
             .entropy = entropy[0..64].*,
-            .ml_kem_seed = entropy[64..128].*,
+            .hybrid_seed = entropy[64..160].*,
             .verifier = verifier,
             .handshake_buf = &c.hs_buf,
         });

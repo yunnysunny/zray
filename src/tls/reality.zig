@@ -248,7 +248,7 @@ fn buildHello(buf: []u8, r: *Reality, suites: []const tls.CipherSuite, kp: X2551
 fn serverDecrypt(enc: hello.Encoded, client_pub: [32]u8, aead: Aead) !struct { auth_key: [32]u8, plain: [16]u8 } {
     const shared = try X25519.scalarmult(server_sk, client_pub);
     const auth_key = deriveAuthKey(shared, enc.random[0..20]);
-    var aad_buf: [1024]u8 = undefined;
+    var aad_buf: [4096]u8 = undefined;
     @memcpy(aad_buf[0..enc.msg.len], enc.msg);
     @memset(aad_buf[hello.Encoded.session_id_offset..][0..32], 0);
     const plain = open(aead, auth_key, enc.random[20..32].*, enc.session_id[0..32], aad_buf[0..enc.msg.len]) orelse
@@ -350,4 +350,37 @@ test "preferredAead mirrors Go" {
     try testing.expectEqual(Aead.aes_256_gcm, preferredAead(&.{ @fromBackingInt(0x0a0a), .AES_128_GCM_SHA256, .CHACHA20_POLY1305_SHA256 }));
     try testing.expectEqual(Aead.chacha20_poly1305, preferredAead(&.{ .CHACHA20_POLY1305_SHA256, .AES_128_GCM_SHA256 }));
     try testing.expectEqual(Aead.chacha20_poly1305, preferredAead(&.{}));
+}
+
+test "REALITY authenticates the standalone share when hybrid keys are independent" {
+    var r = Reality.init(testConfig(), 0x6711_2233);
+    var hs_buf: [2048]u8 = undefined;
+    var c = client.Client.init(.{
+        .entropy = @splat(0x11),
+        .hybrid_seed = @as([64]u8, @splat(0x22)) ++ @as([32]u8, @splat(0x33)),
+        .verifier = r.verifier(),
+        .handshake_buf = &hs_buf,
+    });
+    var prng = std.Random.DefaultPrng.init(42);
+    var fp: @import("fingerprint.zig").Chrome = undefined;
+    fp.build(prng.random(), .{ .sni = "example.com", .x25519_public = c.publicKey(), .ml_kem_public = c.mlKemPublicKey() });
+    var buf: [4096]u8 = undefined;
+    const wire = try c.clientHello(&buf, .{
+        .random = undefined,
+        .session_id = &@as([32]u8, @splat(0)),
+        .cipher_suites = fp.cipherSuites(),
+        .extensions = fp.extensions(),
+    }, r.helloHook());
+    try testing.expectEqual(@as(?Error, null), r.err);
+    const msg = buf[5..wire.len];
+    const enc: hello.Encoded = .{
+        .msg = msg,
+        .random = msg[hello.Encoded.random_offset..][0..32],
+        .session_id = msg[hello.Encoded.session_id_offset..][0..32],
+    };
+    const got = try serverDecrypt(enc, c.publicKey().*, .aes_256_gcm);
+    try testing.expectEqualSlices(u8, &r.auth_key, &got.auth_key);
+    try testing.expectEqualSlices(u8, &r.cfg.short_id, got.plain[8..16]);
+    const hybrid = c.mlKemPublicKey().?;
+    try testing.expectError(error.AuthFailed, serverDecrypt(enc, hybrid[hybrid.len - 32 ..][0..32].*, .aes_256_gcm));
 }
