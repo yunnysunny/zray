@@ -1,6 +1,6 @@
-//! One proxied connection: SOCKS5 client <-> REALITY/VLESS/Vision upstream.
+//! One proxied connection: SOCKS5 / HTTP client <-> REALITY/VLESS/Vision upstream.
 //!
-//! Non-blocking, single-threaded, driven by `Loop`. All buffers are fixed
+//! Non-blocking, owned by one worker and driven by its `Loop`. All buffers are fixed
 //! size members so a connection's memory footprint is a compile-time constant
 //! (`@sizeOf(Conn)`), and the pool is allocated once at startup.
 //!
@@ -12,6 +12,7 @@ const std = @import("std");
 const mem = std.mem;
 const tls = std.crypto.tls;
 const sys = @import("sys.zig");
+const hop = @import("hop.zig");
 const client = @import("../tls/client.zig");
 const hello = @import("../tls/hello.zig");
 const record = @import("../tls/record.zig");
@@ -19,14 +20,20 @@ const reality = @import("../tls/reality.zig");
 const vless = @import("../proxy/vless.zig");
 const vision = @import("../proxy/vision.zig");
 const socks5 = @import("../proxy/socks5.zig");
+const http = @import("../proxy/http.zig");
 const fingerprint = @import("../tls/fingerprint.zig");
 const sniff = @import("../proxy/sniff.zig");
 const mux = @import("../proxy/mux.zig");
 const ws = @import("../proxy/ws.zig");
+const splice = @import("splice.zig");
+const kernel_crypto = @import("kernel_crypto.zig");
+const crypto = @import("crypto.zig");
 
 const max_rec = tls.max_ciphertext_record_len;
 /// Largest chunk read from the SOCKS client per event (xray uses 8 KiB).
 const client_chunk = 8192;
+// Absolute-URL rewriting may add Host / Connection headers to a full read.
+const client_buffer = client_chunk + 64;
 
 pub const max_outbounds = 16;
 /// ob_index[i..][0..1] is a static one-element group for outbound i.
@@ -79,6 +86,9 @@ pub const Config = struct {
     sniff: bool = true,
     /// Seconds an outbound is skipped after it failed to connect.
     fail_backoff_s: u64 = 30,
+    stats_interval_s: u64 = 60,
+    hops: ?*hop.Registry = null,
+    crypto_limits: kernel_crypto.Limits = .{},
 };
 
 /// Does `host` equal `suffix` or end in ".suffix"? (ASCII case-insensitive)
@@ -111,6 +121,9 @@ pub const State = enum {
     free,
     socks_greeting,
     socks_request,
+    http_request,
+    /// Drain an HTTP error response before closing.
+    http_error,
     /// Waiting for the first client bytes to pick an outbound by SNI/Host.
     sniffing,
     connecting,
@@ -141,6 +154,9 @@ pub const Conn = struct {
     up_ev: u32 = 0,
     udp_ev: u32 = 0,
 
+    http_plain: bool = false,
+    http_body: http.Body = .{},
+
     // SOCKS5 UDP ASSOCIATE: `client_fd` is only the control connection, packets
     // flow on `udp_fd` and are carried upstream as XUDP mux frames.
     is_udp: bool = false,
@@ -154,9 +170,18 @@ pub const Conn = struct {
     client_eof: bool = false,
     /// Upstream finished sending; close once `c_out` is drained.
     up_eof: bool = false,
+    up_write_closed: bool = false,
+    client_write_closed: bool = false,
+    upload_pipe: splice.Pipe = .{},
+    download_pipe: splice.Pipe = .{},
+    cfg: *const Config = undefined,
+    crypto_job: ?*crypto.Job = null,
+    crypto_ready: bool = false,
+    paused: bool = false,
+    close_wait: ?[]const u8 = null,
 
     // client -> upstream
-    cin: [client_chunk]u8 = undefined,
+    cin: [client_buffer]u8 = undefined,
     cin_len: usize = 0,
     up_out: [max_rec]u8 = undefined,
     up_out_off: usize = 0,
@@ -192,12 +217,14 @@ pub const Conn = struct {
     /// Pinned outbound (hop listener connections).
     forced: ?u8 = null,
     /// Loopback port pairing a chained connection with its hop connection.
-    /// Chained side: local port of up_fd (0 = outbound not chained).
-    chain_lport: u16 = 0,
-    /// Hop side: peer port of client_fd (0 = not a hop connection).
-    hop_peer: u16 = 0,
+    /// Chained side: ephemeral port + hop listener port (0 = not chained).
+    chain_key: u32 = 0,
+    /// Hop side: peer port + local listener port (0 = not a hop).
+    hop_key: u32 = 0,
     /// Chained side: how the paired hop connection ended, if it already did.
     hop_end: ?HopEnd = null,
+    /// Last published diagnostic state; relay traffic needs no registry lock.
+    hop_published: ?HopEnd = null,
     /// When sniffing started (ms).
     sniff_since_ms: u64 = 0,
     /// Current upstream attempt must reach .relay before this (ms).
@@ -222,10 +249,7 @@ pub const Conn = struct {
     }
 };
 
-/// The running config (single-threaded; set by Loop.init) so the
-/// free-standing record helpers can reach the current outbound.
-var cur_cfg: ?*const Config = null;
-
+/// One independent connection pool, random source and epoll loop per worker.
 pub const Loop = struct {
     ep: sys.fd_t,
     cfg: *const Config,
@@ -233,13 +257,60 @@ pub const Loop = struct {
     csprng: std.Random.DefaultCsprng,
     active: usize = 0,
     bad_until: [max_outbounds]u64 = @splat(0),
+    worker_id: usize = 0,
+    executor: ?*crypto.Executor = null,
 
     pub fn init(ep: sys.fd_t, cfg: *const Config, conns: []Conn) Loop {
-        cur_cfg = cfg;
         var seed: [32]u8 = undefined;
         sys.randomBytes(&seed);
-        for (conns, 0..) |*c, i| c.* = .{ .slot = @intCast(i) };
+        for (conns, 0..) |*c, i| c.* = .{ .slot = @intCast(i), .cfg = cfg };
         return .{ .ep = ep, .cfg = cfg, .conns = conns, .csprng = std.Random.DefaultCsprng.init(seed) };
+    }
+
+    pub fn attachCrypto(l: *Loop, executor: *crypto.Executor) void {
+        l.executor = executor;
+        for (l.conns, executor.jobs) |*c, *j| c.crypto_job = j;
+    }
+
+    pub fn cryptoCompleted(l: *Loop) void {
+        const ex = l.executor orelse return;
+        sys.eventDrain(ex.completed_fd);
+        for (l.conns) |*c| {
+            const j = c.crypto_job orelse continue;
+            if (j.status.load(.acquire) != .done) continue;
+            j.status.store(.idle, .release);
+            ex.completed += 1;
+            if (c.close_wait) |why| {
+                c.close_wait = null;
+                l.close(c, why);
+                continue;
+            }
+            if (j.failure) |err| {
+                l.close(c, @errorName(err));
+                continue;
+            }
+            switch (j.operation) {
+                .encrypt => {
+                    c.up_out_off = 0;
+                    c.up_out_len = j.produced;
+                    l.flushUpstream(c) catch |err| {
+                        l.close(c, @errorName(err));
+                        continue;
+                    };
+                },
+                .decrypt => {
+                    c.crypto_ready = true;
+                    l.processUpstream(c) catch |err| {
+                        if (err == error.UpstreamEof or err == error.UpstreamCloseNotify) l.upstreamDone(c) else l.close(c, @errorName(err));
+                        continue;
+                    };
+                },
+            }
+            if (c.state != .free) {
+                l.publishHop(c, "");
+                l.updateInterest(c);
+            }
+        }
     }
 
     // ---- lifecycle -----------------------------------------------------------
@@ -257,6 +328,8 @@ pub const Loop = struct {
         c.client_ev = 0;
         c.up_ev = 0;
         c.udp_ev = 0;
+        c.http_plain = false;
+        c.http_body = .{};
         c.is_udp = false;
         c.udp_fd = -1;
         c.udp_peer = null;
@@ -270,17 +343,37 @@ pub const Loop = struct {
         c.c_out_len = 0;
         c.client_eof = false;
         c.up_eof = false;
+        c.up_write_closed = false;
+        c.client_write_closed = false;
+        c.upload_pipe = .{};
+        c.download_pipe = .{};
+        c.crypto_ready = false;
+        c.paused = false;
+        c.close_wait = null;
         c.got_resp_hdr = false;
         c.sniff_enabled = l.cfg.sniff and forced == null;
         c.forced = forced;
+        c.ob = forced orelse 0;
         c.tries = 0;
         c.tried_mask = 0;
         c.group = &.{};
         c.last_active = sys.monotonicSeconds();
         c.attempt_deadline_ms = 0;
         c.hop_end = null;
-        c.chain_lport = 0;
-        c.hop_peer = if (forced == null) 0 else if (sys.peerAddr(fd)) |a| a.getPort() else |_| 0;
+        c.hop_published = null;
+        c.chain_key = 0;
+        c.hop_key = if (forced == null) 0 else hop.key(
+            (sys.peerAddr(fd) catch {
+                sys.close(fd);
+                c.state = .free;
+                return;
+            }).getPort(),
+            (sys.localAddr(fd) catch {
+                sys.close(fd);
+                c.state = .free;
+                return;
+            }).getPort(),
+        );
         sys.setNoDelay(fd);
         if (l.cfg.sock_buf > 0) sys.setBufferSizes(fd, l.cfg.sock_buf, l.cfg.sock_buf);
         sys.epollAdd(l.ep, fd, sys.EPOLL.IN | sys.EPOLL.RDHUP, c.token(.client)) catch {
@@ -290,6 +383,7 @@ pub const Loop = struct {
         };
         c.client_ev = sys.EPOLL.IN | sys.EPOLL.RDHUP;
         l.active += 1;
+        l.publishHop(c, "");
 
         if (kind == .redirect) {
             // Transparent (REDIRECT) inbound: the target is the original
@@ -320,9 +414,18 @@ pub const Loop = struct {
 
     pub fn close(l: *Loop, c: *Conn, why: []const u8) void {
         if (c.state == .free) return;
-        sys.log("[{d}] close: {s}", .{ c.slot, why });
-        if (c.hop_peer != 0) {
-            if (l.findChained(c.hop_peer)) |a| a.hop_end = .{ .ob = c.ob, .state = c.state, .got_resp_hdr = c.got_resp_hdr, .why = why };
+        if (c.crypto_job) |j| if (j.pending()) {
+            c.close_wait = why;
+            l.updateInterest(c);
+            return;
+        };
+        sys.log("[w{d}:{d}] close: {s}; splice up={d} down={d}", .{ l.worker_id, c.slot, why, c.upload_pipe.bytes, c.download_pipe.bytes });
+        c.upload_pipe.deinit();
+        c.download_pipe.deinit();
+        l.publishHop(c, why);
+        if (c.chain_key != 0) if (l.cfg.hops) |r| r.release(c.chain_key);
+        if (c.hop_key != 0) {
+            if (l.findChained(c.hop_key)) |a| a.hop_end = .{ .ob = c.ob, .state = c.state, .got_resp_hdr = c.got_resp_hdr, .why = why };
         }
         if (c.client_fd >= 0) {
             sys.epollDel(l.ep, c.client_fd);
@@ -378,28 +481,46 @@ pub const Loop = struct {
         if (slot >= l.conns.len) return;
         const c = &l.conns[slot];
         if (c.state == .free or c.gen != gen) return; // stale
-        c.last_active = sys.monotonicSeconds();
+        if (c.close_wait != null) return;
+        if (c.crypto_job) |j| if (j.pending()) return;
 
-        const fail = events & (sys.EPOLL.ERR | sys.EPOLL.HUP) != 0;
+        defer if (c.state != .free) l.publishHop(c, "");
         switch (side) {
             .client => {
                 if (events & sys.EPOLL.OUT != 0) l.flushClient(c) catch |e| return l.close(c, @errorName(e));
-                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP) != 0) l.readClient(c) catch |e| return l.close(c, @errorName(e));
-                if (fail and c.state != .free) return l.close(c, "client hup");
+                if (c.state == .free) return;
+                if (c.crypto_job) |j| if (j.pending()) {
+                    l.updateInterest(c);
+                    return;
+                };
+                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP | sys.EPOLL.HUP) != 0) l.readClient(c) catch |e| return l.close(c, @errorName(e));
+                if (c.crypto_job) |j| if (j.pending()) {
+                    l.updateInterest(c);
+                    return;
+                };
+                if (events & sys.EPOLL.ERR != 0 and c.state != .free) return l.close(c, "client error");
             },
             .upstream => {
                 if (events & sys.EPOLL.OUT != 0) l.upstreamWritable(c) catch |e| {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, @errorName(e));
                     return l.close(c, @errorName(e));
                 };
-                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP) != 0) l.readUpstream(c) catch |e| {
+                if (c.crypto_job) |j| if (j.pending()) {
+                    l.updateInterest(c);
+                    return;
+                };
+                if (events & (sys.EPOLL.IN | sys.EPOLL.RDHUP | sys.EPOLL.HUP) != 0) l.readUpstream(c) catch |e| {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, @errorName(e));
                     switch (e) {
                         error.UpstreamEof, error.UpstreamCloseNotify => return l.upstreamDone(c),
                         else => return l.close(c, @errorName(e)),
                     }
                 };
-                if (fail and c.state != .free) {
+                if (c.crypto_job) |j| if (j.pending()) {
+                    l.updateInterest(c);
+                    return;
+                };
+                if (events & sys.EPOLL.ERR != 0 and c.state != .free) {
                     if (l.preRelay(c)) return l.retryAndUpdate(c, "upstream hup");
                     return l.upstreamDone(c);
                 }
@@ -413,26 +534,78 @@ pub const Loop = struct {
     }
 
     /// Upstream has nothing more to send: deliver what is queued, then close.
+    fn pumpUpload(l: *Loop, c: *Conn) !bool {
+        if (c.crypto_job) |j| if (j.pending()) return false;
+        if (c.state != .relay or c.is_udp or c.http_plain or !c.padder.direct or c.up_out_len != 0 or c.cin_len != 0) return false;
+        const before = c.upload_pipe.bytes;
+        const pending = c.upload_pipe.pending;
+        if (!try c.upload_pipe.pump(c.client_fd, c.up_fd, 256 * 1024)) return false;
+        if (c.upload_pipe.bytes != before or c.upload_pipe.pending != pending) c.last_active = sys.monotonicSeconds();
+        if (c.upload_pipe.eof and c.upload_pipe.pending == 0) c.client_eof = true;
+        try l.finishDirections(c);
+        return true;
+    }
+
+    fn pumpDownload(l: *Loop, c: *Conn) !bool {
+        if (c.crypto_job) |j| if (j.pending()) return false;
+        if (c.state != .relay or c.is_udp or !c.unpadder.direct or c.c_out_len != 0 or c.uin_len != 0) return false;
+        const before = c.download_pipe.bytes;
+        const pending = c.download_pipe.pending;
+        if (!try c.download_pipe.pump(c.up_fd, c.client_fd, 256 * 1024)) return false;
+        if (c.download_pipe.bytes != before or c.download_pipe.pending != pending) c.last_active = sys.monotonicSeconds();
+        if (c.download_pipe.eof and c.download_pipe.pending == 0) c.up_eof = true;
+        try l.finishDirections(c);
+        return true;
+    }
+
     fn upstreamDone(l: *Loop, c: *Conn) void {
-        if (c.c_out_len == 0) return l.close(c, "upstream eof");
         c.up_eof = true;
-        if (c.up_fd >= 0) {
-            sys.epollDel(l.ep, c.up_fd);
-            sys.close(c.up_fd);
-            c.up_fd = -1;
-        }
+        l.finishDirections(c) catch |e| return l.close(c, @errorName(e));
+        if (c.state == .free) return;
         l.updateInterest(c);
+    }
+
+    fn finishDirections(l: *Loop, c: *Conn) (sys.Error || client.Error)!void {
+        if (c.crypto_job) |j| if (j.pending()) return;
+        if (c.http_plain and c.up_eof) c.client_eof = true;
+        if (c.up_eof and c.c_out_len == 0 and c.download_pipe.pending == 0 and !c.client_write_closed) {
+            sys.shutdownWrite(c.client_fd);
+            c.client_write_closed = true;
+        }
+        if (c.client_eof and c.cin_len == 0 and c.up_out_len == 0 and c.upload_pipe.pending == 0 and !c.up_write_closed and c.state == .relay) {
+            c.up_write_closed = true;
+            if (c.padder.direct) sys.shutdownWrite(c.up_fd) else {
+                const rec = try c.tls.close(&c.up_out);
+                c.up_out_off = 0;
+                c.up_out_len = rec.len;
+                try l.flushUpstream(c);
+            }
+        }
+        if (c.client_eof and c.up_eof and c.cin_len == 0 and c.c_out_len == 0 and c.up_out_len == 0 and c.upload_pipe.pending == 0 and c.download_pipe.pending == 0) l.close(c, "eof");
     }
 
     /// Derive epoll interest sets from buffer state. Read a side only when the
     /// queue feeding the other side is empty.
     fn updateInterest(l: *Loop, c: *Conn) void {
-        var cev: u32 = sys.EPOLL.RDHUP;
-        if (c.c_out_len > 0) cev |= sys.EPOLL.OUT;
-        if (c.is_udp or (!c.client_eof and c.up_out_len == 0 and c.cin_len < c.cin.len)) cev |= sys.EPOLL.IN;
+        if (c.crypto_job) |j| if (j.pending()) {
+            if (!c.paused) {
+                for ([_]sys.fd_t{ c.client_fd, c.up_fd, c.udp_fd }) |fd| if (fd >= 0) sys.epollDel(l.ep, fd);
+                c.paused = true;
+            }
+            return;
+        };
+        if (c.paused) {
+            if (c.udp_fd >= 0) sys.epollAdd(l.ep, c.udp_fd, 0, c.token(.udp)) catch {};
+            c.client_ev = 0;
+            c.up_ev = 0;
+            c.udp_ev = 0;
+            c.paused = false;
+        }
+        var cev: u32 = 0;
+        if (c.c_out_len > 0 or c.download_pipe.pending > 0) cev |= sys.EPOLL.OUT;
+        if (c.state != .http_error and (c.is_udp or (!c.client_eof and !(c.http_plain and c.http_body.done()) and c.up_out_len == 0 and c.upload_pipe.pending == 0 and c.cin_len < client_chunk))) cev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
         if (cev != c.client_ev) {
-            sys.epollMod(l.ep, c.client_fd, cev, c.token(.client)) catch {};
-            c.client_ev = cev;
+            l.setInterest(c.client_fd, &c.client_ev, cev, c.token(.client));
         }
         if (c.udp_fd >= 0) {
             // Datagrams wait in the kernel until the tunnel is up and the
@@ -444,19 +617,60 @@ pub const Loop = struct {
             }
         }
         if (c.up_fd < 0) return;
-        var uev: u32 = sys.EPOLL.RDHUP;
-        if (c.state == .connecting or c.up_out_len > 0) uev |= sys.EPOLL.OUT;
-        if (c.state != .connecting and c.c_out_len == 0) uev |= sys.EPOLL.IN;
+        var uev: u32 = 0;
+        if (c.state == .connecting or c.up_out_len > 0 or c.upload_pipe.pending > 0 or (c.state == .relay and c.cin_len > 0 and c.padder.direct)) uev |= sys.EPOLL.OUT;
+        if (!c.up_eof and c.state != .connecting and c.c_out_len == 0 and c.download_pipe.pending == 0) uev |= sys.EPOLL.IN | sys.EPOLL.RDHUP;
         if (uev != c.up_ev) {
-            sys.epollMod(l.ep, c.up_fd, uev, c.token(.upstream)) catch {};
-            c.up_ev = uev;
+            l.setInterest(c.up_fd, &c.up_ev, uev, c.token(.upstream));
         }
+    }
+
+    // An empty mask still receives HUP/ERR. Remove blocked sockets entirely,
+    // and re-add them when the opposite queue drains so EOF remains observable.
+    fn setInterest(l: *Loop, fd: sys.fd_t, old: *u32, next: u32, tok: u64) void {
+        if (next == old.*) return;
+        if (next == 0) {
+            sys.epollDel(l.ep, fd);
+        } else if (old.* == 0) {
+            sys.epollAdd(l.ep, fd, next, tok) catch return;
+        } else {
+            sys.epollMod(l.ep, fd, next, tok) catch return;
+        }
+        old.* = next;
     }
 
     // ---- client side ---------------------------------------------------------
 
     fn readClient(l: *Loop, c: *Conn) !void {
+        for (0..16) |_| {
+            const reads = sys.counters.reads;
+            try l.readClientOnce(c);
+            if (c.state != .relay or c.client_eof or c.up_out_len > 0 or c.cin_len > 0 or sys.counters.reads == reads) break;
+            if (c.crypto_job) |j| if (j.pending()) break;
+        }
+    }
+
+    fn readClientOnce(l: *Loop, c: *Conn) !void {
+        if (c.crypto_job) |j| if (j.pending()) return;
+        if (c.state == .http_error or (c.http_plain and c.http_body.done())) return;
         if (c.client_eof) return; // RDHUP can be reported more than once
+        if (try l.pumpUpload(c)) return;
+        if (c.state == .relay and !c.is_udp and !c.http_plain and c.padder.direct and c.cin_len == 0 and c.up_out_len == 0) {
+            // Read straight into the transmit queue: no cin -> up_out copy.
+            const n = sys.read(c.client_fd, &c.up_out) catch |err| switch (err) {
+                error.WouldBlock, error.Interrupted => return,
+                else => return err,
+            };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
+            if (n == 0) {
+                c.client_eof = true;
+                return l.finishDirections(c);
+            }
+            c.up_out_off = 0;
+            c.up_out_len = n;
+            return l.flushUpstream(c);
+        }
+
         if (c.is_udp) {
             // Control connection: nothing meaningful arrives, but its EOF ends
             // the association.
@@ -465,41 +679,39 @@ pub const Loop = struct {
                 error.WouldBlock => return,
                 else => return e,
             };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
             if (n == 0) return error.UdpControlClosed;
             return;
         }
-        if (c.up_out_len > 0 or c.cin_len == c.cin.len) return; // back-pressure
-        const n = sys.read(c.client_fd, c.cin[c.cin_len..]) catch |e| switch (e) {
+        if (c.up_out_len > 0 or c.cin_len >= client_chunk) return; // back-pressure
+        const n = sys.read(c.client_fd, c.cin[c.cin_len..client_chunk]) catch |e| switch (e) {
             error.WouldBlock => return,
             else => return e,
         };
+        if (n > 0) c.last_active = sys.monotonicSeconds();
         if (n == 0) {
+            if (c.http_plain and !c.http_body.done()) return error.HttpTruncatedBody;
             c.client_eof = true;
             // Hop connection whose chained outbound gave up before the relay
             // answered (dead exit): nobody is left to read the reply, and the
             // relay may keep dialing for a minute. Free the slot now.
             if (c.forced != null and !c.got_resp_hdr) return error.HopClientGone;
-            // Nothing more to forward: let upstream finish, then close on its EOF.
-            if (c.state == .relay and c.cin_len == 0 and c.up_out_len == 0) {
-                if (c.fullyDirect()) sys.shutdownWrite(c.up_fd) else {
-                    const rec = c.tls.close(&c.up_out) catch |e| {
-                        sys.log("[{d}] tls close: {s} (tls state {s})", .{ c.slot, @errorName(e), @tagName(c.tls.state) });
-                        return error.TlsClose;
-                    };
-                    c.up_out_off = 0;
-                    c.up_out_len = rec.len;
-                    try l.flushUpstream(c);
-                }
-            } else if (c.state != .relay) return error.ClientClosedEarly;
+            if (c.state == .relay) try l.finishDirections(c) else return error.ClientClosedEarly;
             return;
         }
-        c.cin_len += n;
+        // Only the first HTTP request belongs to this upstream connection.
+        const used = if (c.http_plain) try c.http_body.feed(c.cin[c.cin_len..][0..n]) else n;
+        c.cin_len += used;
         try l.processClient(c);
     }
 
     fn processClient(l: *Loop, c: *Conn) !void {
         switch (c.state) {
             .socks_greeting => {
+                if (c.cin_len > 0 and c.cin[0] != 5 and c.forced == null) {
+                    c.state = .http_request;
+                    return l.processClient(c);
+                }
                 const used = (socks5.parseGreeting(c.cin[0..c.cin_len]) catch {
                     l.queueClient(c, &socks5.greeting_reject);
                     return error.SocksGreeting;
@@ -548,6 +760,49 @@ pub const Loop = struct {
                 try l.flushClient(c);
                 try l.routeOrSniff(c);
             },
+            .http_request => {
+                const req = (http.parse(c.cin[0..c.cin_len]) catch |err| return l.httpError(c, err)) orelse return;
+                switch (req.target.address) {
+                    .ipv4 => |a| {
+                        c.target_kind = .ipv4;
+                        c.target_buf[0..4].* = a;
+                        c.target_len = 4;
+                    },
+                    .ipv6 => |a| {
+                        c.target_kind = .ipv6;
+                        c.target_buf[0..16].* = a;
+                        c.target_len = 16;
+                    },
+                    .domain => |d| {
+                        c.target_kind = .domain;
+                        @memcpy(c.target_buf[0..d.len], d);
+                        c.target_len = @intCast(d.len);
+                    },
+                }
+                c.target_port = req.target.port;
+                // HTTP supplies an explicit authority; do not replace it by Host/SNI.
+                c.sniff_enabled = false;
+                if (req.connect) {
+                    c.consumeClient(req.len);
+                    l.queueClient(c, http.connected);
+                    try l.flushClient(c);
+                } else {
+                    var rewritten: [client_chunk]u8 = undefined;
+                    const head = http.rewrite(req, &rewritten) catch |err| return l.httpError(c, err);
+                    c.http_body = req.body;
+                    const body_len = c.http_body.feed(c.cin[req.len..c.cin_len]) catch |err| return l.httpError(c, err);
+                    if (head.len + body_len > c.cin.len) return l.httpError(c, error.HeaderTooLarge);
+                    if (head.len > req.len)
+                        mem.copyBackwards(u8, c.cin[head.len..][0..body_len], c.cin[req.len..][0..body_len])
+                    else
+                        mem.copyForwards(u8, c.cin[head.len..][0..body_len], c.cin[req.len..][0..body_len]);
+                    @memcpy(c.cin[0..head.len], head);
+                    c.cin_len = head.len + body_len;
+                    c.http_plain = true;
+                }
+                try l.routeOrSniff(c);
+            },
+            .http_error => {},
             .sniffing => try l.sniffRoute(c),
             .connecting, .socks_dial, .tls_handshake, .ws_upgrade => {}, // buffer in cin until the tunnel is up
             .relay => try l.forwardClient(c),
@@ -555,15 +810,35 @@ pub const Loop = struct {
         }
     }
 
+    fn httpError(l: *Loop, c: *Conn, err: http.Error) !void {
+        const status = switch (err) {
+            error.HeaderTooLarge, error.BufferTooSmall => "431 Request Header Fields Too Large",
+            error.Unsupported => "501 Not Implemented",
+            else => "400 Bad Request",
+        };
+        var buf: [160]u8 = undefined;
+        const reply = try std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", .{status});
+        c.state = .http_error;
+        c.cin_len = 0;
+        l.queueClient(c, reply);
+        try l.flushClient(c);
+    }
+
     /// Encode everything buffered in `cin` for the upstream and start writing.
     fn forwardClient(l: *Loop, c: *Conn) !void {
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.cin_len == 0 or c.up_out_len > 0) return;
         const data = c.cin[0..c.cin_len];
         if (c.padder.direct) {
-            @memcpy(c.up_out[0..data.len], data);
-            c.up_out_len = data.len;
+            const n = sys.write(c.up_fd, data) catch |err| switch (err) {
+                error.WouldBlock, error.Interrupted => return,
+                else => return err,
+            };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
+            c.consumeClient(n);
+            return l.finishDirections(c);
         } else {
-            var padded_buf: [ws.max_header_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
+            var padded_buf: [ws.max_header_len + client_buffer + 2 * vision.max_overhead]u8 = undefined;
             const off = ws.max_header_len;
             const padded = if (c.vision_on)
                 c.padder.pad(data, padded_buf[off..]) catch return error.VisionPad
@@ -572,6 +847,15 @@ pub const Loop = struct {
                 break :blk padded_buf[off..][0..data.len];
             };
             const plain = if (c.ws_on) ws.frameInPlace(&padded_buf, off, padded.len, maskOf(c)) else padded;
+            if (c.crypto_job) |j| {
+                if (c.cfg.crypto_limits.accepts(plain.len + 1) and c.tls.suite != .chacha20_poly1305_sha256) {
+                    @memcpy(j.input[0..plain.len], plain);
+                    c.cin_len = 0;
+                    j.submit(.encrypt, &c.tls, j.input[0..plain.len], &c.up_out);
+                    if (l.executor) |ex| ex.submitted += 1;
+                    return;
+                }
+            }
             const rec = c.tls.encrypt(plain, &c.up_out) catch return error.TlsEncrypt;
             c.up_out_len = rec.len;
             if (c.padder.direct) sys.log("[{d}] vision uplink -> direct", .{c.slot});
@@ -622,6 +906,7 @@ pub const Loop = struct {
         if (c.udp_peer) |p| {
             if (!p.eql(dg.from)) return; // not our client
         } else c.udp_peer = dg.from;
+        if (dg.len > 0) c.last_active = sys.monotonicSeconds();
         const dgram = c.cin[0..dg.len];
         const hdr = (socks5.parseUdpHeader(dgram) catch return) orelse return;
         const payload = dgram[hdr.len..];
@@ -697,11 +982,20 @@ pub const Loop = struct {
                 error.WouldBlock => return,
                 else => return e,
             };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
             c.c_out_off += n;
             c.c_out_len -= n;
         }
         c.c_out_off = 0;
-        if (c.up_eof) return error.Done;
+        if (c.state == .http_error) {
+            l.close(c, "HTTP request rejected");
+            return;
+        }
+        if (c.state == .relay) {
+            _ = try l.pumpDownload(c);
+            try l.finishDirections(c);
+            if (c.state == .free) return;
+        }
         // Queue drained: records still buffered in uin can now be processed.
         if (c.uin_len > 0 and c.state == .relay and !c.unpadder.direct) {
             try processRecords(c);
@@ -797,15 +1091,33 @@ pub const Loop = struct {
     }
 
     /// The chained connection (still attempting) that owns hop port `p`.
-    fn findChained(l: *Loop, p: u16) ?*Conn {
-        for (l.conns) |*a| if (a.state != .free and a.chain_lport == p and l.preRelay(a) and a.up_fd >= 0) return a;
+    fn findChained(l: *Loop, p: u32) ?*Conn {
+        for (l.conns) |*a| if (a.state != .free and a.chain_key == p and l.preRelay(a) and a.up_fd >= 0) return a;
         return null;
     }
 
     /// The live hop connection accepted from local port `p`.
-    fn findHop(l: *Loop, p: u16) ?*Conn {
-        for (l.conns) |*b| if (b.state != .free and b.hop_peer == p) return b;
+    fn findHop(l: *Loop, p: u32) ?*Conn {
+        for (l.conns) |*b| if (b.state != .free and b.hop_key == p) return b;
         return null;
+    }
+
+    fn publishHop(l: *Loop, c: *Conn, why: []const u8) void {
+        if (c.hop_key == 0) return;
+        if (c.hop_published) |previous| {
+            if (previous.ob == c.ob and previous.state == c.state and previous.got_resp_hdr == c.got_resp_hdr and mem.eql(u8, previous.why, why)) return;
+        }
+        const snapshot: HopEnd = .{ .ob = c.ob, .state = c.state, .got_resp_hdr = c.got_resp_hdr, .why = why };
+        if (l.cfg.hops) |r| r.publish(c.hop_key, snapshot);
+        c.hop_published = snapshot;
+    }
+
+    fn hopSnapshot(l: *Loop, c: *const Conn) ?HopEnd {
+        if (l.cfg.hops) |r| return r.get(c.chain_key);
+        return c.hop_end orelse if (l.findHop(c.chain_key)) |b|
+            HopEnd{ .ob = b.ob, .state = b.state, .got_resp_hdr = b.got_resp_hdr, .why = "" }
+        else
+            null;
     }
 
     fn firstUntried(order: []const u8, c: *const Conn) ?usize {
@@ -815,15 +1127,12 @@ pub const Loop = struct {
 
     fn markBad(l: *Loop, c: *Conn, why: []const u8) void {
         const tag = l.cfg.outbounds[c.ob].tag;
-        if (c.chain_lport != 0 and !isTransportFailure(why)) {
+        if (c.chain_key != 0 and !isTransportFailure(why)) {
             // The exit's handshake itself failed (bad reply, rejected key,
             // config): the relay leg is irrelevant.
             sys.log("[{d}] outbound {s} failed: {s}; exit handshake error -> exit side", .{ c.slot, tag, why });
-        } else if (c.chain_lport != 0) {
-            const end: ?HopEnd = c.hop_end orelse if (l.findHop(c.chain_lport)) |b|
-                HopEnd{ .ob = b.ob, .state = b.state, .got_resp_hdr = b.got_resp_hdr, .why = "" }
-            else
-                null;
+        } else if (c.chain_key != 0) {
+            const end = l.hopSnapshot(c);
             if (end) |e| {
                 const relay = l.cfg.outbounds[e.ob].tag;
                 const leg = hopLeg(e);
@@ -837,6 +1146,8 @@ pub const Loop = struct {
     }
 
     fn dropUpstream(l: *Loop, c: *Conn) void {
+        if (c.chain_key != 0) if (l.cfg.hops) |r| r.release(c.chain_key);
+        c.chain_key = 0;
         if (c.up_fd >= 0) {
             sys.epollDel(l.ep, c.up_fd);
             sys.close(c.up_fd);
@@ -876,9 +1187,16 @@ pub const Loop = struct {
         c.last_active = sys.monotonicSeconds();
         c.attempt_deadline_ms = sys.monotonicMs() + l.cfg.connect_timeout_s * 1000;
         c.hop_end = null;
-        c.chain_lport = 0;
+        c.chain_key = 0;
+        if (ob.hop_host.len > 0) {
+            // Publish the owner before connect: another worker can accept and
+            // even close the hop before this worker handles another event.
+            const local = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, 0);
+            try sys.bind(fd, &local);
+            c.chain_key = hop.key((try sys.localAddr(fd)).getPort(), ob.addr.getPort());
+            if (l.cfg.hops) |r| try r.reserve(c.chain_key);
+        }
         const immediate = try sys.connect(fd, &ob.addr);
-        if (ob.hop_host.len > 0) c.chain_lport = if (sys.localAddr(fd)) |a| a.getPort() else |_| 0;
         const ev: u32 = sys.EPOLL.OUT | sys.EPOLL.RDHUP;
         try sys.epollAdd(l.ep, fd, ev, c.token(.upstream));
         c.up_ev = ev;
@@ -925,6 +1243,11 @@ pub const Loop = struct {
             return;
         }
         try l.flushUpstream(c);
+        if (c.state == .relay) {
+            if (c.cin_len > 0) try l.forwardClient(c);
+            _ = try l.pumpUpload(c);
+            try l.finishDirections(c);
+        }
     }
 
     fn startTls(l: *Loop, c: *Conn) !void {
@@ -986,26 +1309,41 @@ pub const Loop = struct {
         try l.flushUpstream(c);
     }
 
-    fn flushUpstream(_: *Loop, c: *Conn) !void {
+    fn flushUpstream(l: *Loop, c: *Conn) !void {
         while (c.up_out_len > 0) {
             const n = sys.write(c.up_fd, c.up_out[c.up_out_off..][0..c.up_out_len]) catch |e| switch (e) {
                 error.WouldBlock => return,
                 else => return e,
             };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
             c.up_out_off += n;
             c.up_out_len -= n;
         }
         c.up_out_off = 0;
+        if (c.state == .relay) try l.finishDirections(c);
     }
 
     fn readUpstream(l: *Loop, c: *Conn) !void {
+        for (0..16) |_| {
+            const reads = sys.counters.reads;
+            try l.readUpstreamOnce(c);
+            if (c.state != .relay or c.up_eof or c.c_out_len > 0 or sys.counters.reads == reads) break;
+            if (c.crypto_job) |j| if (j.pending()) break;
+        }
+    }
+
+    fn readUpstreamOnce(l: *Loop, c: *Conn) !void {
+        if (c.crypto_job) |j| if (j.pending()) return;
+        if (c.up_eof) return;
+        if (try l.pumpDownload(c)) return;
         if (c.c_out_len > 0) return; // back-pressure
         if (c.state == .relay and c.unpadder.direct) {
             // Raw inner stream: straight copy.
-            const n = sys.read(c.up_fd, c.c_out[0..max_rec]) catch |e| switch (e) {
+            const n = sys.read(c.up_fd, &c.c_out) catch |e| switch (e) {
                 error.WouldBlock => return,
                 else => return e,
             };
+            if (n > 0) c.last_active = sys.monotonicSeconds();
             if (n == 0) return error.UpstreamEof;
             c.c_out_off = 0;
             c.c_out_len = n;
@@ -1017,6 +1355,7 @@ pub const Loop = struct {
             error.WouldBlock => return,
             else => return e,
         };
+        if (n > 0) c.last_active = sys.monotonicSeconds();
         if (n == 0) return error.UpstreamEof;
         c.uin_len += n;
         if (c.state == .socks_dial) return l.socksDialReply(c);
@@ -1025,7 +1364,9 @@ pub const Loop = struct {
 
     fn processUpstream(l: *Loop, c: *Conn) !void {
         try processRecords(c);
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.c_out_len > 0) try l.flushClient(c);
+        if (c.crypto_job) |j| if (j.pending()) return;
         if (c.up_out_len > 0) try l.flushUpstream(c);
         if (c.state == .relay and c.cin_len > 0) try l.forwardClient(c);
     }
@@ -1042,9 +1383,20 @@ pub const Loop = struct {
             if (c.uin_len < total) break;
 
             var scratch: [max_rec]u8 = undefined;
-            const res = c.tls.handleRecord(c.uin[0..total], &scratch) catch |e| {
-                if (c.tls.last_alert) |a| sys.log("[{d}] tls alert {s}", .{ c.slot, @tagName(a.description) });
-                return e;
+            const res = if (c.crypto_ready) blk: {
+                c.crypto_ready = false;
+                break :blk c.crypto_job.?.result;
+            } else blk: {
+                if (c.crypto_job) |j| {
+                    if (c.state == .relay and c.tls.state == .connected and hdr.content_type == .application_data and total >= 22 and c.cfg.crypto_limits.accepts(total - 21) and c.tls.suite != .chacha20_poly1305_sha256) {
+                        j.submit(.decrypt, &c.tls, c.uin[0..total], &j.reply);
+                        return;
+                    }
+                }
+                break :blk c.tls.handleRecord(c.uin[0..total], &scratch) catch |e| {
+                    if (c.tls.last_alert) |a| sys.log("[{d}] tls alert {s}", .{ c.slot, @tagName(a.description) });
+                    return e;
+                };
             };
             if (res.to_send.len > 0) {
                 if (c.up_out_len + res.to_send.len > c.up_out.len) return error.UpstreamQueueFull;
@@ -1113,7 +1465,7 @@ pub const Loop = struct {
     /// padding block) in one record.
     fn sendVlessRequest(c: *Conn) !void {
         c.state = .relay;
-        var wbuf: [ws.max_header_len + vless.max_request_len + client_chunk + 2 * vision.max_overhead]u8 = undefined;
+        var wbuf: [ws.max_header_len + vless.max_request_len + client_buffer + 2 * vision.max_overhead]u8 = undefined;
         const buf = wbuf[ws.max_header_len..];
         var addr: vless.Address = switch (c.target_kind) {
             .ipv4 => .{ .ipv4 = c.target_buf[0..4].* },
@@ -1172,7 +1524,7 @@ pub const Loop = struct {
     }
 
     fn cfgOf(c: *Conn) *const Outbound {
-        return &cur_cfg.?.outbounds[c.ob];
+        return &c.cfg.outbounds[c.ob];
     }
 
     fn sendWsUpgrade(c: *Conn, ob: *const Outbound) !void {
@@ -1195,3 +1547,537 @@ pub const Loop = struct {
         c.up_out_len += rec.len;
     }
 };
+
+test "drain queued upload before FIN and preserve reverse traffic" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var cp: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &cp)));
+    defer sys.close(cp[1]);
+    var up: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &up)));
+    defer sys.close(up[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    const c = &conns[0];
+    c.state = .relay;
+    c.client_fd = cp[0];
+    c.up_fd = up[0];
+    c.padder.direct = true;
+    c.unpadder.direct = true;
+    c.client_eof = true;
+    c.up_out[0..3].* = "abc".*;
+    c.up_out_len = 3;
+    loop.active = 1;
+    defer loop.close(c, "test finished");
+    try loop.finishDirections(c);
+    try std.testing.expect(!c.up_write_closed);
+    try loop.flushUpstream(c);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try sys.read(up[1], &buf));
+    try std.testing.expectEqualSlices(u8, "abc", buf[0..3]);
+    try std.testing.expectEqual(@as(usize, 0), try sys.read(up[1], &buf));
+    try std.testing.expectEqual(@as(usize, 3), try sys.write(up[1], "xyz"));
+    loop.handle(c.token(.upstream), sys.EPOLL.IN);
+    try std.testing.expectEqual(@as(usize, 3), try sys.read(cp[1], &buf));
+    try std.testing.expectEqualSlices(u8, "xyz", buf[0..3]);
+    sys.shutdownWrite(up[1]);
+    loop.handle(c.token(.upstream), sys.EPOLL.IN);
+    try std.testing.expectEqual(@as(usize, 0), try sys.read(cp[1], &buf));
+    try std.testing.expectEqual(State.free, c.state);
+    try std.testing.expectEqual(@as(usize, 0), loop.active);
+}
+
+// Exercise real epoll readiness with unread data followed by FIN, rather than
+// pre-setting an EOF flag. Both directions must pause and later resume safely.
+fn backpressureHalfClose(download: bool, expire: bool, use_splice: bool) !void {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{}, .idle_timeout_s = 1 };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var cp: [2]sys.fd_t = undefined;
+    var up: [2]sys.fd_t = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &cp)));
+    defer sys.close(cp[1]);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &up)));
+    defer sys.close(up[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(cp[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    c.up_fd = up[0];
+    c.state = .relay;
+    c.padder.direct = true;
+    c.unpadder.direct = true;
+    const dst = if (download) cp[0] else up[0];
+    const sink = if (download) cp[1] else up[1];
+    const source = if (download) up[1] else cp[1];
+    const side: Side = if (download) .upstream else .client;
+    // Fill the destination's send buffer to force EAGAIN with a queued tail.
+    const filler: [4096]u8 = @splat(0x55);
+    while (true) {
+        _ = sys.write(dst, &filler) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    if (download) {
+        c.c_out[0..3].* = "abc".*;
+        c.c_out_len = 3;
+    } else {
+        c.up_out[0..3].* = "abc".*;
+        c.up_out_len = 3;
+    }
+    var pipe_quota: @import("fd_budget.zig").Budget = .{ .limit = 2 };
+    if (use_splice) {
+        c.upload_pipe.budget = &pipe_quota;
+        c.download_pipe.budget = &pipe_quota;
+        c.up_out_len = 0;
+        c.c_out_len = 0;
+        const pipe = if (download) &c.download_pipe else &c.upload_pipe;
+        try std.testing.expect(try pipe.pump(if (download) up[0] else cp[0], dst, 0));
+        const pfds = pipe.fds.?;
+        // Unix sockets can still accept a spliced skb after write() reports
+        // EAGAIN. Saturate the splice path itself before testing its backlog.
+        while (true) {
+            const n = try sys.write(pfds[1], &filler);
+            const rc = linux.syscall6(.splice, @bitCast(@as(isize, pfds[0])), 0, @bitCast(@as(isize, dst)), 0, n, 2);
+            const err = linux.errno(rc);
+            if (err == .SUCCESS and rc == n) continue;
+            var scratch: [4096]u8 = undefined;
+            _ = try sys.read(pfds[0], &scratch);
+            if (err == .AGAIN) break;
+            try std.testing.expectEqual(linux.E.SUCCESS, err);
+        }
+    }
+    const tail: []const u8 = if (use_splice) "abcxyz" else "xyz";
+    try std.testing.expectEqual(tail.len, try sys.write(source, tail));
+    sys.shutdownWrite(source);
+    if (use_splice) {
+        loop.handle(c.token(side), sys.EPOLL.RDHUP);
+        try std.testing.expectEqual(tail.len, if (download) c.download_pipe.pending else c.upload_pipe.pending);
+    }
+    c.last_active = sys.monotonicSeconds() - 3;
+    const before = c.last_active;
+    // A stale RDHUP from the previous event batch must not extend idle life.
+    loop.handle(c.token(side), sys.EPOLL.RDHUP);
+    try std.testing.expectEqual(before, c.last_active);
+    for (0..4) |_| {
+        var events: [4]sys.Event = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try sys.epollWait(ep, &events, 10));
+    }
+    if (expire) {
+        loop.sweep();
+        try std.testing.expectEqual(State.free, c.state);
+        return;
+    }
+    // Remove only the filler, then let actual epoll events forward abc + xyz.
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        _ = sys.read(sink, &buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    var result: [6]u8 = undefined;
+    var used: usize = 0;
+    var eof = false;
+    for (0..100) |_| {
+        var events: [4]sys.Event = undefined;
+        const count = try sys.epollWait(ep, &events, 10);
+        for (events[0..count]) |ev| loop.handle(ev.data.u64, ev.events);
+        const n = sys.read(sink, &buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n > 0) c.last_active = sys.monotonicSeconds();
+        if (n == 0) {
+            eof = true;
+            break;
+        }
+        try std.testing.expect(used + n <= result.len);
+        @memcpy(result[used..][0..n], buf[0..n]);
+        used += n;
+    }
+    try std.testing.expect(eof);
+    try std.testing.expectEqualSlices(u8, "abcxyz", result[0..used]);
+    try std.testing.expect(c.last_active > before);
+    // The peer's FIN must leave the reverse direction usable.
+    try std.testing.expectEqual(@as(usize, 3), try sys.write(sink, "rev"));
+    var got_reverse = false;
+    for (0..100) |_| {
+        var events: [4]sys.Event = undefined;
+        const count = try sys.epollWait(ep, &events, 10);
+        for (events[0..count]) |ev| loop.handle(ev.data.u64, ev.events);
+        const n = sys.read(source, &buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n > 0) c.last_active = sys.monotonicSeconds();
+        try std.testing.expectEqualSlices(u8, "rev", buf[0..n]);
+        got_reverse = true;
+        break;
+    }
+    try std.testing.expect(got_reverse);
+}
+
+test "upload backpressure and FIN pause epoll then preserve tail and reverse traffic" {
+    try backpressureHalfClose(false, false, false);
+}
+test "download backpressure and FIN pause epoll then preserve tail and reverse traffic" {
+    try backpressureHalfClose(true, false, false);
+}
+test "blocked half-closed upload still expires without progress" {
+    try backpressureHalfClose(false, true, false);
+}
+test "blocked half-closed download still expires without progress" {
+    try backpressureHalfClose(true, true, false);
+}
+
+fn crossWorkerHopFailure(exit_failure: bool) !void {
+    var entries: [2]hop.Registry.Entry = undefined;
+    var registry = hop.Registry.init(&entries);
+    const listener = try sys.tcpSocket(std.os.linux.AF.INET);
+    defer sys.close(listener);
+    const local = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, 0);
+    try sys.bind(listener, &local);
+    try sys.listen(listener, 4);
+    const addr = try sys.localAddr(listener);
+    const obs = [_]Outbound{
+        .{ .tag = "unused", .addr = addr, .sni = "unused", .uuid = @splat(0) },
+        .{ .tag = "relay", .addr = addr, .sni = "relay", .uuid = @splat(0) },
+        .{ .tag = "exit", .addr = addr, .hop_host = "exit", .hop_port = 443, .sni = "exit", .uuid = @splat(0) },
+    };
+    const cfg: Config = .{ .outbounds = &obs, .default_group = &.{2}, .hops = &registry };
+    const ep_a = try sys.epollCreate();
+    defer sys.close(ep_a);
+    const ep_b = try sys.epollCreate();
+    defer sys.close(ep_b);
+    var pool_a: [1]Conn = undefined;
+    var pool_b: [1]Conn = undefined;
+    var a_loop = Loop.init(ep_a, &cfg, &pool_a);
+    var b_loop = Loop.init(ep_b, &cfg, &pool_b);
+    b_loop.worker_id = 1;
+    const a = &pool_a[0];
+    a.ob = 2;
+    a_loop.active = 1;
+    defer a_loop.close(a, "test finished");
+    try a_loop.connectUpstream(a);
+    try std.testing.expect(a.chain_key != 0);
+    try std.testing.expect(a_loop.hopSnapshot(a) == null);
+    // Accept the actual loopback connection into the other worker's pool.
+    try std.testing.expect(try sys.pollIn(listener, 5000));
+    const fd = try sys.accept(listener);
+    b_loop.accept(fd, .socks5, 1);
+    const b = &pool_b[0];
+    try std.testing.expectEqual(a.chain_key, b.hop_key);
+    try std.testing.expect(a_loop.findHop(a.chain_key) == null);
+    try std.testing.expectEqual(State.socks_greeting, a_loop.hopSnapshot(a).?.state);
+    try std.testing.expectEqual(@as(u8, 1), a_loop.hopSnapshot(a).?.ob);
+    b.state = if (exit_failure) .relay else .tls_handshake;
+    b.got_resp_hdr = exit_failure;
+    const publish = struct {
+        fn run(loop: *Loop, c: *Conn) void {
+            loop.publishHop(c, "");
+        }
+    };
+    const t = try std.Thread.spawn(.{}, publish.run, .{ &b_loop, b });
+    t.join();
+    const live = a_loop.hopSnapshot(a).?;
+    try std.testing.expectEqualStrings(if (exit_failure) "up, exit replied -> exit side" else "handshake pending -> relay side", Loop.hopLeg(live));
+    const closer = struct {
+        fn run(loop: *Loop, c: *Conn) void {
+            loop.close(c, "ConnectionReset");
+        }
+    };
+    const t2 = try std.Thread.spawn(.{}, closer.run, .{ &b_loop, b });
+    t2.join();
+    const closed = a_loop.hopSnapshot(a).?;
+    try std.testing.expectEqual(live.state, closed.state);
+    try std.testing.expectEqualStrings("ConnectionReset", closed.why);
+    a_loop.markBad(a, "UpstreamEof");
+    try std.testing.expect(a_loop.bad_until[2] > sys.monotonicSeconds());
+    const old_key = a.chain_key;
+    a_loop.dropUpstream(a);
+    try std.testing.expect(registry.get(old_key) == null);
+    // A reused reservation never inherits an earlier attempt's closed snapshot.
+    try registry.reserve(old_key);
+    try std.testing.expect(registry.get(old_key) == null);
+    registry.release(old_key);
+}
+
+test "cross-worker chain attributes live and closed relay failures" {
+    try crossWorkerHopFailure(false);
+}
+test "cross-worker chain attributes live and closed exit failures" {
+    try crossWorkerHopFailure(true);
+}
+
+test "splice upload backpressure and FIN preserve tail and reverse traffic" {
+    try backpressureHalfClose(false, false, true);
+}
+test "splice download backpressure and FIN preserve tail and reverse traffic" {
+    try backpressureHalfClose(true, false, true);
+}
+test "blocked half-closed splice upload still expires" {
+    try backpressureHalfClose(false, true, true);
+}
+test "blocked half-closed splice download still expires" {
+    try backpressureHalfClose(true, true, true);
+}
+
+test "deferred close keeps crypto-owned slot alive and rejects stale events after reuse" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    var executor = try crypto.Executor.init(std.testing.allocator, 1, .off);
+    defer executor.stop(std.testing.allocator);
+    loop.attachCrypto(&executor);
+    const c = &conns[0];
+    const job = &executor.jobs[0];
+    c.state = .relay;
+    loop.active = 1;
+    const stale = c.token(.client);
+    // The crypto thread owns TLS and buffers until its release publication.
+    job.status.store(.running, .release);
+    loop.close(c, "cancelled during crypto");
+    try std.testing.expectEqual(@as(usize, 1), loop.active);
+    try std.testing.expect(c.close_wait != null);
+    try std.testing.expect(c.paused);
+    loop.handle(stale, sys.EPOLL.IN | sys.EPOLL.HUP);
+    try std.testing.expectEqual(State.relay, c.state);
+    job.status.store(.done, .release);
+    loop.cryptoCompleted();
+    try std.testing.expectEqual(State.free, c.state);
+    try std.testing.expectEqual(@as(usize, 0), loop.active);
+    try std.testing.expectEqual(crypto.Status.idle, job.status.load(.acquire));
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+    loop.accept(pair[0], .socks5, null);
+    defer loop.close(c, "test finished");
+    try std.testing.expectEqual(State.socks_greeting, c.state);
+    try std.testing.expect(c.token(.client) != stale);
+    loop.handle(stale, sys.EPOLL.IN | sys.EPOLL.ERR);
+    try std.testing.expectEqual(State.socks_greeting, c.state);
+    try std.testing.expectEqual(@as(usize, 1), loop.active);
+}
+
+test "crypto completion restores real epoll readiness after socket removal" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var cp: [2]sys.fd_t = undefined;
+    var up: [2]sys.fd_t = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &cp)));
+    defer sys.close(cp[1]);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &up)));
+    defer sys.close(up[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    var executor = try crypto.Executor.init(std.testing.allocator, 1, .off);
+    defer executor.stop(std.testing.allocator);
+    loop.attachCrypto(&executor);
+    loop.accept(cp[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    c.state = .relay;
+    c.up_fd = up[0];
+    c.padder.direct = true;
+    c.unpadder.direct = true;
+    loop.updateInterest(c);
+    const j = &executor.jobs[0];
+    j.status.store(.running, .release);
+    loop.updateInterest(c);
+    try std.testing.expect(c.paused);
+    try std.testing.expectEqual(@as(usize, 4), try sys.write(cp[1], "tail"));
+    sys.shutdownWrite(cp[1]);
+    var events: [4]sys.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try sys.epollWait(ep, &events, 10));
+    j.operation = .encrypt;
+    j.produced = 0;
+    j.status.store(.done, .release);
+    loop.cryptoCompleted();
+    try std.testing.expect(!c.paused);
+    var buf: [8]u8 = undefined;
+    var got = false;
+    for (0..10) |_| {
+        const count = try sys.epollWait(ep, &events, 10);
+        for (events[0..count]) |ev| loop.handle(ev.data.u64, ev.events);
+        const n = sys.read(up[1], &buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        try std.testing.expectEqualSlices(u8, "tail", buf[0..n]);
+        got = true;
+        break;
+    }
+    try std.testing.expect(got);
+    try std.testing.expect(c.client_eof);
+}
+
+fn httpIngressTest(tunnel: bool) !void {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var cp: [2]sys.fd_t = undefined;
+    var up: [2]sys.fd_t = undefined;
+    const flags = linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &cp)));
+    defer sys.close(cp[1]);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, flags, 0, &up)));
+    defer sys.close(up[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(cp[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    // A fragmented request must not trigger an upstream attempt.
+    _ = try sys.write(cp[1], if (tunnel) "CON" else "POS");
+    try loop.readClient(c);
+    try std.testing.expectEqual(State.http_request, c.state);
+    try std.testing.expectEqual(@as(usize, 0), c.tries);
+    _ = try sys.write(cp[1], if (tunnel)
+        "NECT [::1]:443 HTTP/1.1\r\n\r\nhello"
+    else
+        "T http://example.com:8080/upload HTTP/1.1\r\nProxy-Authorization: Basic secret\r\nContent-Length: 10\r\n\r\nhello");
+    // No configured outbounds: inspect the parsed request before attaching a
+    // raw socket peer to exercise the established data path deterministically.
+    try std.testing.expectError(error.AllOutboundsFailed, loop.readClient(c));
+    try std.testing.expectEqual(@as(u16, if (tunnel) 443 else 8080), c.target_port);
+    if (tunnel) {
+        try std.testing.expectEqual(@as(u8, 1), c.target_buf[15]);
+    } else try std.testing.expectEqualStrings("example.com", c.target_buf[0..c.target_len]);
+    c.state = .relay;
+    c.up_fd = up[0];
+    c.padder.direct = true;
+    c.unpadder.direct = true;
+    var buf: [1024]u8 = undefined;
+    if (tunnel) {
+        const n = try sys.read(cp[1], &buf);
+        try std.testing.expectEqualStrings(http.connected, buf[0..n]);
+    }
+    try loop.forwardClient(c);
+    const n = try sys.read(up[1], &buf);
+    try std.testing.expectEqualStrings(if (tunnel) "hello" else "POST /upload HTTP/1.1\r\nHost: example.com:8080\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello", buf[0..n]);
+    _ = try sys.write(cp[1], if (tunnel) "world" else "worldGET http://other.example/ HTTP/1.1\r\n\r\n");
+    try loop.readClient(c);
+    const tail = try sys.read(up[1], &buf);
+    try std.testing.expectEqualStrings("world", buf[0..tail]);
+    if (!tunnel) {
+        try std.testing.expect(c.http_body.done());
+        try std.testing.expectError(error.WouldBlock, sys.read(up[1], &buf));
+    }
+    _ = try sys.write(up[1], "response");
+    try loop.readUpstream(c);
+    const reply = try sys.read(cp[1], &buf);
+    try std.testing.expectEqualStrings("response", buf[0..reply]);
+    if (!tunnel) {
+        sys.shutdownWrite(up[1]);
+        loop.handle(c.token(.upstream), sys.EPOLL.IN);
+        try std.testing.expectEqual(State.free, c.state);
+    }
+}
+
+test "HTTP CONNECT ingress preserves early data and bidirectional relay" {
+    try httpIngressTest(true);
+}
+
+test "HTTP forward ingress rewrites headers streams body and closes on response EOF" {
+    try httpIngressTest(false);
+}
+
+test "mixed listener retains fragmented SOCKS5 handshake" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(pair[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    _ = try sys.write(pair[1], "\x05");
+    try loop.readClient(c);
+    try std.testing.expectEqual(State.socks_greeting, c.state);
+    _ = try sys.write(pair[1], "\x01\x00");
+    try loop.readClient(c);
+    try std.testing.expectEqual(State.socks_request, c.state);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try sys.read(pair[1], &buf));
+    try std.testing.expectEqualSlices(u8, &socks5.greeting_reply, buf[0..2]);
+}
+
+test "HTTP error response drains under backpressure before closing" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(pair[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    const filler: [4096]u8 = @splat('x');
+    while (true) {
+        _ = sys.write(pair[0], &filler) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    _ = try sys.write(pair[1], "GET http://x/ HTTP/1.1\r\nContent-Length: -1\r\n\r\n");
+    try loop.readClient(c);
+    try std.testing.expectEqual(State.http_error, c.state);
+    try std.testing.expect(c.c_out_len > 0);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        _ = sys.read(pair[1], &buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    try loop.flushClient(c);
+    try std.testing.expectEqual(State.free, c.state);
+    const n = try sys.read(pair[1], &buf);
+    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", buf[0..n]);
+}
+
+test "HTTP rewrite has headroom when headers and POST body fill the first read" {
+    const linux = std.os.linux;
+    const cfg: Config = .{ .outbounds = &.{}, .default_group = &.{} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var pair: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &pair)));
+    defer sys.close(pair[1]);
+    var conns: [1]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &conns);
+    loop.accept(pair[0], .socks5, null);
+    const c = &conns[0];
+    defer loop.close(c, "test finished");
+    const original = "POST http://x/ HTTP/1.1\r\nContent-Length: 40000\r\n\r\n";
+    var wire: [client_chunk]u8 = @splat('x');
+    @memcpy(wire[0..original.len], original);
+    _ = try sys.write(pair[1], &wire);
+    try std.testing.expectError(error.AllOutboundsFailed, loop.readClient(c));
+    try std.testing.expect(c.http_plain);
+    try std.testing.expect(c.cin_len > client_chunk);
+    try std.testing.expectEqual(@as(u64, 40000 - (client_chunk - original.len)), c.http_body.remaining);
+    try std.testing.expect(mem.startsWith(u8, c.cin[0..c.cin_len], "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 40000\r\nConnection: close\r\n\r\n"));
+}

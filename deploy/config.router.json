@@ -11,6 +11,12 @@
   "short_id": "",
   "uuid": "00000000-0000-0000-0000-000000000000",
   "max_connections": 64,
+  "stats_interval_s": 60,
+  "workers": 1,
+  "crypto_backend": "off",
+  "crypto_min_bytes": 4096,
+  "crypto_max_bytes": 32768,
+  "crypto_async": true,
   "handshake_timeout_s": 15,
   "idle_timeout_s": 300
 }

@@ -9,6 +9,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const tls = crypto.tls;
 const mem = std.mem;
+const kernel_crypto = @import("../linux/kernel_crypto.zig");
 
 pub const header_len = tls.record_header_len;
 /// Max TLSInnerPlaintext content length.
@@ -148,7 +149,11 @@ pub fn Direction(comptime AeadType: type) type {
             body[plaintext.len] = @backingInt(content_type);
 
             const tag = out[header_len + inner_len ..][0..tag_length];
-            Aead.encrypt(body, tag, body, out[0..header_len], self.nonce(), self.key);
+            const accelerated = if (comptime Aead == crypto.aead.aes_gcm.Aes128Gcm or Aead == crypto.aead.aes_gcm.Aes256Gcm)
+                if (kernel_crypto.current) |ctx| ctx.crypt(&self.key, self.nonce(), out[0..header_len], body, out[header_len..total], false) else .software
+            else
+                kernel_crypto.Outcome.software;
+            if (accelerated != .success) Aead.encrypt(body, tag, body, out[0..header_len], self.nonce(), self.key);
             try self.advance();
             return out[0..total];
         }
@@ -165,8 +170,15 @@ pub fn Direction(comptime AeadType: type) type {
             const inner_len = hdr.len - tag_length;
             const body = record[header_len..][0..inner_len];
             const tag = record[header_len + inner_len ..][0..tag_length].*;
-            Aead.decrypt(body, body, tag, record[0..header_len], self.nonce(), self.key) catch
-                return error.BadRecordMac;
+            const accelerated = if (comptime Aead == crypto.aead.aes_gcm.Aes128Gcm or Aead == crypto.aead.aes_gcm.Aes256Gcm)
+                if (kernel_crypto.current) |ctx| ctx.crypt(&self.key, self.nonce(), record[0..header_len], record[header_len..], body, true) else .software
+            else
+                kernel_crypto.Outcome.software;
+            switch (accelerated) {
+                .success => {},
+                .authentication_failed => return error.BadRecordMac,
+                .software => Aead.decrypt(body, body, tag, record[0..header_len], self.nonce(), self.key) catch return error.BadRecordMac,
+            }
             try self.advance();
 
             // Strip zero padding; last non-zero byte is the content type.

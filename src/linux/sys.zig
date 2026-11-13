@@ -9,6 +9,16 @@ pub const E = linux.E;
 
 pub const Error = error{ WouldBlock, ConnectionReset, BrokenPipe, Interrupted, Unexpected };
 
+pub const Counters = struct {
+    reads: u64 = 0,
+    writes: u64 = 0,
+    epoll_waits: u64 = 0,
+    epoll_mods: u64 = 0,
+    splice_calls: u64 = 0,
+    splice_bytes: u64 = 0,
+};
+pub threadlocal var counters: Counters = .{};
+
 fn check(rc: usize) Error!usize {
     return switch (linux.errno(rc)) {
         .SUCCESS => rc,
@@ -220,10 +230,12 @@ pub fn originalDst(fd: fd_t) Error!SockAddr {
 }
 
 pub fn read(fd: fd_t, buf: []u8) Error!usize {
+    counters.reads += 1;
     return check(linux.read(fd, buf.ptr, buf.len));
 }
 
 pub fn write(fd: fd_t, buf: []const u8) Error!usize {
+    counters.writes += 1;
     return check(linux.write(fd, buf.ptr, buf.len));
 }
 
@@ -250,6 +262,7 @@ pub fn epollAdd(ep: fd_t, fd: fd_t, events: u32, data: u64) Error!void {
 }
 
 pub fn epollMod(ep: fd_t, fd: fd_t, events: u32, data: u64) Error!void {
+    counters.epoll_mods += 1;
     var ev: Event = .{ .events = events, .data = .{ .u64 = data } };
     _ = try check(linux.epoll_ctl(ep, linux.EPOLL.CTL_MOD, fd, &ev));
 }
@@ -260,10 +273,31 @@ pub fn epollDel(ep: fd_t, fd: fd_t) void {
 
 /// Returns the number of ready events; `timeout_ms` < 0 blocks forever.
 pub fn epollWait(ep: fd_t, events: []Event, timeout_ms: i32) Error!usize {
+    counters.epoll_waits += 1;
     return check(linux.epoll_wait(ep, events.ptr, @intCast(events.len), timeout_ms)) catch |e| switch (e) {
         error.Interrupted => 0,
         else => e,
     };
+}
+
+pub fn eventCreate(nonblock: bool) Error!fd_t {
+    return @intCast(try check(linux.eventfd(0, linux.EFD.CLOEXEC | @as(u32, if (nonblock) linux.EFD.NONBLOCK else 0))));
+}
+
+pub fn eventNotify(fd: fd_t) void {
+    var one: u64 = 1;
+    while (true) {
+        const rc = linux.write(fd, std.mem.asBytes(&one), 8);
+        if (linux.errno(rc) != .INTR) return;
+    }
+}
+
+pub fn eventDrain(fd: fd_t) void {
+    var value: u64 = undefined;
+    while (true) {
+        const rc = linux.read(fd, std.mem.asBytes(&value), 8);
+        if (linux.errno(rc) != .INTR) return;
+    }
 }
 
 // ---- misc -------------------------------------------------------------------
