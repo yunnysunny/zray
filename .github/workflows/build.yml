@@ -13,22 +13,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Routers (mips, armv7) keep ReleaseSmall for their small flash;
+        # 64-bit targets use ReleaseFast, which makes userspace crypto
+        # (ws / non-Vision TLS) 2-3x faster for ~300-400 KB more binary.
         include:
           - name: mipsel-softfloat
             target: mipsel-linux-musl
             cpu: mips32r2+soft_float
+            optimize: small
           - name: mips-softfloat
             target: mips-linux-musl
             cpu: mips32r2+soft_float
+            optimize: small
           - name: aarch64
             target: aarch64-linux-musl
             cpu: baseline
+            optimize: fast
           - name: arm-v7
             target: arm-linux-musleabihf
             cpu: generic+v7a
+            optimize: small
           - name: x86_64
             target: x86_64-linux-musl
             cpu: baseline
+            optimize: fast
     steps:
       - uses: actions/checkout@v4
 
@@ -36,9 +44,9 @@ jobs:
         with:
           version: 0.17.0
 
-      - name: build (ReleaseSmall)
+      - name: build (Release-${{ matrix.optimize }})
         run: |
-          zig build --release -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -p out
+          zig build --release -Doptimize=${{ matrix.optimize }} -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -p out
           ls -l out/bin/zray
           mv out/bin/zray zray-${{ matrix.name }}
           sha256sum zray-${{ matrix.name }} > zray-${{ matrix.name }}.sha256

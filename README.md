@@ -90,11 +90,14 @@ zig build --release                              # host binary -> zig-out/bin/zr
 
 # cross-compile for a router
 zig build --release -Dtarget=mipsel-linux-musl -Dcpu=mips32r2+soft_float -p zig-out/mipsel
-zig build --release -Dtarget=aarch64-linux-musl -p zig-out/aarch64
-zig build --release -Dtarget=x86_64-linux-musl  -p zig-out/x86_64
+zig build --release -Doptimize=fast -Dtarget=aarch64-linux-musl -p zig-out/aarch64
+zig build --release -Doptimize=fast -Dtarget=x86_64-linux-musl  -p zig-out/x86_64
 ```
 
-`--release` uses `ReleaseSmall`. The proxy service is Linux-only; the probe
+`--release` uses `ReleaseSmall`; `-Doptimize=fast` switches to `ReleaseFast`,
+which makes userspace crypto (ws / non-Vision TLS) 2-3x faster at the cost of
+a larger binary. Release builds use `ReleaseFast` for aarch64 and x86_64 and
+`ReleaseSmall` for mips and armv7. The proxy service is Linux-only; the probe
 below runs anywhere.
 
 Builds are static by default (`-Ddynamic=false`). Pass `-Ddynamic=true` to
