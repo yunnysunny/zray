@@ -102,7 +102,6 @@ const FileConfig = struct {
     crypto_backend: @import("linux/kernel_crypto.zig").Policy = .off,
     crypto_min_bytes: u32 = 4096,
     crypto_max_bytes: u32 = 32768,
-    crypto_async: bool = true,
 };
 
 const Upstream = union(enum) {
@@ -301,7 +300,6 @@ fn linuxMain(init: std.process.Init) !void {
         .sniff = parsed.sniff,
         .fail_backoff_s = parsed.fail_backoff_s,
         .stats_interval_s = parsed.stats_interval_s,
-        .crypto_limits = limits,
     };
 
     if (parsed.listen.len == 0 and parsed.redirect.len == 0) {
@@ -317,10 +315,9 @@ fn linuxMain(init: std.process.Init) !void {
     else
         parsed.crypto_backend;
     const crypto_fds = @import("linux/kernel_crypto.zig").fdReserve(policy, worker_count);
-    const event_fds = if (policy != .off and parsed.crypto_async) 2 * worker_count else 0;
-    @import("linux/fd_budget.zig").configure(parsed.max_connections, worker_count, crypto_fds + event_fds);
-    sys.log("zray {s} socks5/http [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers, splice enabled, crypto_backend {s} bytes={d}..{d} async {}", .{
-        version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, worker_count, @tagName(policy), limits.min_bytes, limits.max_bytes, parsed.crypto_async,
+    @import("linux/fd_budget.zig").configure(parsed.max_connections, worker_count, crypto_fds);
+    sys.log("zray {s} socks5/http [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers, splice enabled, crypto_backend {s} bytes={d}..{d}", .{
+        version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, worker_count, @tagName(policy), limits.min_bytes, limits.max_bytes,
     });
     for (obs, node_cfgs) |ob, oc| {
         // Keep the "mode ..." phrases: the startup smoke test matches them,
@@ -361,7 +358,7 @@ fn linuxMain(init: std.process.Init) !void {
             .redirect_fd = redirect_fd,
             .hop_fd = hop_fd,
             .policy = policy,
-            .async_crypto = parsed.crypto_async,
+            .crypto_limits = limits,
         };
     }
     // All config and listener initialization is complete before publication.
@@ -377,13 +374,12 @@ const Worker = struct {
     redirect_fd: ?@import("linux/sys.zig").fd_t,
     hop_fd: [@import("linux/conn.zig").max_outbounds]?@import("linux/sys.zig").fd_t,
     policy: @import("linux/kernel_crypto.zig").Policy,
-    async_crypto: bool,
+    crypto_limits: @import("linux/kernel_crypto.zig").Limits,
     thread: ?std.Thread = null,
 
     const socks_token = std.math.maxInt(u64);
     const redirect_token = std.math.maxInt(u64) - 1;
-    const crypto_token = std.math.maxInt(u64) - 2;
-    const hop_token_base = std.math.maxInt(u64) - 3;
+    const hop_token_base = std.math.maxInt(u64) - 2;
 
     fn listeners(w: *Worker, ep: @import("linux/sys.zig").fd_t, add: bool) !void {
         const sys = @import("linux/sys.zig");
@@ -409,7 +405,6 @@ const Worker = struct {
         const sys = @import("linux/sys.zig");
         const conn = @import("linux/conn.zig");
         const kernel_crypto = @import("linux/kernel_crypto.zig");
-        const crypto = @import("linux/crypto.zig");
         const allocator = std.heap.page_allocator;
         const ep = try sys.epollCreate();
         defer sys.close(ep);
@@ -418,20 +413,10 @@ const Worker = struct {
         var loop = conn.Loop.init(ep, w.cfg, conns);
         loop.worker_id = w.id;
         var backend = kernel_crypto.Context.init(w.policy);
-        backend.limits = w.cfg.crypto_limits;
+        backend.limits = w.crypto_limits;
         defer backend.deinit();
-        var executor: ?crypto.Executor = null;
-        if (backend.enabled and w.async_crypto) {
-            executor = try crypto.Executor.init(allocator, w.capacity, w.policy);
-            executor.?.backend.limits = w.cfg.crypto_limits;
-            try executor.?.start();
-            loop.attachCrypto(&executor.?);
-            try sys.epollAdd(ep, executor.?.completed_fd, sys.EPOLL.IN, crypto_token);
-        } else if (backend.enabled) kernel_crypto.current = &backend;
-        defer {
-            if (executor) |*ex| ex.stop(allocator);
-            kernel_crypto.current = null;
-        }
+        if (backend.enabled) kernel_crypto.current = &backend;
+        defer kernel_crypto.current = null;
         sys.log("worker {d}: {d} slots, kernel crypto enabled {}", .{ w.id, w.capacity, backend.enabled });
         var registered = false;
         var events: [64]sys.Event = undefined;
@@ -446,10 +431,6 @@ const Worker = struct {
             const n = try sys.epollWait(ep, &events, 1000);
             for (events[0..n]) |ev| {
                 const token = ev.data.u64;
-                if (token == crypto_token) {
-                    loop.cryptoCompleted();
-                    continue;
-                }
                 var listen_fd: ?sys.fd_t = null;
                 var forced: ?u8 = null;
                 var inbound: conn.Inbound = .socks5;
@@ -479,13 +460,9 @@ const Worker = struct {
             }
             if (w.cfg.stats_interval_s > 0 and now - last_stats >= w.cfg.stats_interval_s) {
                 const c = sys.counters;
-                const kernel_ops = if (executor) |*ex| ex.backend_ops.load(.monotonic) else @as(usize, @truncate(backend.backend_ops));
-                const fallbacks = if (executor) |*ex| ex.fallbacks.load(.monotonic) else @as(usize, @truncate(backend.fallbacks));
-                const badmac = if (executor) |*ex| ex.auth_failures.load(.monotonic) else @as(usize, @truncate(backend.auth_failures));
-                const completed = if (executor) |*ex| ex.completed else @as(u64, 0);
-                sys.log("stats w{d} active={d}/{d} read={d} write={d} epoll_wait={d} epoll_mod={d} splice_calls={d} splice_bytes={d} crypto_completed={d} crypto_kernel={d} crypto_fallback={d} crypto_badmac={d}", .{
-                    w.id,      loop.active, conns.len, c.reads, c.writes, c.epoll_waits, c.epoll_mods, c.splice_calls, c.splice_bytes,
-                    completed, kernel_ops,  fallbacks, badmac,
+                sys.log("stats w{d} active={d}/{d} read={d} write={d} epoll_wait={d} epoll_mod={d} splice_calls={d} splice_bytes={d} crypto_kernel={d} crypto_fallback={d} crypto_badmac={d}", .{
+                    w.id,                loop.active,       conns.len,             c.reads, c.writes, c.epoll_waits, c.epoll_mods, c.splice_calls, c.splice_bytes,
+                    backend.backend_ops, backend.fallbacks, backend.auth_failures,
                 });
                 last_stats = now;
             }

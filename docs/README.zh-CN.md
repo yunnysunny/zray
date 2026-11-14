@@ -133,7 +133,6 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `crypto_backend` | `"off"` | 内核 AES-GCM 后端：off / auto / afalg / devcrypto；auto 依次尝试 devcrypto、AF_ALG、软件实现。 |
 | `crypto_min_bytes` | `4096` | 提交后端的 AEAD 明文字节数下限，含该值；小于该值时使用软件实现。 |
 | `crypto_max_bytes` | `32768` | 提交后端的 AEAD 明文字节数上限，含该值；大于该值时使用软件实现。 |
-| `crypto_async` | `true` | 启用内核加密时，每个网络 worker 使用一个加密执行线程；false 在网络 worker 内同步执行。 |
 
 上述运行参数全部写在配置 JSON 的**最外层**，与 `listen`、`max_connections`
 同级；使用多节点时也不要写进 `outbounds` 的节点对象。省略字段即采用表中默认值。
@@ -196,23 +195,17 @@ ZRAY_CRYPTO_BACKEND=afalg zray /path/to/config.json
 如果配置里设成 `off` 仍发现后端启用，检查启动环境是否设置了此变量。
 修改模式、阈值或 worker 数后都需要重启。
 
-### 异步加密线程与关闭方式
+### 加密后端与 worker 数
 
-`crypto_async` 默认 `true`。在 Linux 上显式启用 `crypto_backend` 后，每个
-网络 worker 创建一个额外的加密执行线程，后端会话在首个符合条件的请求到来时
-打开并自检。接口不可用时任务仍可回退软件实现。
-设为 `false` 时，在网络 worker 内同步执行后端请求，不创建加密执行线程。
+每个网络 worker 使用独立的加密上下文，同步执行后端请求。后端会话在首个
+符合条件的请求到来时打开并自检，接口或算法不可用时回退软件实现。
 
-- `workers: 4`、`crypto_backend: "auto"`、`crypto_async: true`：4 个网络
-  worker（包含主线程）加 4 个加密执行线程，前提是总连接额度不少于 4。
-- `workers: 4`、`crypto_backend: "auto"`、`crypto_async: false`：4 个网络
-  worker，无额外加密线程。
-- 恢复原有单线程运行：`workers: 1`、`crypto_backend: "off"`；此时
-  `crypto_async` 不生效，也不创建额外线程。
+`workers: 4`、`crypto_backend: "auto"` 使用 4 个网络 worker（包含主线程），
+前提是总连接额度不少于 4。`workers: 1` 时由主线程运行单个事件循环。
+Vision direct 流量绕过外层 TLS record 加密。
 
-`crypto_completed` 统计异步任务完成数（含软件回退），`crypto_kernel` 统计成功的
-内核接口操作，`crypto_fallback` / `crypto_badmac` 分别统计回退和认证失败。
-内核操作计数不能证明实际硬件使用率。
+`crypto_kernel` 统计成功的内核接口操作，`crypto_fallback` / `crypto_badmac`
+分别统计回退和认证失败。内核操作计数不能证明实际硬件使用率。
 
 ### 完整 REALITY 配置示例
 
@@ -236,8 +229,7 @@ ZRAY_CRYPTO_BACKEND=afalg zray /path/to/config.json
   "stats_interval_s": 60,
   "crypto_backend": "off",
   "crypto_min_bytes": 4096,
-  "crypto_max_bytes": 32768,
-  "crypto_async": true
+  "crypto_max_bytes": 32768
 }
 ```
 

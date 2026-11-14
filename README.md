@@ -161,7 +161,6 @@ inner connection presents.
 | `crypto_backend` | `"off"` | Kernel AES-GCM backend: off / auto / afalg / devcrypto. auto tries devcrypto, then AF_ALG, then software. |
 | `crypto_min_bytes` | `4096` | Inclusive minimum AEAD plaintext size in bytes; requests below this stay in software. |
 | `crypto_max_bytes` | `32768` | Inclusive maximum AEAD plaintext size in bytes; requests above this stay in software. |
-| `crypto_async` | `true` | When kernel crypto is enabled, use one crypto executor per network worker; false executes synchronously. |
 
 All runtime controls above belong at the **top level** of the configuration JSON,
 alongside `listen` and `max_connections`, including when using multiple outbounds.
@@ -227,32 +226,26 @@ Missing interfaces, unavailable algorithms or backend failures fall back to
 software. Authentication failures reject the record. Kernel completion counters
 (`crypto_kernel`) do not establish hardware use or a performance improvement.
 
-#### Async crypto and worker counts
+#### Crypto and worker counts
 
-`crypto_async` defaults to **true**. When kernel crypto is explicitly enabled on
-Linux, each network worker gets one crypto executor; otherwise none is created.
-Set it to **false** to perform backend requests synchronously in the network
-worker. Backend sessions are opened and checked lazily on the first eligible key.
-An executor may fall back to software if the interface or algorithm is unavailable.
+Each network worker executes backend requests synchronously using its own crypto
+context. Backend sessions are opened and checked lazily on the first eligible
+key. Requests fall back to software if the interface or algorithm is unavailable.
 
-For four network workers with async backend requests, merge:
+For four network workers with kernel crypto enabled, merge:
 
 ```json
 {
   "workers": 4,
   "crypto_backend": "auto",
   "crypto_min_bytes": 4096,
-  "crypto_max_bytes": 32768,
-  "crypto_async": true
+  "crypto_max_bytes": 32768
 }
 ```
 
-This creates four network workers (including the main thread) and four crypto
-executors, subject to the connection-budget limit on network worker count. With
-`"workers": 1, "crypto_backend": "off"`, the main thread runs the original single
-event loop and neither kind of additional thread is created. Async processing
-pauses the affected connection until its record completes; it does not split a
-record across cores. Vision direct traffic bypasses outer TLS record encryption.
+This creates four network workers (including the main thread), subject to the
+connection-budget limit. With `"workers": 1`, the main thread runs a single event
+loop. Vision direct traffic bypasses outer TLS record encryption.
 
 ### Vision direct splice
 
@@ -449,7 +442,6 @@ src/
     sys.zig           thin syscall wrappers (sockets, epoll, SO_ORIGINAL_DST)
     conn.zig          per-connection state machine and relay
     kernel_crypto.zig generic AF_ALG and devcrypto AES-GCM backends
-    crypto.zig        bounded asynchronous TLS record executor
 deploy/               OpenWrt procd script and config template
 tools/udptest.py      SOCKS5 UDP ASSOCIATE smoke test
 tools/httptest.py     Offline mixed-inbound TLS/VLESS integration test
