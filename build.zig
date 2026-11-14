@@ -3,7 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const dynamic = b.option(bool, "dynamic", "Dynamically link the system C library") orelse false;
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .small });
+    // `--release` defaults to ReleaseSmall (routers have small flash);
+    // `-Doptimize=fast` overrides it for targets with room to spare.
+    const optimize = b.option(
+        std.builtin.Optimize,
+        "optimize",
+        "Override the optimization mode (default: small with --release, debug otherwise)",
+    ) orelse b.standardOptimizeOption(.{ .preferred_optimize_mode = .small });
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

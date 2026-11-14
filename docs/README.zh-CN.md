@@ -67,11 +67,11 @@ zig build --release                              # 本机二进制 -> zig-out/bi
 
 # 交叉编译到路由器
 zig build --release -Dtarget=mipsel-linux-musl -Dcpu=mips32r2+soft_float -p zig-out/mipsel
-zig build --release -Dtarget=aarch64-linux-musl -p zig-out/aarch64
-zig build --release -Dtarget=x86_64-linux-musl  -p zig-out/x86_64
+zig build --release -Doptimize=fast -Dtarget=aarch64-linux-musl -p zig-out/aarch64
+zig build --release -Doptimize=fast -Dtarget=x86_64-linux-musl  -p zig-out/x86_64
 ```
 
-`--release` 对应 `ReleaseSmall`。代理服务只在 Linux 上运行；下面的 probe
+`--release` 对应 `ReleaseSmall`；加 `-Doptimize=fast` 改为 `ReleaseFast`，用户态加解密（ws / 非 Vision 的 TLS）快 2–3 倍，代价是体积更大。发布包中 aarch64 和 x86_64 使用 `ReleaseFast`，mips 和 armv7 使用 `ReleaseSmall`。代理服务只在 Linux 上运行；下面的 probe
 可在任何平台运行。
 
 默认静态构建（`-Ddynamic=false`）。传入 `-Ddynamic=true` 可改为动态链接
