@@ -387,6 +387,10 @@ time, relay ~110 ms away). CPU is zray's own CPU time per MB transferred.
 
 ## Deploying on OpenWrt
 
+OpenWrt users can use [luci-app-zray](https://github.com/altman08/luci-app-zray),
+a PassWall-based LuCI plugin with zray support, to configure and manage zray
+through the web interface.
+
 See [deploy/](deploy/) for a procd init script and a config template.
 
 ```sh
