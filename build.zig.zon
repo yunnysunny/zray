@@ -1,6 +1,6 @@
 .{
     .name = .zray,
-    .version = "0.4.0",
+    .version = "0.5.0",
     .fingerprint = 0x278cb0a4344ca084,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

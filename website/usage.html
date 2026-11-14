@@ -582,8 +582,8 @@ sysctl -p /etc/sysctl.d/99-zray.conf</code></pre>
       <h2><span lang="zh">从 v0.3 升级</span><span lang="en">Upgrading from v0.3</span></h2>
     </div>
     <div class="doc">
-      <p><span lang="zh">0.4.0 新增：VLESS WebSocket 传输（<code>network: "ws"</code>）、出站链式（<code>dialer</code>）、按域名后缀分流（<code>rules</code> / <code>default</code>）、组内故障切换（<code>fail_backoff_s</code>）、单次连接硬超时（<code>connect_timeout_s</code>）。升级只需要换二进制：</span>
-      <span lang="en">0.4.0 adds the VLESS WebSocket transport (<code>network: "ws"</code>), outbound chaining (<code>dialer</code>), domain-suffix routing (<code>rules</code> / <code>default</code>), in-group failover (<code>fail_backoff_s</code>) and a hard per-attempt deadline (<code>connect_timeout_s</code>). Upgrading is a binary swap:</span></p>
+      <p><span lang="zh">0.5.0 在同一监听端口支持 SOCKS5 与 HTTP 代理，可通过 <code>workers</code> 配置网络工作线程，并提供可选的内核 AES-GCM 加密后端和动态 libc 链接构建。同时改进了 Vision 转发，并修复 TLS 密钥更新、连接关闭和旧内核随机数获取等兼容性问题。升级只需要换二进制：</span>
+      <span lang="en">0.5.0 supports SOCKS5 and HTTP proxy traffic on the same listener, configurable network workers via <code>workers</code>, optional kernel AES-GCM backends and dynamic libc builds. It also improves Vision forwarding and fixes TLS key updates, connection shutdown and random-number generation on older kernels. Upgrading is a binary swap:</span></p>
       <div class="code">
         <div class="code-bar">
           <span>OpenWrt</span>
@@ -659,7 +659,7 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 
 <footer class="site">
   <div class="wrap">
-    <span>zray <span class="tag">v0.4.0</span></span>
+    <span>zray <span class="tag">v0.5.0</span></span>
     <span><span lang="zh">Zig 0.17.0 · 静态 musl · MIT</span><span lang="en">Zig 0.17.0 · static musl · MIT</span></span>
     <a class="spacer" href="index.html"><span lang="zh">返回官网</span><span lang="en">Back to site</span></a>
     <a href="https://github.com/yunnysunny/zray">GitHub</a>
