@@ -318,6 +318,9 @@ backoff 时，每条连接只探测一次，失败即断开。最多 16 个节�
 
 ## 部署到 OpenWrt
 
+OpenWrt 用户可以使用 [luci-app-zray](https://github.com/altman08/luci-app-zray)，
+这是基于 PassWall、支持 zray 的 LuCI 插件，可通过 Web 界面配置和管理 zray。
+
 [deploy/](../deploy/) 下有 procd init 脚本和配置模板。
 
 ```sh
