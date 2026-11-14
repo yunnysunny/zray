@@ -100,6 +100,30 @@ a larger binary. Release builds use `ReleaseFast` for aarch64 and x86_64 and
 `ReleaseSmall` for mips and armv7. The proxy service is Linux-only; the probe
 below runs anywhere.
 
+The aarch64 and x86_64 releases also come in a hardware-crypto flavour, which
+uses the CPU's AES / carry-less multiply instructions for TLS and is several
+times faster on encrypted traffic. It crashes with `Illegal instruction` on a
+CPU without them, so check `/proc/cpuinfo` first:
+
+| binary | use when | typical CPUs |
+|---|---|---|
+| `zray-aarch64-crypto` | `Features` lists `aes pmull sha2` | Amlogic S905/S912, Rockchip RK3328/RK3399, most ARMv8 boxes |
+| `zray-aarch64` | otherwise | Raspberry Pi 4 (BCM2711) |
+| `zray-x86_64-aes` | `flags` lists `sse4_2 popcnt aes pclmulqdq avx` | Intel N100/N200/N305, Core i3/i5/i7 (2nd gen+), AMD GX-412 (APU2), Ryzen/EPYC |
+| `zray-x86_64` | otherwise | Intel J4125, N5105, J3455, J1900 (no AVX), Core 2 |
+
+```sh
+grep -m1 -o -w -E 'aes|pmull|sha2' /proc/cpuinfo | sort -u                  # ARM
+grep -m1 -o -w -E 'sse4_2|popcnt|aes|pclmulqdq|avx' /proc/cpuinfo | sort -u    # x86
+```
+
+To build them yourself:
+
+```sh
+zig build --release -Doptimize=fast -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53+aes+sha2 -p zig-out/aarch64-crypto
+zig build --release -Doptimize=fast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v2+aes+pclmul+avx -p zig-out/x86_64-aes
+```
+
 Builds are static by default (`-Ddynamic=false`). Pass `-Ddynamic=true` to
 dynamically link the target system's C library instead; the option also
 applies to `run`, `probe`, and `test`:

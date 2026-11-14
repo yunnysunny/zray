@@ -74,6 +74,27 @@ zig build --release -Doptimize=fast -Dtarget=x86_64-linux-musl  -p zig-out/x86_6
 `--release` 对应 `ReleaseSmall`；加 `-Doptimize=fast` 改为 `ReleaseFast`，用户态加解密（ws / 非 Vision 的 TLS）快 2–3 倍，代价是体积更大。发布包中 aarch64 和 x86_64 使用 `ReleaseFast`，mips 和 armv7 使用 `ReleaseSmall`。代理服务只在 Linux 上运行；下面的 probe
 可在任何平台运行。
 
+aarch64 和 x86_64 另外提供硬件加密版本，TLS 使用 CPU 的 AES / 无进位乘法指令，加密流量快数倍。在不支持这些指令的 CPU 上会直接以 `Illegal instruction` 崩溃，下载前先看 `/proc/cpuinfo`：
+
+| 二进制 | 适用条件 | 典型 CPU |
+|---|---|---|
+| `zray-aarch64-crypto` | `Features` 含 `aes pmull sha2` | Amlogic S905/S912、瑞芯微 RK3328/RK3399、大多数 ARMv8 盒子 |
+| `zray-aarch64` | 其他情况 | 树莓派 4（BCM2711） |
+| `zray-x86_64-aes` | `flags` 含 `sse4_2 popcnt aes pclmulqdq avx` | Intel N100/N200/N305、二代及以后酷睿，AMD GX-412（APU2）、锐龙/EPYC |
+| `zray-x86_64` | 其他情况 | Intel J4125、N5105、J3455、J1900（无 AVX）、Core 2 |
+
+```sh
+grep -m1 -o -w -E 'aes|pmull|sha2' /proc/cpuinfo | sort -u                  # ARM
+grep -m1 -o -w -E 'sse4_2|popcnt|aes|pclmulqdq|avx' /proc/cpuinfo | sort -u    # x86
+```
+
+自行构建：
+
+```sh
+zig build --release -Doptimize=fast -Dtarget=aarch64-linux-musl -Dcpu=cortex_a53+aes+sha2 -p zig-out/aarch64-crypto
+zig build --release -Doptimize=fast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v2+aes+pclmul+avx -p zig-out/x86_64-aes
+```
+
 默认静态构建（`-Ddynamic=false`）。传入 `-Ddynamic=true` 可改为动态链接
 目标系统的 C 标准库；该选项也适用于 `run`、`probe` 和 `test`：
 

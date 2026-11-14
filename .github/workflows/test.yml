@@ -49,11 +49,20 @@ jobs:
           - name: mipsel-softfloat
             target: mipsel-linux-musl
             cpu: mips32r2+soft_float
+            optimize: small
             qemu: qemu-mipsel
           - name: mips-softfloat
             target: mips-linux-musl
             cpu: mips32r2+soft_float
+            optimize: small
             qemu: qemu-mips
+          # Exercises the hardware AES/PMULL code paths (qemu-user's default
+          # cpu "max" implements the ARMv8 Crypto Extension).
+          - name: aarch64-crypto
+            target: aarch64-linux-musl
+            cpu: cortex_a53+aes+sha2
+            optimize: fast
+            qemu: qemu-aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -70,7 +79,7 @@ jobs:
       - name: unit tests under qemu
         run: zig build test --summary all -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -fqemu
 
-      - name: startup smoke test under qemu (ReleaseSmall, the shipped build)
+      - name: startup smoke test under qemu (Release-${{ matrix.optimize }}, the shipped build)
         run: |
-          zig build --release -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -p out
+          zig build --release -Doptimize=${{ matrix.optimize }} -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }} -p out
           sh .github/scripts/smoke.sh out/bin/zray ${{ matrix.qemu }}

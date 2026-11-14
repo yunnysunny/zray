@@ -29,6 +29,12 @@ jobs:
             target: aarch64-linux-musl
             cpu: baseline
             optimize: fast
+          # Hardware AES/PMULL/SHA2 (ARMv8 Crypto Extension): most ARMv8
+          # boxes (Amlogic S905/S912, RK3328/3399...). Not the Raspberry Pi 4.
+          - name: aarch64-crypto
+            target: aarch64-linux-musl
+            cpu: cortex_a53+aes+sha2
+            optimize: fast
           - name: arm-v7
             target: arm-linux-musleabihf
             cpu: generic+v7a
@@ -36,6 +42,13 @@ jobs:
           - name: x86_64
             target: x86_64-linux-musl
             cpu: baseline
+            optimize: fast
+          # AES-NI + PCLMUL. Zig's std only uses them together with AVX, so
+          # this needs Sandy Bridge / Jaguar (APU2) / Zen / N100 or newer;
+          # Atom-class J4125, N5105, J3455 have no AVX and stay on x86_64.
+          - name: x86_64-aes
+            target: x86_64-linux-musl
+            cpu: x86_64_v2+aes+pclmul+avx
             optimize: fast
     steps:
       - uses: actions/checkout@v4
