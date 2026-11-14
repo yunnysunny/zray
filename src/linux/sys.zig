@@ -324,8 +324,31 @@ pub fn randomBytes(buf: []u8) void {
     var off: usize = 0;
     while (off < buf.len) {
         const rc = linux.getrandom(buf[off..].ptr, buf.len - off, 0);
-        if (linux.errno(rc) != .SUCCESS) continue;
-        off += rc;
+        switch (linux.errno(rc)) {
+            .SUCCESS => off += rc,
+            .INTR, .AGAIN => continue,
+            // getrandom(2) is Linux >= 3.17; older kernels (e.g. Android 7 on 3.14).
+            else => return urandomBytes(buf[off..]),
+        }
+    }
+}
+
+fn urandomBytes(buf: []u8) void {
+    const fd_rc = linux.open("/dev/urandom", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) @panic("no getrandom and no /dev/urandom");
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+    var off: usize = 0;
+    while (off < buf.len) {
+        const rc = linux.read(fd, buf[off..].ptr, buf.len - off);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) @panic("/dev/urandom EOF");
+                off += rc;
+            },
+            .INTR, .AGAIN => continue,
+            else => @panic("/dev/urandom read failed"),
+        }
     }
 }
 
