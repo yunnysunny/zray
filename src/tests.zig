@@ -11,11 +11,14 @@ comptime {
     _ = @import("proxy/vless.zig");
     _ = @import("proxy/vision.zig");
     _ = @import("proxy/socks5.zig");
+    _ = @import("proxy/http.zig");
     _ = @import("proxy/mux.zig");
     _ = @import("proxy/sniff.zig");
     _ = @import("proxy/dns.zig");
     _ = @import("proxy/ws.zig");
     _ = @import("linux/conn.zig");
+    _ = @import("linux/kernel_crypto.zig");
+    _ = @import("linux/crypto.zig");
     _ = @import("tls/fingerprint.zig");
     _ = @import("main.zig");
 }

@@ -35,40 +35,89 @@ pub const State = struct {
     cipher: u16 = 0,
     remaining_server_hello: i32 = -1,
 
+    upload_inspector: Inspector = .{},
+    download_inspector: Inspector = .{},
+
     pub fn init(uuid: [16]u8) State {
         return .{ .uuid = uuid };
     }
+};
 
-    /// XtlsFilterTls for one buffer.
-    pub fn filter(s: *State, b: []const u8) void {
-        s.packets_to_filter -= 1;
-        if (b.len >= 6) {
-            if (b[0] == 0x16 and b[1] == 0x03 and b[2] == 0x03 and b[5] == 0x02) {
-                s.remaining_server_hello = (@as(i32, b[3]) << 8 | b[4]) + 5;
-                s.is_tls12_or_above = true;
-                s.is_tls = true;
-                if (b.len >= 79 and s.remaining_server_hello >= 79) {
-                    const sid_len: usize = b[43];
-                    if (b.len >= 43 + sid_len + 3) {
-                        s.cipher = mem.readInt(u16, b[43 + sid_len + 1 ..][0..2], .big);
-                    }
-                }
-            } else if (b[0] == 0x16 and b[1] == 0x03 and b[5] == 0x01) {
-                s.is_tls = true;
-            }
+/// Observe whole TLS records rather than spending the classification budget
+/// on arbitrary TCP reads. Each direction has its own parser. Only a bounded
+/// prefix of plaintext handshake records is retained; application data is
+/// skipped without copying. Oversized/unknown hellos retain outer encryption.
+const Inspector = struct {
+    header: [5]u8 = undefined,
+    used: usize = 0,
+    remaining: usize = 0,
+    body: [2048]u8 = undefined,
+    body_len: usize = 0,
+    invalid: bool = false,
+
+    fn feed(p: *Inspector, state: *State, data: []const u8) void {
+        if (p.invalid) {
+            state.packets_to_filter -= 1;
+            return;
         }
-        if (s.remaining_server_hello > 0) {
-            const end: usize = @min(@as(usize, @intCast(s.remaining_server_hello)), b.len);
-            s.remaining_server_hello -= @intCast(b.len);
-            if (mem.indexOf(u8, b[0..end], &tls13_supported_versions) != null) {
-                switch (s.cipher) {
-                    0x1301, 0x1302, 0x1303, 0x1304 => s.enable_xtls = true,
-                    else => {}, // 0x1305 (CCM_8) and unknown: no direct copy
+        var pos: usize = 0;
+        while (pos < data.len and state.packets_to_filter > 0) {
+            if (p.used < 5) {
+                const n = @min(5 - p.used, data.len - pos);
+                @memcpy(p.header[p.used..][0..n], data[pos..][0..n]);
+                p.used += n;
+                pos += n;
+                if (p.header[0] < 0x14 or p.header[0] > 0x17 or
+                    (p.used >= 2 and p.header[1] != 3) or (p.used >= 3 and p.header[2] > 3))
+                {
+                    p.invalid = true;
+                    state.packets_to_filter -= 1;
+                    return;
                 }
-                s.packets_to_filter = 0;
-            } else if (s.remaining_server_hello <= 0) {
-                s.packets_to_filter = 0; // TLS 1.2
+                if (p.used < 5) return;
+                const h = p.header;
+                if (h[0] < 0x14 or h[0] > 0x17 or h[1] != 3 or h[2] > 3) {
+                    p.invalid = true;
+                    state.packets_to_filter -= 1;
+                    return;
+                }
+                p.remaining = mem.readInt(u16, h[3..5], .big);
+                if (p.remaining > 18432) {
+                    p.invalid = true;
+                    return;
+                }
+                p.body_len = 0;
             }
+            const n = @min(p.remaining, data.len - pos);
+            if (p.header[0] == 0x16) {
+                const keep = @min(n, p.body.len - p.body_len);
+                @memcpy(p.body[p.body_len..][0..keep], data[pos..][0..keep]);
+                p.body_len += keep;
+            }
+            p.remaining -= n;
+            pos += n;
+            if (p.remaining > 0) return;
+            state.packets_to_filter -= 1;
+            if (p.header[0] == 0x16 and p.body_len > 0) {
+                const body = p.body[0..p.body_len];
+                if (body[0] == 1) state.is_tls = true;
+                if (body[0] == 2) {
+                    state.is_tls = true;
+                    state.is_tls12_or_above = true;
+                    if (body.len >= 41) {
+                        const sid: usize = body[38];
+                        if (body.len >= 41 + sid) state.cipher = mem.readInt(u16, body[39 + sid ..][0..2], .big);
+                    }
+                    if (mem.indexOf(u8, body, &tls13_supported_versions) != null) {
+                        state.enable_xtls = switch (state.cipher) {
+                            0x1301, 0x1302, 0x1303, 0x1304 => true,
+                            else => false,
+                        };
+                    }
+                    state.packets_to_filter = 0;
+                }
+            }
+            p.used = 0;
         }
     }
 };
@@ -86,6 +135,54 @@ pub fn isCompleteRecord(b: []const u8) bool {
     return true;
 }
 
+/// Track record boundaries without retaining payloads. TCP reads are not TLS
+/// records: a 16 KiB record routinely spans several 8 KiB client reads.
+pub const RecordBoundary = struct {
+    header: [5]u8 = undefined,
+    used: usize = 0,
+    remaining: usize = 0,
+    valid: bool = true,
+
+    /// True only when this read ends exactly at an application-data boundary
+    /// and starts in (or at the header of) application data. Never switch in
+    /// the middle of a record, even if ciphertext contains a TLS-like header.
+    pub fn feed(s: *RecordBoundary, data: []const u8) bool {
+        if (!s.valid or data.len == 0) return false;
+        const starts_app = if (s.used > 0 or s.remaining > 0) s.header[0] == 0x17 else data[0] == 0x17;
+        var pos: usize = 0;
+        var last_app = false;
+        while (pos < data.len) {
+            if (s.remaining > 0) {
+                const n = @min(s.remaining, data.len - pos);
+                s.remaining -= n;
+                pos += n;
+                if (s.remaining == 0) {
+                    last_app = s.header[0] == 0x17;
+                    s.used = 0;
+                }
+                continue;
+            }
+            const n = @min(5 - s.used, data.len - pos);
+            @memcpy(s.header[s.used..][0..n], data[pos..][0..n]);
+            pos += n;
+            s.used += n;
+            if (s.used < 5) break;
+            const h = s.header;
+            const len = mem.readInt(u16, h[3..5], .big);
+            if (h[0] < 0x14 or h[0] > 0x17 or h[1] != 3 or h[2] > 3 or len > 18432) {
+                s.valid = false;
+                return false;
+            }
+            s.remaining = len;
+            if (len == 0) {
+                last_app = h[0] == 0x17;
+                s.used = 0;
+            }
+        }
+        return starts_app and last_app and s.used == 0 and s.remaining == 0;
+    }
+};
+
 /// Uplink: wraps payloads in padding blocks until the switch condition.
 pub const Padder = struct {
     state: *State,
@@ -95,6 +192,7 @@ pub const Padder = struct {
     /// Set once a `direct` block has been produced. The caller must send that
     /// output through the outer TLS, then write all later payloads raw.
     direct: bool = false,
+    boundary: RecordBoundary = .{},
 
     pub fn init(state: *State, rand: std.Random) Padder {
         return .{ .state = state, .rand = rand };
@@ -111,7 +209,7 @@ pub const Padder = struct {
             @memcpy(out[0..payload.len], payload);
             return out[0..payload.len];
         }
-        if (p.state.packets_to_filter > 0) p.state.filter(payload);
+        if (p.state.packets_to_filter > 0) p.state.upload_inspector.feed(p.state, payload);
 
         // ReshapeMultiBuffer: split oversized payloads into two pieces.
         var pieces: [2][]const u8 = .{ payload, &.{} };
@@ -125,7 +223,7 @@ pub const Padder = struct {
             n_pieces = 2;
         }
 
-        const complete = isCompleteRecord(payload);
+        const complete = p.boundary.feed(payload);
         var long_padding = p.state.is_tls;
         var w: usize = 0;
         for (pieces[0..n_pieces], 0..) |b, i| {
@@ -137,12 +235,12 @@ pub const Padder = struct {
                 w += b.len;
                 continue;
             }
-            if (p.state.is_tls and b.len >= 6 and b[0] == 0x17 and b[1] == 0x03 and b[2] == 0x03 and complete) {
-                if (p.state.enable_xtls) p.direct = true;
+            if (p.state.is_tls and complete) {
+                if (last and p.state.enable_xtls) p.direct = true;
                 var cmd: Command = .cont;
                 if (last) cmd = if (p.state.enable_xtls) .direct else .end;
                 w += try p.block(b, cmd, true, out[w..]);
-                p.is_padding = false;
+                if (last) p.is_padding = false;
                 long_padding = false;
                 continue;
             } else if (!p.state.is_tls12_or_above and p.state.packets_to_filter <= 1) {
@@ -225,7 +323,7 @@ pub const Unpadder = struct {
                 u.direct = true;
             }
         }
-        if (u.state.packets_to_filter > 0 and content.len > 0) u.state.filter(content);
+        if (u.state.packets_to_filter > 0 and content.len > 0) u.state.download_inspector.feed(u.state, content);
         return content;
     }
 
@@ -436,4 +534,87 @@ test "isCompleteRecord" {
     try testing.expect(!isCompleteRecord(&.{ 0x17, 3, 3, 0, 2, 0xaa }));
     try testing.expect(!isCompleteRecord(&.{ 0x14, 3, 3, 0, 1, 1 }));
     try testing.expect(isCompleteRecord(&.{}));
+}
+
+test "record boundary survives every split of a large TLS record" {
+    var record_bytes: [16405]u8 = @splat(0xab);
+    record_bytes[0..5].* = .{ 0x17, 3, 3, 0x40, 0x10 };
+    for (1..record_bytes.len) |split| {
+        var tracker: RecordBoundary = .{};
+        try testing.expect(!tracker.feed(record_bytes[0..split]));
+        try testing.expect(tracker.feed(record_bytes[split..]));
+    }
+    var tracker: RecordBoundary = .{};
+    for (record_bytes[0 .. record_bytes.len - 1]) |b| {
+        try testing.expect(!tracker.feed(&.{b}));
+    }
+    try testing.expect(tracker.feed(record_bytes[record_bytes.len - 1 ..]));
+}
+
+test "fragmented upload switches only after a complete padding command" {
+    const uuid: [16]u8 = @splat(0x42);
+    var st = State.init(uuid);
+    st.is_tls = true;
+    st.is_tls12_or_above = true;
+    st.enable_xtls = true;
+    st.packets_to_filter = 0;
+    var pad = Padder.init(&st, fixedRandom());
+    var peer = State.init(uuid);
+    var unpad = Unpadder.init(&peer);
+    var bytes: [16405]u8 = @splat(0xab);
+    bytes[0..5].* = .{ 0x17, 3, 3, 0x40, 0x10 };
+    var buffer: [8192 + 2 * max_overhead]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(offset + 8192, bytes.len);
+        const wire = try pad.pad(bytes[offset..end], &buffer);
+        const got = unpad.feed(wire);
+        try testing.expectEqualSlices(u8, bytes[offset..end], got);
+        try testing.expectEqual(end == bytes.len, pad.direct);
+        try testing.expectEqual(end == bytes.len, unpad.direct);
+        offset = end;
+    }
+}
+
+test "reshaped complete app record sends direct command in final block" {
+    const uuid: [16]u8 = @splat(0x29);
+    var st = State.init(uuid);
+    st.is_tls = true;
+    st.is_tls12_or_above = true;
+    st.enable_xtls = true;
+    st.packets_to_filter = 0;
+    var pad = Padder.init(&st, fixedRandom());
+    var peer = State.init(uuid);
+    var unpad = Unpadder.init(&peer);
+    var bytes: [8192]u8 = @splat(0xab);
+    bytes[0..5].* = .{ 0x17, 3, 3, 0x1f, 0xfb };
+    var buffer: [8192 + 2 * max_overhead]u8 = undefined;
+    const wire = try pad.pad(&bytes, &buffer);
+    try testing.expectEqualSlices(u8, &bytes, unpad.feed(wire));
+    try testing.expect(pad.direct and unpad.direct);
+}
+
+test "one-byte fragmented hellos preserve classification budget and enable Vision" {
+    var st = State.init(@splat(0));
+    var ch: [100]u8 = @splat(0);
+    ch[0..6].* = .{ 0x16, 3, 1, 0, 95, 1 };
+    for (ch) |b| st.upload_inspector.feed(&st, &.{b});
+    try testing.expect(st.is_tls);
+    try testing.expectEqual(@as(i32, 7), st.packets_to_filter);
+    var sh: [120]u8 = @splat(0);
+    sh[0..6].* = .{ 0x16, 3, 3, 0, 115, 2 };
+    sh[43] = 32;
+    sh[76..78].* = .{ 0x13, 1 };
+    sh[90..96].* = tls13_supported_versions;
+    for (sh) |b| st.download_inspector.feed(&st, &.{b});
+    try testing.expect(st.enable_xtls);
+    try testing.expectEqual(@as(u16, 0x1301), st.cipher);
+    try testing.expectEqual(@as(i32, 0), st.packets_to_filter);
+}
+
+test "coalesced record with trailing partial header cannot switch early" {
+    var boundary: RecordBoundary = .{};
+    const bytes = [_]u8{ 0x17, 3, 3, 0, 1, 0xaa, 0x17, 3 };
+    try testing.expect(!boundary.feed(&bytes));
+    try testing.expect(boundary.feed(&.{ 3, 0, 1, 0xbb }));
 }

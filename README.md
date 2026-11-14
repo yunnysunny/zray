@@ -7,7 +7,7 @@ A minimal [REALITY](https://github.com/XTLS/REALITY) client (VLESS +
 beyond the Zig standard library.
 
 It is built for the kind of box that has one or two slow cores, ~100 MB of
-RAM and no FPU: a single thread, an `epoll` loop, and a fixed pool of
+RAM and no FPU: one network worker by default, configurable `epoll` workers, and a fixed pool of
 connection slots allocated up front. Memory use is decided at startup and does
 not grow with traffic.
 
@@ -51,7 +51,8 @@ by `net.core.rmem_max`.
   key share. JA4 `_b` and `_c` segments match current Chrome.
 - **VLESS + XTLS Vision**: padding state machine, switch to direct copy once
   the inner TLS 1.3 handshake is seen, so bulk traffic is not double-encrypted.
-- **Inbounds**: SOCKS5 (CONNECT and UDP ASSOCIATE) and transparent
+- **Inbounds**: mixed SOCKS5 (CONNECT and UDP ASSOCIATE) / HTTP proxy
+  (CONNECT tunnels and plain HTTP/1.x forward requests) on one port, and transparent
   netfilter `REDIRECT` with `SO_ORIGINAL_DST`.
 - **UDP** over XUDP (VLESS mux), full-cone, as xray does for Vision.
 - **Zero-latency sniffing**: TLS SNI and HTTP `Host` are read from the first
@@ -80,8 +81,8 @@ it), TPROXY, SOCKS5 UDP fragmentation.
 ## Building
 
 Requires Zig 0.17.0. Prebuilt binaries for mipsel / mips / aarch64 / armv7 /
-x86_64 (all static musl) are attached to each tagged release; CI builds every
-push (see .github/workflows/).
+x86_64 (all static, with no libc dependency) are attached to each tagged
+release; CI builds every push (see .github/workflows/).
 
 ```sh
 zig build test                                   # unit tests (host)
@@ -95,6 +96,22 @@ zig build --release -Dtarget=x86_64-linux-musl  -p zig-out/x86_64
 
 `--release` uses `ReleaseSmall`. The proxy service is Linux-only; the probe
 below runs anywhere.
+
+Builds are static by default (`-Ddynamic=false`). Pass `-Ddynamic=true` to
+dynamically link the target system's C library instead; the option also
+applies to `run`, `probe`, and `test`:
+
+```sh
+zig build --release -Ddynamic=true
+zig build test -Ddynamic=true
+# OpenWrt: reuse the router's musl shared library
+zig build --release -Dtarget=mipsel-linux-musleabi -Dcpu=mips32r2+soft_float -Ddynamic=true -p zig-out/mipsel-dynamic
+```
+
+Dynamic binaries require a matching libc and dynamic loader on the target
+device, including the same architecture and floating-point ABI.
+For MIPS musl dynamic builds, use `musleabi` for soft-float or `musleabihf`
+for hard-float.
 
 ### Probe
 
@@ -122,7 +139,7 @@ inner connection presents.
 
 | key | default | meaning |
 |---|---|---|
-| `listen` | `127.0.0.1:1080` | SOCKS5 inbound. `""` disables it. |
+| `listen` | `127.0.0.1:1080` | Mixed SOCKS5 / HTTP proxy inbound (automatic detection). `""` disables it. |
 | `redirect` | `""` | Transparent inbound for `REDIRECT` rules. `""` disables it. At least one of `listen` / `redirect` must be set. |
 | `sniff` | `true` | Replace the destination IP with the TLS SNI / HTTP Host when present. |
 | `server` | ? | Upstream server hostname or IP (REALITY or plain TLS). Resolved once at startup. |
@@ -135,14 +152,117 @@ inner connection presents.
 | `tls_verify` | ? | `security = "tls"` only, and then mandatory. Only `"none"` (no certificate verification, like `allowInsecure`) is implemented; `"ca"` and `"pin"` are reserved and rejected for now. |
 | `uuid` | ? | VLESS user id. |
 | `max_connections` | `128` | Connection slots. Each slot is ~92 KiB, allocated at startup. |
-| `handshake_timeout_s` | `15` | Inbound side: SOCKS5 handshake / waiting for the client before an upstream is chosen. |
+| `handshake_timeout_s` | `15` | Inbound side: SOCKS5 / HTTP handshake / waiting for the client before an upstream is chosen. |
 | `connect_timeout_s` | `5` | Hard deadline for one upstream attempt (TCP connect, hop SOCKS, TLS, WS upgrade), not extended by traffic. On expiry the next group member is tried. |
 | `idle_timeout_s` | `600` | Close a relay with no traffic in either direction. |
 | `sock_buf` | `0` | `SO_SNDBUF` / `SO_RCVBUF` per socket; `0` leaves kernel defaults. |
+| `stats_interval_s` | `60` | Periodic statistics interval in seconds; 0 disables periodic statistics. |
+| `workers` | `1` | Network workers: 1 keeps the original single loop; 0 selects automatically (up to 4); 2..16 requests a count, capped by max_connections. |
+| `crypto_backend` | `"off"` | Kernel AES-GCM backend: off / auto / afalg / devcrypto. auto tries devcrypto, then AF_ALG, then software. |
+| `crypto_min_bytes` | `4096` | Inclusive minimum AEAD plaintext size in bytes; requests below this stay in software. |
+| `crypto_max_bytes` | `32768` | Inclusive maximum AEAD plaintext size in bytes; requests above this stay in software. |
+| `crypto_async` | `true` | When kernel crypto is enabled, use one crypto executor per network worker; false executes synchronously. |
+
+All runtime controls above belong at the **top level** of the configuration JSON,
+alongside `listen` and `max_connections`, including when using multiple outbounds.
+Do not put them inside an outbound object. Omitted controls use the listed defaults.
+Edit the file passed to `zray /path/to/config.json`, then restart the process.
+The supplied OpenWrt init script reads `/mnt/zray/config.json`; after editing that
+file, run `/etc/init.d/zray restart`. JSON does not allow comments.
 
 The REALITY server checks the client's clock (timestamp inside the sealed
 `session_id`). A router whose time is not synced will fail every handshake
 with `CertificateRejected`.
+
+### Network workers
+
+Merge these options into the top level of your existing JSON configuration:
+
+```json
+{
+  "workers": 1
+}
+```
+
+`workers` defaults to **1**, keeping the original single event loop on the main
+thread. Set `workers` to **0** to select automatically (at most four CPUs), or
+**2..16** to request that many network workers. The actual count cannot exceed
+`max_connections`, which remains the total connection budget for the process and
+is divided among worker pools. Extra workers handle concurrent connections;
+one TCP connection is not split across network workers. Changes require restart.
+
+### Kernel crypto backends
+
+Kernel crypto is optional and defaults to **off**. Merge these top-level settings
+into your existing configuration (node credentials and routing are still needed):
+
+```json
+{
+  "workers": 1,
+  "crypto_backend": "off",
+  "crypto_min_bytes": 4096,
+  "crypto_max_bytes": 32768
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `crypto_backend` | `"off"` | `off`: software only; `afalg`: AF_ALG; `devcrypto`: `/dev/crypto`; `auto`: try devcrypto, then AF_ALG, then software. |
+| `crypto_min_bytes` | `4096` | Inclusive minimum AEAD plaintext size sent to the backend. |
+| `crypto_max_bytes` | `32768` | Inclusive maximum AEAD plaintext size sent to the backend. |
+
+For example, `"crypto_backend": "auto", "crypto_min_bytes": 8192` opts in only for
+records of at least 8192 bytes. Bounds must satisfy
+`1 <= crypto_min_bytes <= crypto_max_bytes <= 32768`; invalid values fail startup.
+Lengths include TLS inner content, its content-type byte and padding, and exclude
+the record header, authentication tag and AAD. Records are not combined to reach
+the threshold; a minimum above the record size keeps that record in software.
+
+`ZRAY_CRYPTO_BACKEND` overrides the JSON mode and accepts the same four values.
+Changes require restart. AES-128/256-GCM is supported; ChaCha20 stays in software.
+AF_ALG requests `gcm(aes)` and devcrypto requests AES-GCM; the kernel selects the
+implementation, with no board or driver-name restriction. Interface availability
+and per-key encryption/decryption/tag self-tests determine whether it can be used.
+Missing interfaces, unavailable algorithms or backend failures fall back to
+software. Authentication failures reject the record. Kernel completion counters
+(`crypto_kernel`) do not establish hardware use or a performance improvement.
+
+#### Async crypto and worker counts
+
+`crypto_async` defaults to **true**. When kernel crypto is explicitly enabled on
+Linux, each network worker gets one crypto executor; otherwise none is created.
+Set it to **false** to perform backend requests synchronously in the network
+worker. Backend sessions are opened and checked lazily on the first eligible key.
+An executor may fall back to software if the interface or algorithm is unavailable.
+
+For four network workers with async backend requests, merge:
+
+```json
+{
+  "workers": 4,
+  "crypto_backend": "auto",
+  "crypto_min_bytes": 4096,
+  "crypto_max_bytes": 32768,
+  "crypto_async": true
+}
+```
+
+This creates four network workers (including the main thread) and four crypto
+executors, subject to the connection-budget limit on network worker count. With
+`"workers": 1, "crypto_backend": "off"`, the main thread runs the original single
+event loop and neither kind of additional thread is created. Async processing
+pauses the affected connection until its record completes; it does not split a
+record across cores. Vision direct traffic bypasses outer TLS record encryption.
+
+### Vision direct splice
+
+Vision direct automatically uses splice in each eligible direction through
+`socket -> kernel pipe -> socket` after earlier buffers drain. There is no
+configuration switch. Unsupported source calls or pipe allocation failure fall
+back to ordinary forwarding before consuming source data. The payload bypasses
+user buffers; the process still handles readiness and backpressure. Inner TLS
+protection remains in place. Remove any old `splice` field from your JSON config;
+unknown fields are rejected at startup.
 
 ### Plain VLESS + TLS (no REALITY)
 
@@ -322,17 +442,55 @@ src/
     vision.zig        XTLS Vision padding state machine
     mux.zig           XUDP (Mux.Cool) frames
     socks5.zig        SOCKS5 greeting / CONNECT / UDP ASSOCIATE
+    http.zig          HTTP CONNECT / forward request parsing and body framing
     sniff.zig         TLS SNI and HTTP Host extraction
     ws.zig            WebSocket client framing (VLESS `ws` transport)
   linux/
     sys.zig           thin syscall wrappers (sockets, epoll, SO_ORIGINAL_DST)
     conn.zig          per-connection state machine and relay
+    kernel_crypto.zig generic AF_ALG and devcrypto AES-GCM backends
+    crypto.zig        bounded asynchronous TLS record executor
 deploy/               OpenWrt procd script and config template
 tools/udptest.py      SOCKS5 UDP ASSOCIATE smoke test
+tools/httptest.py     Offline mixed-inbound TLS/VLESS integration test
 ```
 
 Everything in `tls/` and `proxy/` is sans-I/O and unit tested
 (`zig build test`); `linux/` is the only part that touches sockets.
+
+### HTTP proxy inbound
+
+`listen` accepts SOCKS5 and HTTP automatically; existing configurations need no
+changes. For example, with `"listen": "127.0.0.1:1080"`:
+
+```sh
+curl --proxy http://127.0.0.1:1080 http://example.com/
+curl --proxy http://127.0.0.1:1080 https://example.com/
+curl --proxy socks5h://127.0.0.1:1080 https://example.com/
+```
+
+HTTP CONNECT accepts domain, IPv4 and bracketed IPv6 targets, including bytes
+sent immediately after the request headers. Plain HTTP supports HTTP/1.0 and
+HTTP/1.1 absolute URLs, Content-Length and chunked streaming uploads. The URL
+authority determines the destination and outgoing Host header; proxy credentials
+and hop-by-hop request headers are removed. HTTP targets use existing routing
+and outbounds without SNI/Host overriding the explicit destination.
+
+Plain HTTP uses one request per connection and sends `Connection: close` to the
+origin. HTTP keep-alive/pipelining and Upgrade are not supported; HTTPS uses
+CONNECT. Request headers are limited to 8 KiB (including the rewritten head),
+chunk-size/trailer lines to 1 KiB and total trailers to 8 KiB. Malformed headers
+return 400, unsupported request forms return 501 and oversized headers return
+431. Like the existing SOCKS5 inbound, HTTP has no authentication.
+
+Run the offline integration test after building (Python 3.8+ with TLS 1.3 support
+and the `openssl` command are required):
+
+```sh
+zig build test --summary all
+zig build
+python3 tools/httptest.py zig-out/bin/zray
+```
 
 ## Status and known limits
 
@@ -347,3 +505,5 @@ Everything in `tls/` and `proxy/` is sans-I/O and unit tested
 ## License
 
 [MIT](LICENSE).
+
+Relay performance controls and measurement: [docs/performance.md](docs/performance.md).

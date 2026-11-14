@@ -159,6 +159,8 @@ const Schedule = union(enum) {
 
 pub const Client = struct {
     state: State = .start,
+    write_closed: bool = false,
+    read_closed: bool = false,
     opts: Options,
 
     x25519: X25519.KeyPair,
@@ -261,6 +263,7 @@ pub const Client = struct {
     /// Process one complete record (`rec` = header + body, decrypted in
     /// place). `out` receives anything that must be sent back.
     pub fn handleRecord(c: *Client, rec: []u8, out: []u8) Error!Result {
+        if (c.read_closed) return error.InvalidState;
         switch (c.state) {
             .start, .closed, .failed => return error.InvalidState,
             else => {},
@@ -310,15 +313,16 @@ pub const Client = struct {
 
     /// Encrypt application data into a record. Connected state only.
     pub fn encrypt(c: *Client, data: []const u8, out: []u8) Error![]u8 {
-        if (c.state != .connected) return error.InvalidState;
+        if (c.state != .connected or c.write_closed) return error.InvalidState;
         return c.write.?.seal(.application_data, data, out);
     }
 
-    /// Produce a close_notify alert record and move to `closed`.
+    /// Produce close_notify and close writing; peer input remains readable.
     pub fn close(c: *Client, out: []u8) Error![]u8 {
-        if (c.state != .connected) return error.InvalidState;
+        if (c.state != .connected or c.write_closed) return error.InvalidState;
         const rec = try c.write.?.seal(.alert, &tls.close_notify_alert, out);
-        c.state = .closed;
+        c.write_closed = true;
+        if (c.read_closed) c.state = .closed;
         return rec;
     }
 
@@ -329,7 +333,8 @@ pub const Client = struct {
         const alert: tls.Alert = .{ .level = @fromBackingInt(body[0]), .description = @fromBackingInt(body[1]) };
         c.last_alert = alert;
         if (alert.description == .close_notify) {
-            c.state = .closed;
+            c.read_closed = true;
+            if (c.write_closed) c.state = .closed;
             return .{ .event = .close_notify };
         }
         if (alert.level == .warning and alert.description == .user_canceled) return .{ .event = .warning_alert };
@@ -444,12 +449,25 @@ pub const Client = struct {
     }
 
     fn installKeys(c: *Client, comptime KS: type, client_secret: KS.Secret, server_secret: KS.Secret) void {
+        c.installWriteKey(KS, client_secret);
+        c.installReadKey(KS, server_secret);
+    }
+
+    fn installWriteKey(c: *Client, comptime KS: type, secret: KS.Secret) void {
         switch (c.suite) {
             inline else => |s| {
                 const Aead = record.Suite.Aead(s);
-                const ck = KS.trafficKeys(Aead, client_secret);
-                const sk = KS.trafficKeys(Aead, server_secret);
+                const ck = KS.trafficKeys(Aead, secret);
                 c.write = record.Cipher.init(s, &ck.key, &ck.iv);
+            },
+        }
+    }
+
+    fn installReadKey(c: *Client, comptime KS: type, secret: KS.Secret) void {
+        switch (c.suite) {
+            inline else => |s| {
+                const Aead = record.Suite.Aead(s);
+                const sk = KS.trafficKeys(Aead, secret);
                 c.read = record.Cipher.init(s, &sk.key, &sk.iv);
             },
         }
@@ -540,10 +558,13 @@ pub const Client = struct {
                         sent = try c.write.?.seal(.handshake, &reply, out);
                         const next_client = KS.nextTrafficSecret(c.client_ap_secret[0..KS.digest_length].*);
                         @memcpy(c.client_ap_secret[0..KS.digest_length], &next_client);
+                        c.installWriteKey(KS, next_client);
                     },
                     _ => return error.IllegalParameter,
                 }
-                c.installKeys(KS, c.client_ap_secret[0..KS.digest_length].*, c.server_ap_secret[0..KS.digest_length].*);
+                // A sequence resets only with a new key. Reinstalling the
+                // unchanged write key for update_not_requested reuses nonces.
+                c.installReadKey(KS, next_server);
             },
         }
         return sent;
@@ -612,6 +633,12 @@ test "RFC 8448 full handshake reproduces client records byte-for-byte" {
 
     const alert = try c.close(&out);
     try testing.expectEqualSlices(u8, &rfc8448.client_alert_record, alert);
+    try testing.expect(c.write_closed);
+    try testing.expectEqual(State.connected, c.state);
+    try testing.expectError(error.InvalidState, c.encrypt(&payload, &out));
+    var server_alert = rfc8448.server_alert_record;
+    const r5 = try c.handleRecord(&server_alert, &out);
+    try testing.expectEqual(Event.close_notify, r5.event);
     try testing.expectEqual(State.closed, c.state);
 }
 
@@ -703,6 +730,73 @@ test "flight split across records and interleaved CCS" {
         }
     }
     try testing.expectEqual(State.connected, c.state);
+}
+
+test "KeyUpdate preserves independent traffic keys and sequences for every suite" {
+    inline for (.{ record.Suite.aes_128_gcm_sha256, record.Suite.aes_256_gcm_sha384, record.Suite.chacha20_poly1305_sha256 }) |suite| {
+        const KS = if (suite == .aes_256_gcm_sha384) ks.Sha384 else ks.Sha256;
+        const Aead = record.Suite.Aead(suite);
+        var hs_buf: [128]u8 = undefined;
+        var c = Client.init(.{
+            .entropy = @splat(0),
+            .verifier = Verifier.insecure,
+            .handshake_buf = &hs_buf,
+        });
+        c.state = .connected;
+        c.suite = suite;
+        c.sched = if (suite == .aes_256_gcm_sha384)
+            .{ .sha384 = ks.Sha384.init() }
+        else
+            .{ .sha256 = ks.Sha256.init() };
+
+        var client_secret: KS.Secret = @splat(0x31);
+        var server_secret: KS.Secret = @splat(0x72);
+        @memcpy(c.client_ap_secret[0..KS.digest_length], &client_secret);
+        @memcpy(c.server_ap_secret[0..KS.digest_length], &server_secret);
+        c.installKeys(KS, client_secret, server_secret);
+
+        const ck = KS.trafficKeys(Aead, client_secret);
+        const sk = KS.trafficKeys(Aead, server_secret);
+        var srv_r = record.Cipher.init(suite, &ck.key, &ck.iv);
+        var srv_w = record.Cipher.init(suite, &sk.key, &sk.iv);
+        var out: [256]u8 = undefined;
+        var wire: [256]u8 = undefined;
+
+        // Start with traffic in flight, then update only the server twice
+        // before requesting a client update. The peer retains its read state
+        // until it receives our authenticated KeyUpdate reply.
+        const first = try c.encrypt("ping", &out);
+        try testing.expectEqualSlices(u8, "ping", (try srv_r.open(first)).data);
+        for ([_]u8{ 0, 0, 1 }) |request| {
+            const write_seq = c.write.?.seq();
+            const ku = [_]u8{ 0x18, 0, 0, 1, request };
+            const rec = try srv_w.seal(.handshake, &ku, &wire);
+            const res = try c.handleRecord(rec, &out);
+            if (request == 0) {
+                try testing.expectEqual(@as(usize, 0), res.to_send.len);
+                try testing.expectEqual(write_seq, c.write.?.seq());
+                try testing.expectEqualSlices(u8, &client_secret, c.client_ap_secret[0..KS.digest_length]);
+            } else {
+                // Reply must use the existing key AND its current sequence.
+                const reply = try srv_r.open(out[0..res.to_send.len]);
+                try testing.expectEqualSlices(u8, &.{ 0x18, 0, 0, 1, 0 }, reply.data);
+                client_secret = KS.nextTrafficSecret(client_secret);
+                const next_ck = KS.trafficKeys(Aead, client_secret);
+                srv_r = record.Cipher.init(suite, &next_ck.key, &next_ck.iv);
+                try testing.expectEqual(@as(u64, 0), c.write.?.seq());
+            }
+            server_secret = KS.nextTrafficSecret(server_secret);
+            const next_sk = KS.trafficKeys(Aead, server_secret);
+            srv_w = record.Cipher.init(suite, &next_sk.key, &next_sk.iv);
+
+            // Both peers must still agree on keys and nonces in each direction.
+            const app = try c.encrypt("ping", &out);
+            try testing.expectEqualSlices(u8, "ping", (try srv_r.open(app)).data);
+            const pong = try srv_w.seal(.application_data, "pong", &wire);
+            const received = try c.handleRecord(pong, &out);
+            try testing.expectEqualSlices(u8, "pong", received.app_data);
+        }
+    }
 }
 
 test "KeyUpdate with update_requested rolls both directions" {

@@ -2,7 +2,7 @@
 //!
 //!   zray [config.json]      (default: ./config.json)
 //!
-//! Linux only; single thread; epoll; fixed memory (connection pool sized by
+//! Linux only; per-worker epoll loops; fixed memory (connection pool sized by
 //! `max_connections`).
 
 const std = @import("std");
@@ -60,7 +60,7 @@ const FileConfig = struct {
     /// Tags for traffic no rule matches; default: the first outbound.
     default: []const []const u8 = &.{},
     fail_backoff_s: u64 = 30,
-    /// SOCKS5 inbound; empty string disables it.
+    /// Mixed SOCKS5 / HTTP inbound; empty string disables it.
     listen: []const u8 = "127.0.0.1:1080",
     /// Transparent inbound for netfilter REDIRECT (iptables -j REDIRECT /
     /// nft redirect to); empty string disables it.
@@ -96,6 +96,13 @@ const FileConfig = struct {
     idle_timeout_s: u64 = 600,
     connect_timeout_s: u64 = 5,
     sock_buf: i32 = 0,
+    /// 0 selects up to four cores. max_connections remains the total budget.
+    workers: u16 = 1,
+    stats_interval_s: u64 = 60,
+    crypto_backend: @import("linux/kernel_crypto.zig").Policy = .off,
+    crypto_min_bytes: u32 = 4096,
+    crypto_max_bytes: u32 = 32768,
+    crypto_async: bool = true,
 };
 
 const Upstream = union(enum) {
@@ -199,6 +206,18 @@ fn linuxMain(init: std.process.Init) !void {
         sys.log("bad config: use either top-level server/uuid or outbounds, not both", .{});
         return error.BadConfig;
     }
+    if (parsed.max_connections == 0 or parsed.workers > 16) {
+        sys.log("bad config: max_connections must be >= 1 and workers <= 16", .{});
+        return error.BadConfig;
+    }
+    const limits: @import("linux/kernel_crypto.zig").Limits = .{
+        .min_bytes = parsed.crypto_min_bytes,
+        .max_bytes = parsed.crypto_max_bytes,
+    };
+    if (!limits.valid()) {
+        sys.log("bad config: require 1 <= crypto_min_bytes <= crypto_max_bytes <= 32768", .{});
+        return error.BadConfig;
+    }
     if (parsed.connect_timeout_s == 0) {
         sys.log("bad config: connect_timeout_s must be >= 1", .{});
         return error.BadConfig;
@@ -267,7 +286,11 @@ fn linuxMain(init: std.process.Init) !void {
     for (parsed.rules, 0..) |r, i| rules[i] = .{ .suffixes = r.domain_suffix, .group = try tagsToGroup(arena, node_cfgs, r.outbound) };
     const default_group: []const u8 = if (parsed.default.len > 0) try tagsToGroup(arena, node_cfgs, parsed.default) else &.{0};
 
+    const hop = @import("linux/hop.zig");
+    const hop_entries = try arena.alloc(hop.Registry.Entry, parsed.max_connections);
+    var hops = hop.Registry.init(hop_entries);
     const cfg: conn.Config = .{
+        .hops = &hops,
         .outbounds = obs,
         .rules = rules,
         .default_group = default_group,
@@ -277,6 +300,8 @@ fn linuxMain(init: std.process.Init) !void {
         .sock_buf = parsed.sock_buf,
         .sniff = parsed.sniff,
         .fail_backoff_s = parsed.fail_backoff_s,
+        .stats_interval_s = parsed.stats_interval_s,
+        .crypto_limits = limits,
     };
 
     if (parsed.listen.len == 0 and parsed.redirect.len == 0) {
@@ -284,20 +309,18 @@ fn linuxMain(init: std.process.Init) !void {
         return error.BadListen;
     }
     sys.ignoreSigpipe();
-    const ep = try sys.epollCreate();
-    const socks_token: u64 = std.math.maxInt(u64);
-    const redirect_token: u64 = std.math.maxInt(u64) - 1;
-    const hop_token_base: u64 = std.math.maxInt(u64) - 2;
     const socks_fd: ?sys.fd_t = if (parsed.listen.len > 0) try listenOn(parsed.listen) else null;
     const redirect_fd: ?sys.fd_t = if (parsed.redirect.len > 0) try listenOn(parsed.redirect) else null;
-    if (socks_fd) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, socks_token);
-    for (hop_fd, 0..) |h, i| if (h) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, hop_token_base - i);
-    if (redirect_fd) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, redirect_token);
-
-    const conns = try std.heap.page_allocator.alloc(conn.Conn, parsed.max_connections);
-    var loop = conn.Loop.init(ep, &cfg, conns);
-    sys.log("zray {s} socks5 [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} slots x {d} KiB = {d} KiB", .{
-        version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, (@sizeOf(conn.Conn) * parsed.max_connections) / 1024,
+    const worker_count = @min(parsed.max_connections, if (parsed.workers == 0) @min(@as(usize, 4), std.Thread.getCpuCount() catch 1) else @as(usize, parsed.workers));
+    const policy = if (init.environ_map.get("ZRAY_CRYPTO_BACKEND")) |value|
+        std.meta.stringToEnum(@import("linux/kernel_crypto.zig").Policy, value) orelse return error.BadCryptoBackend
+    else
+        parsed.crypto_backend;
+    const crypto_fds = @import("linux/kernel_crypto.zig").fdReserve(policy, worker_count);
+    const event_fds = if (policy != .off and parsed.crypto_async) 2 * worker_count else 0;
+    @import("linux/fd_budget.zig").configure(parsed.max_connections, worker_count, crypto_fds + event_fds);
+    sys.log("zray {s} socks5/http [{s}] redirect [{s}] sniff {}, {d} outbounds, {d} rules, {d} total slots x {d} KiB, {d} workers, splice enabled, crypto_backend {s} bytes={d}..{d} async {}", .{
+        version, parsed.listen, parsed.redirect, parsed.sniff, obs.len, rules.len, parsed.max_connections, @sizeOf(conn.Conn) / 1024, worker_count, @tagName(policy), limits.min_bytes, limits.max_bytes, parsed.crypto_async,
     });
     for (obs, node_cfgs) |ob, oc| {
         // Keep the "mode ..." phrases: the startup smoke test matches them,
@@ -328,38 +351,147 @@ fn linuxMain(init: std.process.Init) !void {
         }
     }
 
-    var events: [64]sys.Event = undefined;
-    var last_sweep = sys.monotonicSeconds();
-    while (true) {
-        const n = sys.epollWait(ep, &events, 1000) catch |e| {
-            sys.log("epoll_wait: {s}", .{@errorName(e)});
-            continue;
+    const worker_list = try arena.alloc(Worker, worker_count);
+    for (worker_list, 0..) |*worker, i| {
+        worker.* = .{
+            .id = i,
+            .cfg = &cfg,
+            .capacity = parsed.max_connections / worker_count + @intFromBool(i < parsed.max_connections % worker_count),
+            .socks_fd = socks_fd,
+            .redirect_fd = redirect_fd,
+            .hop_fd = hop_fd,
+            .policy = policy,
+            .async_crypto = parsed.crypto_async,
         };
-        for (events[0..n]) |ev| {
-            if (ev.data.u64 == socks_token or ev.data.u64 == redirect_token) {
-                const is_socks = ev.data.u64 == socks_token;
-                const lfd = if (is_socks) socks_fd.? else redirect_fd.?;
-                while (true) {
-                    const fd = sys.accept(lfd) catch break;
-                    loop.accept(fd, if (is_socks) .socks5 else .redirect, null);
+    }
+    // All config and listener initialization is complete before publication.
+    for (worker_list[1..]) |*worker| worker.thread = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    worker_list[0].run();
+}
+
+const Worker = struct {
+    id: usize,
+    cfg: *const @import("linux/conn.zig").Config,
+    capacity: usize,
+    socks_fd: ?@import("linux/sys.zig").fd_t,
+    redirect_fd: ?@import("linux/sys.zig").fd_t,
+    hop_fd: [@import("linux/conn.zig").max_outbounds]?@import("linux/sys.zig").fd_t,
+    policy: @import("linux/kernel_crypto.zig").Policy,
+    async_crypto: bool,
+    thread: ?std.Thread = null,
+
+    const socks_token = std.math.maxInt(u64);
+    const redirect_token = std.math.maxInt(u64) - 1;
+    const crypto_token = std.math.maxInt(u64) - 2;
+    const hop_token_base = std.math.maxInt(u64) - 3;
+
+    fn listeners(w: *Worker, ep: @import("linux/sys.zig").fd_t, add: bool) !void {
+        const sys = @import("linux/sys.zig");
+        if (w.socks_fd) |fd| try listener(ep, fd, socks_token, add);
+        if (w.redirect_fd) |fd| try listener(ep, fd, redirect_token, add);
+        for (w.hop_fd, 0..) |h, i| if (h) |fd| try listener(ep, fd, hop_token_base - @as(u64, i), add);
+        _ = sys;
+    }
+    fn listener(ep: @import("linux/sys.zig").fd_t, fd: @import("linux/sys.zig").fd_t, token: u64, add: bool) !void {
+        const sys = @import("linux/sys.zig");
+        if (!add) return sys.epollDel(ep, fd);
+        // One shared accept queue; EXCLUSIVE wakes a worker with free slots.
+        sys.epollAdd(ep, fd, sys.EPOLL.IN | sys.EPOLL.EXCLUSIVE, token) catch try sys.epollAdd(ep, fd, sys.EPOLL.IN, token);
+    }
+    fn run(w: *Worker) void {
+        w.serve() catch |err| {
+            @import("linux/sys.zig").log("worker {d} failed: {s}", .{ w.id, @errorName(err) });
+            // A missing worker must not leave a silently degraded service.
+            std.process.exit(1);
+        };
+    }
+    fn serve(w: *Worker) !void {
+        const sys = @import("linux/sys.zig");
+        const conn = @import("linux/conn.zig");
+        const kernel_crypto = @import("linux/kernel_crypto.zig");
+        const crypto = @import("linux/crypto.zig");
+        const allocator = std.heap.page_allocator;
+        const ep = try sys.epollCreate();
+        defer sys.close(ep);
+        const conns = try allocator.alloc(conn.Conn, w.capacity);
+        defer allocator.free(conns);
+        var loop = conn.Loop.init(ep, w.cfg, conns);
+        loop.worker_id = w.id;
+        var backend = kernel_crypto.Context.init(w.policy);
+        backend.limits = w.cfg.crypto_limits;
+        defer backend.deinit();
+        var executor: ?crypto.Executor = null;
+        if (backend.enabled and w.async_crypto) {
+            executor = try crypto.Executor.init(allocator, w.capacity, w.policy);
+            executor.?.backend.limits = w.cfg.crypto_limits;
+            try executor.?.start();
+            loop.attachCrypto(&executor.?);
+            try sys.epollAdd(ep, executor.?.completed_fd, sys.EPOLL.IN, crypto_token);
+        } else if (backend.enabled) kernel_crypto.current = &backend;
+        defer {
+            if (executor) |*ex| ex.stop(allocator);
+            kernel_crypto.current = null;
+        }
+        sys.log("worker {d}: {d} slots, kernel crypto enabled {}", .{ w.id, w.capacity, backend.enabled });
+        var registered = false;
+        var events: [64]sys.Event = undefined;
+        var last_sweep = sys.monotonicSeconds();
+        var last_stats = last_sweep;
+        while (true) {
+            const have_space = loop.active < conns.len;
+            if (have_space != registered) {
+                try w.listeners(ep, have_space);
+                registered = have_space;
+            }
+            const n = try sys.epollWait(ep, &events, 1000);
+            for (events[0..n]) |ev| {
+                const token = ev.data.u64;
+                if (token == crypto_token) {
+                    loop.cryptoCompleted();
+                    continue;
                 }
-            } else if (ev.data.u64 > hop_token_base - conn.max_outbounds and ev.data.u64 <= hop_token_base) {
-                const i: u8 = @intCast(hop_token_base - ev.data.u64);
-                while (true) {
-                    const fd = sys.accept(hop_fd[i].?) catch break;
-                    loop.accept(fd, .socks5, i);
+                var listen_fd: ?sys.fd_t = null;
+                var forced: ?u8 = null;
+                var inbound: conn.Inbound = .socks5;
+                if (token == socks_token) listen_fd = w.socks_fd else if (token == redirect_token) {
+                    listen_fd = w.redirect_fd;
+                    inbound = .redirect;
+                } else if (token <= hop_token_base and token > hop_token_base - conn.max_outbounds) {
+                    forced = @intCast(hop_token_base - token);
+                    listen_fd = w.hop_fd[forced.?];
+                } else {
+                    loop.handle(token, ev.events);
+                    continue;
                 }
-            } else {
-                loop.handle(ev.data.u64, ev.events);
+                if (listen_fd) |fd| {
+                    // Never accept a socket into a full worker while another
+                    // worker may have room. A full pool stops accepting.
+                    while (loop.active < conns.len) {
+                        const accepted = sys.accept(fd) catch break;
+                        loop.accept(accepted, inbound, forced);
+                    }
+                }
+            }
+            const now = sys.monotonicSeconds();
+            if (now != last_sweep) {
+                last_sweep = now;
+                loop.sweep();
+            }
+            if (w.cfg.stats_interval_s > 0 and now - last_stats >= w.cfg.stats_interval_s) {
+                const c = sys.counters;
+                const kernel_ops = if (executor) |*ex| ex.backend_ops.load(.monotonic) else @as(usize, @truncate(backend.backend_ops));
+                const fallbacks = if (executor) |*ex| ex.fallbacks.load(.monotonic) else @as(usize, @truncate(backend.fallbacks));
+                const badmac = if (executor) |*ex| ex.auth_failures.load(.monotonic) else @as(usize, @truncate(backend.auth_failures));
+                const completed = if (executor) |*ex| ex.completed else @as(u64, 0);
+                sys.log("stats w{d} active={d}/{d} read={d} write={d} epoll_wait={d} epoll_mod={d} splice_calls={d} splice_bytes={d} crypto_completed={d} crypto_kernel={d} crypto_fallback={d} crypto_badmac={d}", .{
+                    w.id,      loop.active, conns.len, c.reads, c.writes, c.epoll_waits, c.epoll_mods, c.splice_calls, c.splice_bytes,
+                    completed, kernel_ops,  fallbacks, badmac,
+                });
+                last_stats = now;
             }
         }
-        const now = sys.monotonicSeconds();
-        if (now != last_sweep) {
-            last_sweep = now;
-            loop.sweep();
-        }
     }
-}
+};
 
 fn tagIndex(nodes: []const OutboundConfig, tag: []const u8) ?u8 {
     for (nodes, 0..) |n, i| if (std.mem.eql(u8, n.tag, tag)) return @intCast(i);
@@ -524,4 +656,26 @@ test "config json: enums parse from strings, unknown keys are rejected" {
     try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(FileConfig, a,
         \\{"server":"x","uuid":"u","security":"plain"}
     , .{}));
+}
+
+test "worker configuration preserves single-worker defaults" {
+    const defaults: FileConfig = .{};
+    try std.testing.expectEqual(@as(u16, 1), defaults.workers);
+    const parsed = try std.json.parseFromSlice(FileConfig, std.testing.allocator, "{\"workers\":0}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 0), parsed.value.workers);
+}
+
+test "kernel crypto defaults off and payload limits parse from config" {
+    const defaults: FileConfig = .{};
+    try std.testing.expectEqual(@import("linux/kernel_crypto.zig").Policy.off, defaults.crypto_backend);
+    try std.testing.expectEqual(@as(u32, 4096), defaults.crypto_min_bytes);
+    try std.testing.expectEqual(@as(u32, 32768), defaults.crypto_max_bytes);
+    const parsed = try std.json.parseFromSlice(FileConfig, std.testing.allocator,
+        \\{"crypto_backend":"afalg","crypto_min_bytes":8192,"crypto_max_bytes":16384}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@import("linux/kernel_crypto.zig").Policy.afalg, parsed.value.crypto_backend);
+    try std.testing.expectEqual(@as(u32, 8192), parsed.value.crypto_min_bytes);
+    try std.testing.expectEqual(@as(u32, 16384), parsed.value.crypto_max_bytes);
 }

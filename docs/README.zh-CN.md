@@ -5,8 +5,8 @@
 面向家用路由器的最小 [REALITY](https://github.com/XTLS/REALITY) 客户端
 （VLESS + `xtls-rprx-vision`），用 Zig 编写，除 Zig 标准库外没有任何依赖。
 
-它针对的是这样的设备：一两个慢核心、约 100 MB 内存、没有 FPU。单线程、
-`epoll` 事件循环、启动时一次性分配固定数量的连接槽位。内存占用在启动时就
+它针对的是这样的设备：一两个慢核心、约 100 MB 内存、没有 FPU。默认单线程、
+可配置多个 `epoll` 网络 worker、启动时一次性分配固定数量的连接槽位。内存占用在启动时就
 确定，不随流量增长。
 
 参考部署：小米 AC2100（MT7621，MIPS 1004Kc，软浮点，ImmortalWrt 23.05）——
@@ -58,7 +58,7 @@ AES-GCM 的上限约 1.5 MB/s，这正是 Vision 的 direct 直拷在这类设�
 ## 构建
 
 需要 Zig 0.17.0。每个 tag 发布都附带 mipsel / mips / aarch64 / armv7 / x86_64
-的预编译二进制（全部静态 musl）；CI 对每次 push 都会构建（见
+的预编译二进制（全部静态，不依赖 libc）；CI 对每次 push 都会构建（见
 .github/workflows/）。
 
 ```sh
@@ -73,6 +73,19 @@ zig build --release -Dtarget=x86_64-linux-musl  -p zig-out/x86_64
 
 `--release` 对应 `ReleaseSmall`。代理服务只在 Linux 上运行；下面的 probe
 可在任何平台运行。
+
+默认静态构建（`-Ddynamic=false`）。传入 `-Ddynamic=true` 可改为动态链接
+目标系统的 C 标准库；该选项也适用于 `run`、`probe` 和 `test`：
+
+```sh
+zig build --release -Ddynamic=true
+zig build test -Ddynamic=true
+# OpenWrt：复用路由器上的 musl 共享库
+zig build --release -Dtarget=mipsel-linux-musleabi -Dcpu=mips32r2+soft_float -Ddynamic=true -p zig-out/mipsel-dynamic
+```
+
+动态版要求目标设备提供匹配的 libc 和动态加载器，包括相同的架构与软硬浮点 ABI。
+MIPS musl 动态构建的软浮点 ABI 使用 `musleabi`，硬浮点使用 `musleabihf`。
 
 ### Probe
 
@@ -115,9 +128,118 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `connect_timeout_s` | `5` | 单次上游尝试（TCP 连接、hop SOCKS、TLS、WS 升级）的硬时限，有流量也不延长；超时即换组内下一个成员。 |
 | `idle_timeout_s` | `600` | 双向都无流量多久后关闭。 |
 | `sock_buf` | `0` | 每个 socket 的 `SO_SNDBUF` / `SO_RCVBUF`；`0` 用内核默认。 |
+| `stats_interval_s` | `60` | 统计输出间隔，单位秒；0 关闭定期统计。 |
+| `workers` | `1` | 网络 worker 数：1 保持原有单事件循环；0 自动选择、最多 4 个；2..16 指定数量，实际不超过 max_connections。 |
+| `crypto_backend` | `"off"` | 内核 AES-GCM 后端：off / auto / afalg / devcrypto；auto 依次尝试 devcrypto、AF_ALG、软件实现。 |
+| `crypto_min_bytes` | `4096` | 提交后端的 AEAD 明文字节数下限，含该值；小于该值时使用软件实现。 |
+| `crypto_max_bytes` | `32768` | 提交后端的 AEAD 明文字节数上限，含该值；大于该值时使用软件实现。 |
+| `crypto_async` | `true` | 启用内核加密时，每个网络 worker 使用一个加密执行线程；false 在网络 worker 内同步执行。 |
+
+上述运行参数全部写在配置 JSON 的**最外层**，与 `listen`、`max_connections`
+同级；使用多节点时也不要写进 `outbounds` 的节点对象。省略字段即采用表中默认值。
+修改实际启动命令使用的文件后，需要重启进程才生效。
+
+直接运行：`zray /path/to/config.json`。仓库的 OpenWrt init 脚本读取
+`/mnt/zray/config.json`；按该方式部署时修改此文件，然后执行
+`/etc/init.d/zray restart`。JSON 不支持注释，布尔值使用 `true` / `false`。
 
 REALITY 服务端会校验客户端时钟（封在 `session_id` 里的时间戳）。路由器时间
 没同步时所有握手都会以 `CertificateRejected` 失败。
+
+### 多核与转发配置
+
+`workers` 是网络事件循环数。默认 `1` 在主线程运行原有的单事件循环；
+设为 `0` 时自动选择、最多 4 个；设为 `2` 到 `16` 时指定数量，实际数量
+不超过 `max_connections`。例如四核机器可以设置 `"workers": 4`。
+`max_connections` 始终是整个进程的连接总额度，不会乘以 worker 数。
+每条连接归属于一个 worker，多核用于处理并发连接，不会把一条 TCP 流拆给多个核心。
+
+splice 默认启用，无需配置开关。在对应方向进入 Vision direct 且旧缓冲区排空后，
+通过 `socket → 内核 pipe → socket` 转发。源端不支持 splice 或 pipe 分配失败时，
+会在消费源数据之前自动回退普通转发。数据不进入用户缓冲区，进程仍负责 syscall、
+epoll、背压和关闭；内层 TLS 加密保留。已有配置中的 `splice` 字段请删除，
+否则会因未知字段导致启动报错。
+
+`stats_interval_s` 默认 `60`，可设为 `10` 每十秒查看一次累计统计，
+或设为 `0` 关闭定期统计。它不控制其他连接日志。
+
+### 内核加密后端与阈值
+
+`crypto_backend` 默认 `"off"`，不会调用内核加密接口。可选值：
+
+| 模式 | 行为 |
+|---|---|
+| `off` | 使用原有软件加密。 |
+| `afalg` | 使用 AF_ALG 的通用 `gcm(aes)` 算法。 |
+| `devcrypto` | 使用 `/dev/crypto` 的 AES-GCM 接口。 |
+| `auto` | 依次尝试 devcrypto、AF_ALG，不可用时回退软件实现。 |
+
+例如把 `"crypto_backend": "off"` 改为 `"crypto_backend": "auto"` 即可启用。
+支持 AES-128/256-GCM，ChaCha20 保持软件实现。具体实现由内核选择，接口成功
+不代表一定使用硬件，也不保证提速。每个新会话先校验加密、解密和错误标签处理；
+后端不可用时回退软件，认证标签失败则拒绝记录。
+
+`crypto_min_bytes` 和 `crypto_max_bytes` 分别是单个 AEAD 请求的明文字节数
+下限与上限，**两个边界都包含**。默认 `4096..32768`，必须满足
+`1 <= crypto_min_bytes <= crypto_max_bytes <= 32768`，否则启动报错。
+例如下限改为 `8192`，只有至少 8192 字节的请求才提交后端。
+计量包含 TLS 内层内容、content-type 字节和 padding，不包含 record 头、标签和 AAD。
+不会合并记录来凑阈值；下限高于实际 record 大小时，该记录继续使用软件实现。
+Vision direct 的大块数据不再经过外层 TLS 加密，因此这些阈值不作用于该直传数据。
+
+环境变量 `ZRAY_CRYPTO_BACKEND` 可覆盖 JSON 的模式，取值同上。例如：
+
+```sh
+ZRAY_CRYPTO_BACKEND=afalg zray /path/to/config.json
+```
+
+如果配置里设成 `off` 仍发现后端启用，检查启动环境是否设置了此变量。
+修改模式、阈值或 worker 数后都需要重启。
+
+### 异步加密线程与关闭方式
+
+`crypto_async` 默认 `true`。在 Linux 上显式启用 `crypto_backend` 后，每个
+网络 worker 创建一个额外的加密执行线程，后端会话在首个符合条件的请求到来时
+打开并自检。接口不可用时任务仍可回退软件实现。
+设为 `false` 时，在网络 worker 内同步执行后端请求，不创建加密执行线程。
+
+- `workers: 4`、`crypto_backend: "auto"`、`crypto_async: true`：4 个网络
+  worker（包含主线程）加 4 个加密执行线程，前提是总连接额度不少于 4。
+- `workers: 4`、`crypto_backend: "auto"`、`crypto_async: false`：4 个网络
+  worker，无额外加密线程。
+- 恢复原有单线程运行：`workers: 1`、`crypto_backend: "off"`；此时
+  `crypto_async` 不生效，也不创建额外线程。
+
+`crypto_completed` 统计异步任务完成数（含软件回退），`crypto_kernel` 统计成功的
+内核接口操作，`crypto_fallback` / `crypto_badmac` 分别统计回退和认证失败。
+内核操作计数不能证明实际硬件使用率。
+
+### 完整 REALITY 配置示例
+
+下面展示四个网络 worker 的完整配置。必须替换 `server`、`sni`、`public_key`、
+`uuid`，并按服务端设置填写 `short_id`；占位值不能直接用于连接。
+示例保持内核加密关闭；测试后端时把 `crypto_backend` 改为上述模式之一。
+
+```json
+{
+  "listen": "127.0.0.1:1080",
+  "server": "node.example.com",
+  "port": 443,
+  "sni": "example.com",
+  "security": "reality",
+  "public_key": "<填入服务端公钥，base64url>",
+  "short_id": "",
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "flow": "xtls-rprx-vision",
+  "max_connections": 64,
+  "workers": 4,
+  "stats_interval_s": 60,
+  "crypto_backend": "off",
+  "crypto_min_bytes": 4096,
+  "crypto_max_bytes": 32768,
+  "crypto_async": true
+}
+```
 
 ### 普通 VLESS + TLS（非 REALITY）
 
