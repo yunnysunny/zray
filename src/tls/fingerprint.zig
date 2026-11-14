@@ -166,7 +166,7 @@ pub const Chrome = struct {
 
     /// GREASE ECH (draft-ietf-tls-esni, ClientHelloOuter):
     /// type(0) | kdf 0x0001 | aead 0x0001 | config_id | enc<32> | payload<n>
-    /// with a random X25519-sized `enc` and a random payload of 144..240 bytes
+    /// with an ephemeral X25519 public key as `enc` and a random payload of 144..240 bytes
     /// in 32-byte steps, mirroring BoringSSL.
     fn buildEch(self: *Chrome, rand: std.Random, config_seed: u8) void {
         var n: usize = 0;
@@ -178,7 +178,13 @@ pub const Chrome = struct {
         n += 1;
         self.ech[n..][0..2].* = .{ 0, 32 };
         n += 2;
-        rand.bytes(self.ech[n..][0..32]);
+        // DHKEM(X25519) enc is the sender's ephemeral public key. Generating
+        // it has the same wire distribution as HPKE SetupSender; arbitrary
+        // random bytes (even with the high bit cleared) do not.
+        var ephemeral_secret: [32]u8 = undefined;
+        rand.bytes(&ephemeral_secret);
+        defer std.crypto.secureZero(u8, &ephemeral_secret);
+        self.ech[n..][0..32].* = std.crypto.dh.X25519.recoverPublicKey(ephemeral_secret);
         n += 32;
         const payload_len: usize = 144 + 32 * @as(usize, rand.uintLessThan(u8, 4));
         self.ech[n..][0..2].* = .{ 0, @intCast(payload_len) };
@@ -252,4 +258,23 @@ test "ml-kem profile" {
     try testing.expectEqual(@as(usize, 3), fp.key_shares_len);
     try testing.expect(fp.key_shares[1].group == .x25519_ml_kem768);
     try testing.expectEqual(@as(usize, ml_kem_key_share_len), fp.key_shares[1].public_key.len);
+}
+
+test "GREASE ECH enc is an X25519 public key matching a known vector" {
+    const vector = @import("testdata/rfc8448.zig");
+    const Source = struct {
+        fn fill(_: *@This(), bytes: []u8) void {
+            for (bytes, 0..) |*b, i| b.* = vector.client_priv[i % vector.client_priv.len];
+        }
+    };
+    var source: Source = .{};
+    var fp: Chrome = undefined;
+    fp.buildEch(std.Random.init(&source, Source.fill), 0x42);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 1, 0x42, 0, 32 }, fp.ech[0..8]);
+    // Comparing the whole known public key also rejects a "fix" that merely
+    // masks the high bit of random bytes instead of generating a key.
+    try testing.expectEqualSlices(u8, &vector.client_pub, fp.ech[8..40]);
+    const payload_len = std.mem.readInt(u16, fp.ech[40..42], .big);
+    try testing.expect(payload_len >= 144 and payload_len <= 240 and (payload_len - 144) % 32 == 0);
+    try testing.expectEqual(@as(usize, 42) + payload_len, fp.ech_len);
 }

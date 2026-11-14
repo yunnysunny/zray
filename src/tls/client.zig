@@ -100,7 +100,8 @@ pub const VerifyInput = struct {
 
 /// Called after the ClientHello is serialized and before it is hashed/sent.
 /// REALITY uses it to fill `enc.session_id`; `ecdh_secret` is the x25519
-/// private key whose public half is in the key_share extension.
+/// private key for the standalone X25519 share (REALITY prefers it over the
+/// hybrid share when both are present).
 pub const HelloHook = struct {
     ctx: ?*anyopaque = null,
     run: *const fn (ctx: ?*anyopaque, enc: hello.Encoded, ecdh_secret: *const [32]u8) void,
@@ -109,9 +110,10 @@ pub const HelloHook = struct {
 pub const Options = struct {
     /// 64 bytes of CSPRNG output: [0..32] ClientHello.random, [32..64] x25519 seed.
     entropy: [64]u8,
-    /// 64 more bytes of CSPRNG output to also offer X25519MLKEM768. Only the
-    /// seed is kept; the ML-KEM key pair is re-derived when the server picks it.
-    ml_kem_seed: ?[64]u8 = null,
+    /// Independent CSPRNG output for X25519MLKEM768: [0..64] ML-KEM seed,
+    /// [64..96] hybrid X25519 secret. Never reuse the standalone X25519 seed.
+    /// Only seeds are kept; the ML-KEM key pair is re-derived on selection.
+    hybrid_seed: ?[96]u8 = null,
     verifier: Verifier,
     /// Handshake reassembly buffer. Must hold the largest single handshake
     /// message (the Certificate chain); 8 KiB is plenty for REALITY's single
@@ -165,7 +167,7 @@ pub const Client = struct {
 
     x25519: X25519.KeyPair,
     /// X25519MLKEM768 key_share payload (ML-KEM-768 ek || x25519 pk), valid
-    /// when `opts.ml_kem_seed` is set.
+    /// when `opts.hybrid_seed` is set.
     ml_kem_share: [MLKem768.PublicKey.encoded_length + 32]u8 = undefined,
     session_id: [32]u8 = undefined,
     session_id_len: u8 = 0,
@@ -204,19 +206,19 @@ pub const Client = struct {
             .sched384 = ks.Sha384.init(),
             .reasm = handshake.Reassembler.init(opts.handshake_buf),
         };
-        if (opts.ml_kem_seed) |seed| {
+        if (opts.hybrid_seed) |seed| {
             // generateDeterministic only fails on a seed-derived non-canonical
             // key, which cannot happen for ML-KEM key generation.
-            const kp = MLKem768.KeyPair.generateDeterministic(seed) catch unreachable;
+            const kp = MLKem768.KeyPair.generateDeterministic(seed[0..64].*) catch unreachable;
             c.ml_kem_share[0..MLKem768.PublicKey.encoded_length].* = kp.public_key.toBytes();
-            c.ml_kem_share[MLKem768.PublicKey.encoded_length..].* = c.x25519.public_key;
+            c.ml_kem_share[MLKem768.PublicKey.encoded_length..].* = X25519.recoverPublicKey(seed[64..96].*);
         }
         return c;
     }
 
     /// X25519MLKEM768 key_share payload, or null if not offered.
     pub fn mlKemPublicKey(c: *const Client) ?[]const u8 {
-        return if (c.opts.ml_kem_seed != null) &c.ml_kem_share else null;
+        return if (c.opts.hybrid_seed != null) &c.ml_kem_share else null;
     }
 
     pub fn random(c: *const Client) *const [32]u8 {
@@ -416,13 +418,13 @@ pub const Client = struct {
             .x25519_ml_kem768 => {
                 // Server sends ML-KEM ciphertext (1088) || x25519 public (32);
                 // shared secret is ML-KEM ss || x25519 ss (RFC draft-ietf-tls-ecdhe-mlkem).
-                const seed = c.opts.ml_kem_seed orelse return error.IllegalSelection;
+                const seed = c.opts.hybrid_seed orelse return error.IllegalSelection;
                 const ctl = MLKem768.ciphertext_length;
                 if (sh.key_share.public_key.len != ctl + X25519.public_length) return error.IllegalParameter;
-                const kp = MLKem768.KeyPair.generateDeterministic(seed) catch unreachable;
+                const kp = MLKem768.KeyPair.generateDeterministic(seed[0..64].*) catch unreachable;
                 shared_buf[0..MLKem768.shared_length].* = kp.secret_key.decaps(sh.key_share.public_key[0..ctl]) catch
                     return error.IllegalParameter;
-                shared_buf[MLKem768.shared_length..].* = X25519.scalarmult(c.x25519.secret_key, sh.key_share.public_key[ctl..][0..32].*) catch
+                shared_buf[MLKem768.shared_length..].* = X25519.scalarmult(seed[64..96].*, sh.key_share.public_key[ctl..][0..32].*) catch
                     return error.WeakKeyShare;
                 shared = &shared_buf;
             },
@@ -842,4 +844,72 @@ test "KeyUpdate with update_requested rolls both directions" {
     const srec = try srv_w2.seal(.application_data, "pong", &rec_buf);
     const r2 = try c.handleRecord(srec, &out);
     try testing.expectEqualSlices(u8, "pong", r2.app_data);
+}
+
+test "independent hybrid and standalone shares negotiate the selected traffic keys" {
+    const fingerprint = @import("fingerprint.zig");
+    for ([_]tls.NamedGroup{ .x25519, .x25519_ml_kem768 }) |group| {
+        var hs_buf: [2048]u8 = undefined;
+        var c = Client.init(.{
+            .entropy = @splat(0x11),
+            .hybrid_seed = @as([64]u8, @splat(0x22)) ++ @as([32]u8, @splat(0x33)),
+            .verifier = Verifier.insecure,
+            .handshake_buf = &hs_buf,
+        });
+        const hybrid = c.mlKemPublicKey().?;
+        try testing.expect(!mem.eql(u8, c.publicKey(), hybrid[MLKem768.PublicKey.encoded_length..]));
+        var prng = std.Random.DefaultPrng.init(42);
+        var fp: fingerprint.Chrome = undefined;
+        fp.build(prng.random(), .{ .sni = "example.com", .x25519_public = c.publicKey(), .ml_kem_public = hybrid });
+        var ch_buf: [4096]u8 = undefined;
+        const ch = try c.clientHello(&ch_buf, .{
+            .random = undefined,
+            .cipher_suites = fp.cipherSuites(),
+            .extensions = fp.extensions(),
+        }, null);
+
+        // Server derives its secret from the advertised public key, not the
+        // client's private seed. This catches using the wrong key after SH.
+        const server = X25519.KeyPair.generateDeterministic(@splat(0x44));
+        var share: [MLKem768.ciphertext_length + 32]u8 = undefined;
+        var secret: [MLKem768.shared_length + 32]u8 = undefined;
+        const is_hybrid = group == .x25519_ml_kem768;
+        const share_len: usize = if (is_hybrid) share.len else 32;
+        const secret_len: usize = if (is_hybrid) secret.len else 32;
+        if (is_hybrid) {
+            const pk = try MLKem768.PublicKey.fromBytes(hybrid[0..MLKem768.PublicKey.encoded_length]);
+            const encapsulated = pk.encapsDeterministic(&@as([32]u8, @splat(0x55)));
+            share[0..MLKem768.ciphertext_length].* = encapsulated.ciphertext;
+            secret[0..MLKem768.shared_length].* = encapsulated.shared_secret;
+        }
+        share[share_len - 32 ..][0..32].* = server.public_key;
+        secret[secret_len - 32 ..][0..32].* = try X25519.scalarmult(server.secret_key, if (is_hybrid) hybrid[MLKem768.PublicKey.encoded_length..][0..32].* else c.publicKey().*);
+
+        var sh_buf: [58 + share.len]u8 = @splat(0);
+        const sh = sh_buf[0 .. 58 + share_len];
+        sh[0] = 2;
+        mem.writeInt(u24, sh[1..4], @intCast(sh.len - 4), .big);
+        sh[4..6].* = .{ 3, 3 };
+        @memset(sh[6..38], 0x66);
+        sh[39..41].* = .{ 0x13, 1 };
+        mem.writeInt(u16, sh[42..44], @intCast(14 + share_len), .big);
+        sh[44..52].* = .{ 0, 0x2b, 0, 2, 3, 4, 0, 0x33 };
+        mem.writeInt(u16, sh[52..54], @intCast(4 + share_len), .big);
+        mem.writeInt(u16, sh[54..56], @backingInt(group), .big);
+        mem.writeInt(u16, sh[56..58], @intCast(share_len), .big);
+        @memcpy(sh[58..], share[0..share_len]);
+        try c.onServerHello(.{ .type = .server_hello, .raw = sh, .body = sh[4..] });
+
+        var server_schedule = ks.Sha256.init();
+        server_schedule.update(ch[5..]);
+        server_schedule.update(sh);
+        server_schedule.setSharedSecret(secret[0..secret_len]);
+        const keys = ks.Sha256.trafficKeys(record.Suite.Aead(.aes_128_gcm_sha256), server_schedule.handshakeTraffic().server);
+        var writer = record.Cipher.init(.aes_128_gcm_sha256, &keys.key, &keys.iv);
+        var wire: [128]u8 = undefined;
+        var out: [min_out_len]u8 = undefined;
+        const encrypted_extensions = try writer.seal(.handshake, &.{ 8, 0, 0, 2, 0, 0 }, &wire);
+        _ = try c.handleRecord(encrypted_extensions, &out);
+        try testing.expectEqual(State.wait_certificate, c.state);
+    }
 }
