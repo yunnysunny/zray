@@ -17,7 +17,7 @@ pub const Counters = struct {
     splice_calls: u64 = 0,
     splice_bytes: u64 = 0,
 };
-pub threadlocal var counters: Counters = .{};
+pub var counters: Counters = .{};
 
 fn check(rc: usize) Error!usize {
     return switch (linux.errno(rc)) {

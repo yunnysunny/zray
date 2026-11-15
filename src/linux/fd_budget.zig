@@ -1,42 +1,40 @@
-//! Process-wide admission for optional pipe pairs. Configure before starting
-//! workers; connections and mandatory infrastructure always take precedence.
+//! Process-wide admission for optional pipe pairs. Connections and mandatory
+//! infrastructure always take precedence.
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 
 pub const Budget = struct {
     limit: usize = 0,
-    used: std.atomic.Value(usize) = .init(0),
+    used: usize = 0,
 
     pub fn acquire(b: *Budget) bool {
-        var n = b.used.load(.monotonic);
-        while (n < b.limit) {
-            n = b.used.cmpxchgWeak(n, n + 1, .monotonic, .monotonic) orelse return true;
-        }
-        return false;
+        if (b.used >= b.limit) return false;
+        b.used += 1;
+        return true;
     }
     pub fn release(b: *Budget) void {
-        const previous = b.used.fetchSub(1, .monotonic);
-        std.debug.assert(previous > 0);
+        std.debug.assert(b.used > 0);
+        b.used -= 1;
     }
 };
 pub var pipes: Budget = .{};
 
-pub fn pipeLimit(soft: u64, open: usize, connections: usize, workers: usize, extra: usize) usize {
+pub fn pipeLimit(soft: u64, open: usize, connections: usize, extra: usize) usize {
     // Three sockets per slot covers SOCKS UDP control + UDP + upstream too.
-    // Count existing/inherited descriptors, future epolls, and a small margin
+    // Count existing/inherited descriptors and a small margin
     // for temporary descriptors. Saturation handles tiny and infinite limits.
-    const reserve: u64 = @as(u64, open) +| (@as(u64, connections) *| 3) +| workers +| extra +| 16;
+    const reserve: u64 = @as(u64, open) +| (@as(u64, connections) *| 3) +| extra +| 16;
     return @intCast(@min((soft -| reserve) / 2, std.math.maxInt(usize)));
 }
 
-pub fn configure(connections: usize, workers: usize, extra: usize) void {
-    std.debug.assert(pipes.used.load(.monotonic) == 0);
+pub fn configure(connections: usize, extra: usize) void {
+    std.debug.assert(pipes.used == 0);
     pipes.limit = 0;
     var limit: linux.rlimit = undefined;
     if (linux.errno(linux.getrlimit(.NOFILE, &limit)) != .SUCCESS) return;
     const open = openDescriptors() orelse return; // optional optimization
-    pipes.limit = pipeLimit(limit.cur, open, connections, workers, extra);
+    pipes.limit = pipeLimit(limit.cur, open, connections, extra);
     sys.log("splice pipe budget: {d} pairs, fd soft limit {d}", .{ pipes.limit, limit.cur });
 }
 
@@ -68,27 +66,19 @@ fn openDescriptors() ?usize {
 }
 
 test "pipe budget reserves sockets and infrastructure even under tiny fd limits" {
-    try std.testing.expectEqual(@as(usize, 0), pipeLimit(64, 8, 16, 2, 0));
-    try std.testing.expectEqual(@as(usize, 20), pipeLimit(128, 8, 16, 2, 14));
-    try std.testing.expectEqual(@as(usize, 0), pipeLimit(1, 8, 16, 2, 0));
+    try std.testing.expectEqual(@as(usize, 0), pipeLimit(64, 8, 16, 0));
+    try std.testing.expectEqual(@as(usize, 21), pipeLimit(128, 8, 16, 14));
+    try std.testing.expectEqual(@as(usize, 0), pipeLimit(1, 8, 16, 0));
     try std.testing.expect(openDescriptors().? >= 3);
 }
 
-test "workers compete for one process-wide pipe quota" {
+test "pipe quota is bounded and reusable" {
     var quota: Budget = .{ .limit = 8 };
-    var admitted = std.atomic.Value(usize).init(0);
-    const contender = struct {
-        fn run(b: *Budget, total: *std.atomic.Value(usize)) void {
-            for (0..32) |_| if (b.acquire()) {
-                _ = total.fetchAdd(1, .monotonic);
-            };
-        }
-    };
-    var threads: [4]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, contender.run, .{ &quota, &admitted });
-    for (threads) |t| t.join();
-    try std.testing.expectEqual(@as(usize, 8), admitted.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 8), quota.used.load(.monotonic));
+    for (0..8) |_| try std.testing.expect(quota.acquire());
+    try std.testing.expect(!quota.acquire());
+    try std.testing.expectEqual(@as(usize, 8), quota.used);
     for (0..8) |_| quota.release();
-    try std.testing.expectEqual(@as(usize, 0), quota.used.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), quota.used);
+    try std.testing.expect(quota.acquire());
+    quota.release();
 }

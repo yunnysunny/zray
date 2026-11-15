@@ -7,9 +7,8 @@ A minimal [REALITY](https://github.com/XTLS/REALITY) client (VLESS +
 beyond the Zig standard library.
 
 It is built for the kind of box that has one or two slow cores, ~100 MB of
-RAM and no FPU: one network worker by default, configurable `epoll` workers, and a fixed pool of
-connection slots allocated up front. Memory use is decided at startup and does
-not grow with traffic.
+RAM and no FPU: one `epoll` event loop and a fixed pool of connection slots
+allocated up front. Memory use is decided at startup and does not grow with traffic.
 
 Reference deployment: Xiaomi AC2100 (MT7621, MIPS 1004Kc, soft-float,
 ImmortalWrt 23.05): 802 KB static binary, 7.3 MB VSZ / ~2.2 MB RSS with
@@ -184,7 +183,7 @@ inner connection presents.
 | `idle_timeout_s` | `600` | Close a relay with no traffic in either direction. |
 | `sock_buf` | `0` | `SO_SNDBUF` / `SO_RCVBUF` per socket; `0` leaves kernel defaults. |
 | `stats_interval_s` | `60` | Periodic statistics interval in seconds; 0 disables periodic statistics. |
-| `workers` | `1` | Network workers: 1 keeps the original single loop; 0 selects automatically (up to 4); 2..16 requests a count, capped by max_connections. |
+| `workers` | — | Deprecated compatibility field. Any integer value is ignored with a startup warning; remove it from the configuration. |
 | `crypto_backend` | `"off"` | Kernel AES-GCM backend: off / auto / afalg / devcrypto. auto tries devcrypto, then AF_ALG, then software. |
 | `crypto_min_bytes` | `4096` | Inclusive minimum AEAD plaintext size in bytes; requests below this stay in software. |
 | `crypto_max_bytes` | `32768` | Inclusive maximum AEAD plaintext size in bytes; requests above this stay in software. |
@@ -200,22 +199,11 @@ The REALITY server checks the client's clock (timestamp inside the sealed
 `session_id`). A router whose time is not synced will fail every handshake
 with `CertificateRejected`.
 
-### Network workers
+### Single event loop
 
-Merge these options into the top level of your existing JSON configuration:
-
-```json
-{
-  "workers": 1
-}
-```
-
-`workers` defaults to **1**, keeping the original single event loop on the main
-thread. Set `workers` to **0** to select automatically (at most four CPUs), or
-**2..16** to request that many network workers. The actual count cannot exceed
-`max_connections`, which remains the total connection budget for the process and
-is divided among worker pools. Extra workers handle concurrent connections;
-one TCP connection is not split across network workers. Changes require restart.
+zray always runs one network event loop. The former `workers` setting is accepted
+only so old configuration files still start: zray prints a deprecation warning and
+ignores its value. Remove the field when updating a configuration.
 
 ### Kernel crypto backends
 
@@ -224,7 +212,6 @@ into your existing configuration (node credentials and routing are still needed)
 
 ```json
 {
-  "workers": 1,
   "crypto_backend": "off",
   "crypto_min_bytes": 4096,
   "crypto_max_bytes": 32768
@@ -253,26 +240,12 @@ Missing interfaces, unavailable algorithms or backend failures fall back to
 software. Authentication failures reject the record. Kernel completion counters
 (`crypto_kernel`) do not establish hardware use or a performance improvement.
 
-#### Crypto and worker counts
+#### Crypto execution
 
-Each network worker executes backend requests synchronously using its own crypto
-context. Backend sessions are opened and checked lazily on the first eligible
-key. Requests fall back to software if the interface or algorithm is unavailable.
-
-For four network workers with kernel crypto enabled, merge:
-
-```json
-{
-  "workers": 4,
-  "crypto_backend": "auto",
-  "crypto_min_bytes": 4096,
-  "crypto_max_bytes": 32768
-}
-```
-
-This creates four network workers (including the main thread), subject to the
-connection-budget limit. With `"workers": 1`, the main thread runs a single event
-loop. Vision direct traffic bypasses outer TLS record encryption.
+The event loop executes backend requests synchronously using one crypto context.
+Backend sessions are opened and checked lazily on the first eligible key. Requests
+fall back to software if the interface or algorithm is unavailable. Vision direct
+traffic bypasses outer TLS record encryption.
 
 ### Vision direct splice
 

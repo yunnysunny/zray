@@ -93,8 +93,7 @@ def run(binary):
             reserved.close()
             cfg = {"listen": f"127.0.0.1:{proxy_port}", "server": "127.0.0.1",
                    "port": server.getsockname()[1], "sni": "localhost", "security": "tls",
-                   "tls_verify": "none", "flow": "none", "uuid": "00000000-0000-0000-0000-000000000000",
-                   "workers": 1}
+                   "tls_verify": "none", "flow": "none", "uuid": "00000000-0000-0000-0000-000000000000"}
             (tmp / "config.json").write_text(json.dumps(cfg))
             with (tmp / "zray.log").open("w+") as log:
                 proc = subprocess.Popen([binary, str(tmp / "config.json")], stdout=log, stderr=log)

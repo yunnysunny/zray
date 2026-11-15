@@ -21,20 +21,11 @@ Each readable event advances at most 16 ordinary reads, stopping on backpressure
 EOF, protocol-state changes or no progress. This reduces repeated epoll wakeups
 without allowing one ready stream to drain indefinitely.
 
-## Network workers
+## Single event loop
 
-`workers` defaults to **1**, retaining one network event loop on the main thread.
-Set it to 0 to choose automatically (at most four CPUs), or 2..16 to request a
-specific worker count. The actual count cannot exceed `max_connections`.
-`max_connections` is a process-wide total, divided among worker pools including
-any remainder. A full pool stops accepting until a slot is released.
-
-Each connection belongs to one worker; extra workers help independent concurrent
-connections and do not divide one TCP stream across cores. Diagnostics are
-cumulative per worker. Shared listeners use EPOLLEXCLUSIVE when available.
-
-The build still uses the original ReleaseSmall preference. Only the compiler's
-single-thread-only assumption is removed so configured workers can run.
+The network path always uses one event loop and one process-wide connection pool.
+The deprecated `workers` field is accepted for old configurations, but its value
+is ignored with a startup warning. The executable is built as single-threaded.
 
 ## Vision direct relay
 
@@ -46,9 +37,9 @@ pipe. The per-event transfer budget is 256 KiB; destination backpressure retains
 pending bytes before any further source read. EOF is propagated after buffers
 and pipes drain, preserving the reverse direction.
 
-Pipe pairs share a process-wide atomic budget derived from the fd soft limit.
-Startup reserves existing descriptors, three sockets per connection slot, worker
-epolls, enabled crypto session descriptors and temporary headroom. If `/proc/self/fd` or the limit cannot be read,
+Pipe pairs share a process-wide budget derived from the fd soft limit.
+Startup reserves existing descriptors, three sockets per connection slot,
+enabled crypto session descriptors and temporary headroom. If `/proc/self/fd` or the limit cannot be read,
 splice is skipped. Budget exhaustion falls back before allocating; closing a pipe
 or a failed allocation returns its quota. Idle pipes stay with their connection.
 
@@ -83,10 +74,10 @@ No NEON AES/GHASH implementation or performance compiler options are added.
 
 ## Synchronous kernel requests
 
-Each network worker executes kernel crypto requests synchronously using its own
-context and backend counters. Only records within the configured byte limits
-use the backend. With `workers: 1`, the main thread runs a single network loop.
+The event loop executes kernel crypto requests synchronously using one context
+and one set of backend counters. Only records within the configured byte limits
+use the backend.
 
 Vision direct traffic bypasses outer record encryption. `crypto_kernel` counts
 successful kernel operations; `crypto_fallback` and `crypto_badmac` count software
-fallbacks and authentication failures. See the [worker example](../README.md#crypto-and-worker-counts).
+fallbacks and authentication failures. See the [kernel crypto configuration](../README.md#kernel-crypto-backends).
