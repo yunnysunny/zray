@@ -349,9 +349,6 @@ fn linuxMain(init: std.process.Init) !void {
     const hop_token_base = std.math.maxInt(u64) - 2;
     const ep = try sys.epollCreate();
     defer sys.close(ep);
-    if (socks_fd) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, socks_token);
-    if (redirect_fd) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, redirect_token);
-    for (hop_fd, 0..) |h, i| if (h) |fd| try sys.epollAdd(ep, fd, sys.EPOLL.IN, hop_token_base - @as(u64, i));
 
     const kernel_crypto = @import("linux/kernel_crypto.zig");
     @import("linux/fd_budget.zig").configure(parsed.max_connections, kernel_crypto.fdReserve(policy));
@@ -369,7 +366,24 @@ fn linuxMain(init: std.process.Init) !void {
     var events: [64]sys.Event = undefined;
     var last_sweep = sys.monotonicSeconds();
     var last_stats = last_sweep;
+    var listeners_registered = false;
     while (true) {
+        const have_space = loop.active < conns.len;
+        if (have_space != listeners_registered) {
+            if (socks_fd) |fd| if (have_space)
+                try sys.epollAdd(ep, fd, sys.EPOLL.IN, socks_token)
+            else
+                sys.epollDel(ep, fd);
+            if (redirect_fd) |fd| if (have_space)
+                try sys.epollAdd(ep, fd, sys.EPOLL.IN, redirect_token)
+            else
+                sys.epollDel(ep, fd);
+            for (hop_fd, 0..) |h, i| if (h) |fd| if (have_space)
+                try sys.epollAdd(ep, fd, sys.EPOLL.IN, hop_token_base - @as(u64, i))
+            else
+                sys.epollDel(ep, fd);
+            listeners_registered = have_space;
+        }
         const n = try sys.epollWait(ep, &events, 1000);
         for (events[0..n]) |ev| {
             const token = ev.data.u64;
@@ -386,7 +400,7 @@ fn linuxMain(init: std.process.Init) !void {
                 loop.handle(token, ev.events);
                 continue;
             }
-            if (listen_fd) |fd| while (true) {
+            if (listen_fd) |fd| while (loop.active < conns.len) {
                 const accepted = sys.accept(fd) catch break;
                 loop.accept(accepted, inbound, forced);
             };
