@@ -5,9 +5,9 @@
 面向家用路由器的最小 [REALITY](https://github.com/XTLS/REALITY) 客户端
 （VLESS + `xtls-rprx-vision`），用 Zig 编写，除 Zig 标准库外没有任何依赖。
 
-它针对的是这样的设备：一两个慢核心、约 100 MB 内存、没有 FPU。默认单线程、
-可配置多个 `epoll` 网络 worker、启动时一次性分配固定数量的连接槽位。内存占用在启动时就
-确定，不随流量增长。
+它针对的是这样的设备：一两个慢核心、约 100 MB 内存、没有 FPU。程序始终使用
+单个 `epoll` 事件循环，并在启动时一次性分配固定数量的连接槽位。内存占用在启动时就确定，
+不随流量增长。
 
 参考部署：小米 AC2100（MT7621，MIPS 1004Kc，软浮点，ImmortalWrt 23.05）——
 静态二进制 802 KB，64 个槽位时虚拟内存 7.3 MB、RSS 约 2.2 MB。在这台机器上
@@ -150,7 +150,7 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 | `idle_timeout_s` | `600` | 双向都无流量多久后关闭。 |
 | `sock_buf` | `0` | 每个 socket 的 `SO_SNDBUF` / `SO_RCVBUF`；`0` 用内核默认。 |
 | `stats_interval_s` | `60` | 统计输出间隔，单位秒；0 关闭定期统计。 |
-| `workers` | `1` | 网络 worker 数：1 保持原有单事件循环；0 自动选择、最多 4 个；2..16 指定数量，实际不超过 max_connections。 |
+| `workers` | — | 已废弃的兼容字段。任何整数值都会被忽略并打印启动警告；应从配置中删除。 |
 | `crypto_backend` | `"off"` | 内核 AES-GCM 后端：off / auto / afalg / devcrypto；auto 依次尝试 devcrypto、AF_ALG、软件实现。 |
 | `crypto_min_bytes` | `4096` | 提交后端的 AEAD 明文字节数下限，含该值；小于该值时使用软件实现。 |
 | `crypto_max_bytes` | `32768` | 提交后端的 AEAD 明文字节数上限，含该值；大于该值时使用软件实现。 |
@@ -166,13 +166,10 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 REALITY 服务端会校验客户端时钟（封在 `session_id` 里的时间戳）。路由器时间
 没同步时所有握手都会以 `CertificateRejected` 失败。
 
-### 多核与转发配置
+### 单事件循环与转发配置
 
-`workers` 是网络事件循环数。默认 `1` 在主线程运行原有的单事件循环；
-设为 `0` 时自动选择、最多 4 个；设为 `2` 到 `16` 时指定数量，实际数量
-不超过 `max_connections`。例如四核机器可以设置 `"workers": 4`。
-`max_connections` 始终是整个进程的连接总额度，不会乘以 worker 数。
-每条连接归属于一个 worker，多核用于处理并发连接，不会把一条 TCP 流拆给多个核心。
+zray 始终运行一个网络事件循环。旧配置中的 `workers` 字段仅为兼容而保留：
+启动时会打印废弃警告并忽略其值。更新配置时应删除该字段。
 
 splice 默认启用，无需配置开关。在对应方向进入 Vision direct 且旧缓冲区排空后，
 通过 `socket → 内核 pipe → socket` 转发。源端不支持 splice 或 pipe 分配失败时，
@@ -214,15 +211,12 @@ ZRAY_CRYPTO_BACKEND=afalg zray /path/to/config.json
 ```
 
 如果配置里设成 `off` 仍发现后端启用，检查启动环境是否设置了此变量。
-修改模式、阈值或 worker 数后都需要重启。
+修改模式或阈值后需要重启。
 
-### 加密后端与 worker 数
+### 加密后端执行方式
 
-每个网络 worker 使用独立的加密上下文，同步执行后端请求。后端会话在首个
+单事件循环使用一个加密上下文，同步执行后端请求。后端会话在首个
 符合条件的请求到来时打开并自检，接口或算法不可用时回退软件实现。
-
-`workers: 4`、`crypto_backend: "auto"` 使用 4 个网络 worker（包含主线程），
-前提是总连接额度不少于 4。`workers: 1` 时由主线程运行单个事件循环。
 Vision direct 流量绕过外层 TLS record 加密。
 
 `crypto_kernel` 统计成功的内核接口操作，`crypto_fallback` / `crypto_badmac`
@@ -230,7 +224,7 @@ Vision direct 流量绕过外层 TLS record 加密。
 
 ### 完整 REALITY 配置示例
 
-下面展示四个网络 worker 的完整配置。必须替换 `server`、`sni`、`public_key`、
+下面展示完整配置。必须替换 `server`、`sni`、`public_key`、
 `uuid`，并按服务端设置填写 `short_id`；占位值不能直接用于连接。
 示例保持内核加密关闭；测试后端时把 `crypto_backend` 改为上述模式之一。
 
@@ -246,7 +240,6 @@ Vision direct 流量绕过外层 TLS record 加密。
   "uuid": "00000000-0000-0000-0000-000000000000",
   "flow": "xtls-rprx-vision",
   "max_connections": 64,
-  "workers": 4,
   "stats_interval_s": 60,
   "crypto_backend": "off",
   "crypto_min_bytes": 4096,

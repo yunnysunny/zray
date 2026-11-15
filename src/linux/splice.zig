@@ -101,7 +101,7 @@ test "low fd limit: pipe quota exhaustion preserves new TCP connections and copy
     defer _ = linux.setrlimit(.NOFILE, &saved);
     const old_limit = fd_budget.pipes.limit;
     defer fd_budget.pipes.limit = old_limit;
-    fd_budget.configure(4, 2, 0);
+    fd_budget.configure(4, 0);
     var quota: fd_budget.Budget = .{ .limit = fd_budget.pipes.limit };
     try std.testing.expect(quota.limit > 0 and quota.limit < 32);
     var pair: [2]sys.fd_t = undefined;
@@ -110,7 +110,7 @@ test "low fd limit: pipe quota exhaustion preserves new TCP connections and copy
     var pipes: [32]Pipe = @splat(.{ .budget = &quota });
     defer for (&pipes) |*p| p.deinit();
     for (pipes[0..quota.limit]) |*p| try std.testing.expect(try p.pump(pair[0], pair[1], 1024));
-    try std.testing.expectEqual(quota.limit, quota.used.load(.monotonic));
+    try std.testing.expectEqual(quota.limit, quota.used);
     const fallback = &pipes[quota.limit];
     try std.testing.expect(!try fallback.pump(pair[0], pair[1], 1024));
     // Start and accept an actual new TCP connection while all pipe quota is used.
@@ -143,7 +143,7 @@ test "low fd limit: pipe quota exhaustion preserves new TCP connections and copy
     var replacement: Pipe = .{ .budget = &quota };
     defer replacement.deinit();
     try std.testing.expect(try replacement.pump(pair[0], pair[1], 1024));
-    try std.testing.expectEqual(quota.limit, quota.used.load(.monotonic));
+    try std.testing.expectEqual(quota.limit, quota.used);
 }
 
 test "failed pipe2 returns its reserved quota" {
@@ -166,5 +166,5 @@ test "failed pipe2 returns its reserved quota" {
     defer p.deinit();
     try std.testing.expect(!try p.pump(-1, -1, 1024));
     try std.testing.expect(p.fds == null);
-    try std.testing.expectEqual(@as(usize, 0), quota.used.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), quota.used);
 }

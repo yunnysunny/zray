@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
         // Routers have small flash; keep the binary lean.
         .strip = optimize != .debug,
         .link_libc = dynamic,
+        .single_threaded = true,
     });
 
     const exe = b.addExecutable(.{

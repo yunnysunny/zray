@@ -1,6 +1,6 @@
 //! One proxied connection: SOCKS5 / HTTP client <-> REALITY/VLESS/Vision upstream.
 //!
-//! Non-blocking, owned by one worker and driven by its `Loop`. All buffers are fixed
+//! Non-blocking and driven by one `Loop`. All buffers are fixed
 //! size members so a connection's memory footprint is a compile-time constant
 //! (`@sizeOf(Conn)`), and the pool is allocated once at startup.
 //!
@@ -12,7 +12,6 @@ const std = @import("std");
 const mem = std.mem;
 const tls = std.crypto.tls;
 const sys = @import("sys.zig");
-const hop = @import("hop.zig");
 const client = @import("../tls/client.zig");
 const hello = @import("../tls/hello.zig");
 const record = @import("../tls/record.zig");
@@ -34,6 +33,9 @@ const client_chunk = 8192;
 const client_buffer = client_chunk + 64;
 
 pub const max_outbounds = 16;
+fn hopKey(peer_port: u16, listener_port: u16) u32 {
+    return (@as(u32, peer_port) << 16) | listener_port;
+}
 /// ob_index[i..][0..1] is a static one-element group for outbound i.
 const ob_index = blk: {
     var a: [max_outbounds]u8 = undefined;
@@ -85,7 +87,6 @@ pub const Config = struct {
     /// Seconds an outbound is skipped after it failed to connect.
     fail_backoff_s: u64 = 30,
     stats_interval_s: u64 = 60,
-    hops: ?*hop.Registry = null,
 };
 
 /// Does `host` equal `suffix` or end in ".suffix"? (ASCII case-insensitive)
@@ -216,8 +217,6 @@ pub const Conn = struct {
     hop_key: u32 = 0,
     /// Chained side: how the paired hop connection ended, if it already did.
     hop_end: ?HopEnd = null,
-    /// Last published diagnostic state; relay traffic needs no registry lock.
-    hop_published: ?HopEnd = null,
     /// When sniffing started (ms).
     sniff_since_ms: u64 = 0,
     /// Current upstream attempt must reach .relay before this (ms).
@@ -242,7 +241,7 @@ pub const Conn = struct {
     }
 };
 
-/// One independent connection pool, random source and epoll loop per worker.
+/// The process-wide connection pool, random source and epoll loop.
 pub const Loop = struct {
     ep: sys.fd_t,
     cfg: *const Config,
@@ -250,7 +249,6 @@ pub const Loop = struct {
     csprng: std.Random.DefaultCsprng,
     active: usize = 0,
     bad_until: [max_outbounds]u64 = @splat(0),
-    worker_id: usize = 0,
 
     pub fn init(ep: sys.fd_t, cfg: *const Config, conns: []Conn) Loop {
         var seed: [32]u8 = undefined;
@@ -303,9 +301,8 @@ pub const Loop = struct {
         c.last_active = sys.monotonicSeconds();
         c.attempt_deadline_ms = 0;
         c.hop_end = null;
-        c.hop_published = null;
         c.chain_key = 0;
-        c.hop_key = if (forced == null) 0 else hop.key(
+        c.hop_key = if (forced == null) 0 else hopKey(
             (sys.peerAddr(fd) catch {
                 sys.close(fd);
                 c.state = .free;
@@ -326,7 +323,6 @@ pub const Loop = struct {
         };
         c.client_ev = sys.EPOLL.IN | sys.EPOLL.RDHUP;
         l.active += 1;
-        l.publishHop(c, "");
 
         if (kind == .redirect) {
             // Transparent (REDIRECT) inbound: the target is the original
@@ -357,11 +353,9 @@ pub const Loop = struct {
 
     pub fn close(l: *Loop, c: *Conn, why: []const u8) void {
         if (c.state == .free) return;
-        sys.log("[w{d}:{d}] close: {s}; splice up={d} down={d}", .{ l.worker_id, c.slot, why, c.upload_pipe.bytes, c.download_pipe.bytes });
+        sys.log("[{d}] close: {s}; splice up={d} down={d}", .{ c.slot, why, c.upload_pipe.bytes, c.download_pipe.bytes });
         c.upload_pipe.deinit();
         c.download_pipe.deinit();
-        l.publishHop(c, why);
-        if (c.chain_key != 0) if (l.cfg.hops) |r| r.release(c.chain_key);
         if (c.hop_key != 0) {
             if (l.findChained(c.hop_key)) |a| a.hop_end = .{ .ob = c.ob, .state = c.state, .got_resp_hdr = c.got_resp_hdr, .why = why };
         }
@@ -420,7 +414,6 @@ pub const Loop = struct {
         const c = &l.conns[slot];
         if (c.state == .free or c.gen != gen) return; // stale
 
-        defer if (c.state != .free) l.publishHop(c, "");
         switch (side) {
             .client => {
                 if (events & sys.EPOLL.OUT != 0) l.flushClient(c) catch |e| return l.close(c, @errorName(e));
@@ -993,18 +986,7 @@ pub const Loop = struct {
         return null;
     }
 
-    fn publishHop(l: *Loop, c: *Conn, why: []const u8) void {
-        if (c.hop_key == 0) return;
-        if (c.hop_published) |previous| {
-            if (previous.ob == c.ob and previous.state == c.state and previous.got_resp_hdr == c.got_resp_hdr and mem.eql(u8, previous.why, why)) return;
-        }
-        const snapshot: HopEnd = .{ .ob = c.ob, .state = c.state, .got_resp_hdr = c.got_resp_hdr, .why = why };
-        if (l.cfg.hops) |r| r.publish(c.hop_key, snapshot);
-        c.hop_published = snapshot;
-    }
-
     fn hopSnapshot(l: *Loop, c: *const Conn) ?HopEnd {
-        if (l.cfg.hops) |r| return r.get(c.chain_key);
         return c.hop_end orelse if (l.findHop(c.chain_key)) |b|
             HopEnd{ .ob = b.ob, .state = b.state, .got_resp_hdr = b.got_resp_hdr, .why = "" }
         else
@@ -1037,7 +1019,6 @@ pub const Loop = struct {
     }
 
     fn dropUpstream(l: *Loop, c: *Conn) void {
-        if (c.chain_key != 0) if (l.cfg.hops) |r| r.release(c.chain_key);
         c.chain_key = 0;
         if (c.up_fd >= 0) {
             sys.epollDel(l.ep, c.up_fd);
@@ -1080,12 +1061,9 @@ pub const Loop = struct {
         c.hop_end = null;
         c.chain_key = 0;
         if (ob.hop_host.len > 0) {
-            // Publish the owner before connect: another worker can accept and
-            // even close the hop before this worker handles another event.
             const local = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, 0);
             try sys.bind(fd, &local);
-            c.chain_key = hop.key((try sys.localAddr(fd)).getPort(), ob.addr.getPort());
-            if (l.cfg.hops) |r| try r.reserve(c.chain_key);
+            c.chain_key = hopKey((try sys.localAddr(fd)).getPort(), ob.addr.getPort());
         }
         const immediate = try sys.connect(fd, &ob.addr);
         const ev: u32 = sys.EPOLL.OUT | sys.EPOLL.RDHUP;
@@ -1610,9 +1588,7 @@ test "blocked half-closed download still expires without progress" {
     try backpressureHalfClose(true, true, false);
 }
 
-fn crossWorkerHopFailure(exit_failure: bool) !void {
-    var entries: [2]hop.Registry.Entry = undefined;
-    var registry = hop.Registry.init(&entries);
+fn singleLoopHopFailure(exit_failure: bool) !void {
     const listener = try sys.tcpSocket(std.os.linux.AF.INET);
     defer sys.close(listener);
     const local = sys.SockAddr.fromIpv4(.{ 127, 0, 0, 1 }, 0);
@@ -1624,69 +1600,46 @@ fn crossWorkerHopFailure(exit_failure: bool) !void {
         .{ .tag = "relay", .addr = addr, .sni = "relay", .uuid = @splat(0) },
         .{ .tag = "exit", .addr = addr, .hop_host = "exit", .hop_port = 443, .sni = "exit", .uuid = @splat(0) },
     };
-    const cfg: Config = .{ .outbounds = &obs, .default_group = &.{2}, .hops = &registry };
-    const ep_a = try sys.epollCreate();
-    defer sys.close(ep_a);
-    const ep_b = try sys.epollCreate();
-    defer sys.close(ep_b);
-    var pool_a: [1]Conn = undefined;
-    var pool_b: [1]Conn = undefined;
-    var a_loop = Loop.init(ep_a, &cfg, &pool_a);
-    var b_loop = Loop.init(ep_b, &cfg, &pool_b);
-    b_loop.worker_id = 1;
-    const a = &pool_a[0];
+    const cfg: Config = .{ .outbounds = &obs, .default_group = &.{2} };
+    const ep = try sys.epollCreate();
+    defer sys.close(ep);
+    var pool: [2]Conn = undefined;
+    var loop = Loop.init(ep, &cfg, &pool);
+    const a = &pool[0];
     a.ob = 2;
-    a_loop.active = 1;
-    defer a_loop.close(a, "test finished");
-    try a_loop.connectUpstream(a);
+    loop.active = 1;
+    defer loop.close(a, "test finished");
+    try loop.connectUpstream(a);
     try std.testing.expect(a.chain_key != 0);
-    try std.testing.expect(a_loop.hopSnapshot(a) == null);
-    // Accept the actual loopback connection into the other worker's pool.
+    try std.testing.expect(loop.hopSnapshot(a) == null);
+    // Accept the actual loopback connection into the same event loop.
     try std.testing.expect(try sys.pollIn(listener, 5000));
     const fd = try sys.accept(listener);
-    b_loop.accept(fd, .socks5, 1);
-    const b = &pool_b[0];
+    loop.accept(fd, .socks5, 1);
+    const b = &pool[1];
     try std.testing.expectEqual(a.chain_key, b.hop_key);
-    try std.testing.expect(a_loop.findHop(a.chain_key) == null);
-    try std.testing.expectEqual(State.socks_greeting, a_loop.hopSnapshot(a).?.state);
-    try std.testing.expectEqual(@as(u8, 1), a_loop.hopSnapshot(a).?.ob);
+    try std.testing.expect(loop.findHop(a.chain_key) == b);
+    try std.testing.expectEqual(State.socks_greeting, loop.hopSnapshot(a).?.state);
+    try std.testing.expectEqual(@as(u8, 1), loop.hopSnapshot(a).?.ob);
     b.state = if (exit_failure) .relay else .tls_handshake;
     b.got_resp_hdr = exit_failure;
-    const publish = struct {
-        fn run(loop: *Loop, c: *Conn) void {
-            loop.publishHop(c, "");
-        }
-    };
-    const t = try std.Thread.spawn(.{}, publish.run, .{ &b_loop, b });
-    t.join();
-    const live = a_loop.hopSnapshot(a).?;
+    const live = loop.hopSnapshot(a).?;
     try std.testing.expectEqualStrings(if (exit_failure) "up, exit replied -> exit side" else "handshake pending -> relay side", Loop.hopLeg(live));
-    const closer = struct {
-        fn run(loop: *Loop, c: *Conn) void {
-            loop.close(c, "ConnectionReset");
-        }
-    };
-    const t2 = try std.Thread.spawn(.{}, closer.run, .{ &b_loop, b });
-    t2.join();
-    const closed = a_loop.hopSnapshot(a).?;
+    loop.close(b, "ConnectionReset");
+    const closed = loop.hopSnapshot(a).?;
     try std.testing.expectEqual(live.state, closed.state);
     try std.testing.expectEqualStrings("ConnectionReset", closed.why);
-    a_loop.markBad(a, "UpstreamEof");
-    try std.testing.expect(a_loop.bad_until[2] > sys.monotonicSeconds());
-    const old_key = a.chain_key;
-    a_loop.dropUpstream(a);
-    try std.testing.expect(registry.get(old_key) == null);
-    // A reused reservation never inherits an earlier attempt's closed snapshot.
-    try registry.reserve(old_key);
-    try std.testing.expect(registry.get(old_key) == null);
-    registry.release(old_key);
+    loop.markBad(a, "UpstreamEof");
+    try std.testing.expect(loop.bad_until[2] > sys.monotonicSeconds());
+    loop.dropUpstream(a);
+    try std.testing.expectEqual(@as(u32, 0), a.chain_key);
 }
 
-test "cross-worker chain attributes live and closed relay failures" {
-    try crossWorkerHopFailure(false);
+test "single-loop chain attributes live and closed relay failures" {
+    try singleLoopHopFailure(false);
 }
-test "cross-worker chain attributes live and closed exit failures" {
-    try crossWorkerHopFailure(true);
+test "single-loop chain attributes live and closed exit failures" {
+    try singleLoopHopFailure(true);
 }
 
 test "splice upload backpressure and FIN preserve tail and reverse traffic" {

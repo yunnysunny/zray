@@ -1,5 +1,5 @@
-//! Linux AF_ALG and devcrypto AES-GCM backends. Each executing thread owns
-//! its bounded key cache, fixed scratch space and self-tested kernel sessions.
+//! Linux AF_ALG and devcrypto AES-GCM backends. The event loop owns a bounded
+//! key cache, fixed scratch space and self-tested kernel sessions.
 //! Unsupported requests and unavailable backends fall back to software.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,25 +23,24 @@ pub const Limits = struct {
     }
 };
 pub const Outcome = enum { software, success, authentication_failed };
-pub threadlocal var current: ?*Context = null;
-// Bound kernel/DMA resources across every worker, not merely per key cache.
+pub var current: ?*Context = null;
+// Bound kernel/DMA resources used by the process-wide key cache.
 const session_limit = 128;
-var live_sessions: std.atomic.Value(usize) = .init(0);
+var live_sessions: usize = 0;
 
-/// Each cached session owns one fd. Each executing worker may also briefly
+/// Each cached session owns one fd. The event loop may also briefly
 /// hold an AF_ALG transform socket while creating its operation descriptor.
-pub fn fdReserve(policy: Policy, workers: usize) usize {
-    return if (policy == .off) 0 else session_limit +| workers;
+pub fn fdReserve(policy: Policy) usize {
+    return if (policy == .off) 0 else session_limit + 1;
 }
 
 fn reserveSession() !void {
-    if (live_sessions.fetchAdd(1, .monotonic) >= session_limit) {
-        _ = live_sessions.fetchSub(1, .monotonic);
-        return error.BackendUnavailable;
-    }
+    if (live_sessions >= session_limit) return error.BackendUnavailable;
+    live_sessions += 1;
 }
 fn releaseSession() void {
-    _ = live_sessions.fetchSub(1, .monotonic);
+    std.debug.assert(live_sessions > 0);
+    live_sessions -= 1;
 }
 
 // Availability is probed lazily for each key: no board, CPU-feature or driver
@@ -370,9 +369,9 @@ test "configured kernel crypto bounds reject requests before opening a session" 
     try std.testing.expect((Limits{ .min_bytes = 1, .max_bytes = maximum }).accepts(maximum));
 }
 
-test "kernel crypto fd reserve covers cached and concurrent temporary sessions" {
-    try std.testing.expectEqual(@as(usize, 0), fdReserve(.off, 4));
-    try std.testing.expectEqual(@as(usize, 132), fdReserve(.afalg, 4));
-    try std.testing.expectEqual(fdReserve(.afalg, 4), fdReserve(.auto, 4));
-    try std.testing.expectEqual(fdReserve(.afalg, 4), fdReserve(.devcrypto, 4));
+test "kernel crypto fd reserve covers cached and temporary sessions" {
+    try std.testing.expectEqual(@as(usize, 0), fdReserve(.off));
+    try std.testing.expectEqual(@as(usize, 129), fdReserve(.afalg));
+    try std.testing.expectEqual(fdReserve(.afalg), fdReserve(.auto));
+    try std.testing.expectEqual(fdReserve(.afalg), fdReserve(.devcrypto));
 }
