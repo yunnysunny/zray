@@ -58,7 +58,7 @@
       </p>
       <div class="cta">
         <a class="btn" href="https://github.com/yunnysunny/zray/releases/latest">
-          <span lang="zh">下载 v0.5.0</span><span lang="en">Download v0.5.0</span>
+          <span lang="zh">下载 v0.6.0</span><span lang="en">Download v0.6.0</span>
         </a>
         <a class="btn ghost" href="usage.html">
           <span lang="zh">使用说明</span><span lang="en">User guide</span>
@@ -448,8 +448,8 @@
       <span class="n">04</span>
       <h2><span lang="zh">装上它</span><span lang="en">Install it</span></h2>
       <p class="sub">
-        <span lang="zh">每个 Release 都带五个静态 musl 二进制和对应的 sha256，没有动态依赖。选错架构是唯一常见的坑：<code>uname -m</code> 在 MIPS 上分不出大小端。</span>
-        <span lang="en">Every release carries five static musl binaries with their sha256 sums — no dynamic dependencies. Picking the wrong architecture is the one common trap: <code>uname -m</code> cannot tell MIPS endianness apart.</span>
+        <span lang="zh">最新版本提供七个静态 musl 二进制及对应的 SHA-256 校验文件。<code>uname -m</code> 在 MIPS 上分不出大小端。</span>
+        <span lang="en">The latest release ships seven static musl binaries with SHA-256 checksums. On MIPS, <code>uname -m</code> cannot tell endianness apart.</span>
       </p>
     </div>
 
@@ -468,7 +468,9 @@
               <tr><th><code>zray-mips-softfloat</code></th><td><span lang="zh">大端 MIPS，少数老设备</span><span lang="en">BE MIPS, a few older boxes</span></td></tr>
               <tr><th><code>zray-arm-v7</code></th><td><span lang="zh">ARMv7 路由器、树莓派 2 / 3</span><span lang="en">ARMv7 routers, Raspberry Pi 2 / 3</span></td></tr>
               <tr><th><code>zray-aarch64</code></th><td><span lang="zh">ARM64 软路由、VPS、树莓派 4</span><span lang="en">ARM64 mini-PCs, VPS, Pi 4</span></td></tr>
+              <tr><th><code>zray-aarch64-crypto</code></th><td><span lang="zh">支持 AES、PMULL 和 SHA2 的 ARM64 设备</span><span lang="en">ARM64 with AES, PMULL and SHA2</span></td></tr>
               <tr><th><code>zray-x86_64</code></th><td><span lang="zh">PC / x86 软路由 / VPS</span><span lang="en">PC / x86 mini-PC / VPS</span></td></tr>
+              <tr><th><code>zray-x86_64-aes</code></th><td><span lang="zh">支持 x86-64-v2、AES-NI、PCLMUL 和 AVX 的设备</span><span lang="en">x86-64-v2 with AES-NI, PCLMUL and AVX</span></td></tr>
             </tbody>
           </table>
         </div>
@@ -731,7 +733,7 @@ ssh root@router '
 
 <footer class="site">
   <div class="wrap">
-    <span>zray <span class="tag">v0.5.0</span></span>
+    <span>zray <span class="tag">v0.6.0</span></span>
     <span><span lang="zh">Zig 0.17.0 · 静态 musl · MIT</span><span lang="en">Zig 0.17.0 · static musl · MIT</span></span>
     <a class="spacer" href="https://github.com/yunnysunny/zray">GitHub</a>
     <a href="https://github.com/yunnysunny/zray/releases">Releases</a>

@@ -126,8 +126,8 @@
     </div>
     <div class="doc">
       <h3><span lang="zh">选对二进制</span><span lang="en">Pick the right binary</span></h3>
-      <p><span lang="zh">每个 tag 的 Release 里都有五个静态 musl 二进制，<strong>没有动态依赖，也不用装任何库</strong>：</span>
-      <span lang="en">Every tagged release carries five static musl binaries. No shared libraries, nothing to install:</span></p>
+      <p><span lang="zh">最新版本提供七个静态 musl 二进制，<strong>无需安装额外的共享库</strong>。</span>
+      <span lang="en">The latest release ships seven static musl binaries that run without extra shared libraries.</span></p>
       <div class="tablewrap">
         <table>
           <thead>
@@ -141,7 +141,9 @@
             <tr><th><code>zray-mips-softfloat</code></th><td><span lang="zh">大端 MIPS，少数老设备</span><span lang="en">Big-endian MIPS, a few older boxes</span></td></tr>
             <tr><th><code>zray-arm-v7</code></th><td><span lang="zh">ARMv7，如多数高通 / 博通 A7 路由器、树莓派 2/3</span><span lang="en">ARMv7: most Qualcomm / Broadcom A7 routers, Raspberry Pi 2/3</span></td></tr>
             <tr><th><code>zray-aarch64</code></th><td><span lang="zh">ARM64，如树莓派 4、ARM 软路由、ARM VPS</span><span lang="en">ARM64: Raspberry Pi 4, ARM mini-PCs, ARM VPS</span></td></tr>
+            <tr><th><code>zray-aarch64-crypto</code></th><td><span lang="zh">支持 AES、PMULL 和 SHA2 的 ARM64 设备</span><span lang="en">ARM64 with AES, PMULL and SHA2</span></td></tr>
             <tr><th><code>zray-x86_64</code></th><td><span lang="zh">普通 PC / x86 软路由 / x86 VPS</span><span lang="en">Any PC / x86 mini-PC / x86 VPS</span></td></tr>
+            <tr><th><code>zray-x86_64-aes</code></th><td><span lang="zh">支持 x86-64-v2、AES-NI、PCLMUL 和 AVX 的设备</span><span lang="en">x86-64-v2 with AES-NI, PCLMUL and AVX</span></td></tr>
           </tbody>
         </table>
       </div>
@@ -598,8 +600,8 @@ sysctl -p /etc/sysctl.d/99-zray.conf</code></pre>
       <h2><span lang="zh">从 v0.3 升级</span><span lang="en">Upgrading from v0.3</span></h2>
     </div>
     <div class="doc">
-      <p><span lang="zh">0.5.0 在同一监听端口支持 SOCKS5 与 HTTP 代理，并提供可选的内核 AES-GCM 加密后端和动态 libc 链接构建。网络路径保持单事件循环；旧配置中的 <code>workers</code> 会打印废弃警告并被忽略。同时改进了 Vision 转发，并修复 TLS 密钥更新、连接关闭和旧内核随机数获取等兼容性问题。升级只需要换二进制：</span>
-      <span lang="en">0.5.0 supports SOCKS5 and HTTP proxy traffic on the same listener, optional kernel AES-GCM backends and dynamic libc builds. The network path remains a single event loop; a legacy <code>workers</code> field prints a deprecation warning and is ignored. It also improves Vision forwarding and fixes TLS key updates, connection shutdown and random-number generation on older kernels. Upgrading is a binary swap:</span></p>
+      <p><span lang="zh">自 v0.3 以来，zray 新增了 WebSocket 传输和出站链式转发，同一监听端口也已支持 SOCKS5 和 HTTP 代理。最新版本固定使用单个网络事件循环，旧配置中的 <code>workers</code> 会触发废弃警告，可以删掉。升级时保留原配置，替换二进制即可。</span>
+      <span lang="en">Since v0.3, zray has added WebSocket transport, outbound chaining, and SOCKS5 and HTTP proxy support on the same listener. The latest release uses one network event loop. You can remove the deprecated <code>workers</code> field to avoid a startup warning. To upgrade, keep your configuration and replace the binary.</span></p>
       <div class="code">
         <div class="code-bar">
           <span>OpenWrt</span>
@@ -675,7 +677,7 @@ zig build probe -- 203.0.113.5 443 example.com K5Ko4T...4G8 - \
 
 <footer class="site">
   <div class="wrap">
-    <span>zray <span class="tag">v0.5.0</span></span>
+    <span>zray <span class="tag">v0.6.0</span></span>
     <span><span lang="zh">Zig 0.17.0 · 静态 musl · MIT</span><span lang="en">Zig 0.17.0 · static musl · MIT</span></span>
     <a class="spacer" href="index.html"><span lang="zh">返回官网</span><span lang="en">Back to site</span></a>
     <a href="https://github.com/yunnysunny/zray">GitHub</a>
