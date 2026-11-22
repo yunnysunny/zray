@@ -335,18 +335,33 @@ curl --socks5-hostname 127.0.0.1:1080 https://ipinfo.io/json
 <pre><code>table inet gfw {
     set iplist { type ipv4_addr; flags interval; }
     chain prerouting { type nat hook prerouting priority 0;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
     chain output     { type nat hook output priority filter;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
 }</code></pre>
       </div>
       <p><span lang="zh"><code>prerouting</code> 管其他设备，<code>output</code> 管路由器自己。<code>redirect</code> 用的是 <code>SO_ORIGINAL_DST</code>，所以端口写的是 zray 的 <code>redirect</code> 端口（上例 <code>1080</code>），不是 <code>listen</code>。</span>
       <span lang="en"><code>prerouting</code> covers other devices, <code>output</code> covers the router itself. <code>redirect</code> relies on <code>SO_ORIGINAL_DST</code>, so the port here is zray's <code>redirect</code> port (<code>1080</code> above), never <code>listen</code>.</span></p>
-      <p><span lang="zh"><strong>3. 两条必须避开的坑：</strong></span>
-      <span lang="en"><strong>3. Two traps that must be avoided:</strong></span></p>
+      <p><span lang="zh"><strong>3. 三条必须避开的坑：</strong></span>
+      <span lang="en"><strong>3. Three traps that must be avoided:</strong></span></p>
       <ul>
         <li><span lang="zh"><strong>服务器自己的 IP 不能进那个集合</strong>。否则 zray 连服务器的流量又被自己拦回来，变成死循环（症状：启动正常、一有流量就满槽位、日志里全是失败）。用 <code>ip daddr != &lt;服务器 IP&gt;</code> 排除，或者在 DNS 侧把服务器域名加进直连名单。</span><span lang="en"><strong>The server's own IP must never land in that set.</strong> Otherwise zray's connection to its server is redirected back into zray — a loop whose symptom is a healthy start, then instant slot exhaustion and a log full of failures. Exclude it with <code>ip daddr != &lt;server IP&gt;</code>, or put the server hostname on the direct list.</span></li>
         <li><span lang="zh"><strong>解析 <code>server</code> 的解析器不能依赖这条隧道</strong>。如果 dnsmasq / chinadns-ng 的 DoT 上游本身走 zray，开机时两边互相等，谁都起不来。这时把 <code>bootstrap_dns</code> 设成公共 DNS（如 <code>223.5.5.5</code>），启动时那次解析就完全不经过本地解析器。</span><span lang="en"><strong>Whatever resolves <code>server</code> must not depend on the tunnel.</strong> If dnsmasq / chinadns-ng forwards DoT through zray, both wait for each other at boot and neither starts. Set <code>bootstrap_dns</code> to a public resolver (e.g. <code>223.5.5.5</code>) so the startup lookup bypasses the local resolver entirely.</span></li>
+        <li><span lang="zh"><strong>HTTP/3 不受上面那套 TCP 规则约束</strong>。netfilter 的 <code>redirect</code> 只能把连接交给 TCP 监听端口，所以 UDP 443 上的 QUIC 完全命中不了这张表，直接从 WAN 地址出去。偏好 HTTP/3 的浏览器或 App（Chrome、ChatGPT App）就会用错误的来源地址访问目标；对被封锁或有地区限制的服务，请求要么直接失败，要么回一个类似 OpenAI <code>unsupported_country_region_territory</code> 的报错——而同一个 URL 走 TCP 是正常的。想改成把 QUIC 塞进 zray 也不行：UDP 通路有 4.1 里那条约 600 字节的载荷上限。做法是把发往集合的 UDP 443 拒掉，逼客户端立刻放弃 QUIC、回退到上面能接住的 TCP：</span><span lang="en"><strong>HTTP/3 is not covered by these TCP rules.</strong> A netfilter <code>redirect</code> can only hand a connection to a TCP listener, so QUIC on UDP 443 misses the table entirely and leaves the router straight from the WAN address. A browser or app that prefers HTTP/3 (Chrome, the ChatGPT app) then reaches the origin from the wrong source, and for a blocked or geo-restricted service the request either fails or answers with something like OpenAI's <code>unsupported_country_region_territory</code> — while the same URL over TCP is proxied correctly. Routing QUIC through zray instead is not an option either: the UDP path has the ~600-byte payload limit from 4.1. Reject UDP 443 to the set so clients give up on QUIC at once and fall back to TCP, which the rules above do catch:</span>
+          <div class="code">
+            <div class="code-bar">
+              <span>nft · inet gfw</span>
+              <button class="copy" type="button" data-copy><span lang="zh">复制</span><span lang="en">Copy</span></button>
+            </div>
+<pre><code>table inet gfw {
+    chain quic_block     { type filter hook forward priority filter - 10; policy accept;
+        ip daddr @iplist udp dport 443 reject with icmp type port-unreachable; }
+    chain quic_block_out { type filter hook output  priority filter - 10; policy accept;
+        ip daddr @iplist udp dport 443 reject with icmp type port-unreachable; }
+}</code></pre>
+          </div>
+          <p><span lang="zh"><code>forward</code> 管局域网设备，<code>output</code> 管路由器自己，按需要保留其中一条即可。用 <code>reject</code> 而不是 <code>drop</code> 才能快速回退：客户端立刻收到端口不可达，不用等 QUIC 握手超时。只影响命中 <code>@iplist</code> 的目标，国内 HTTP/3 不受影响。<code>iplist</code> 只有 IPv4，局域网若同时下发公网 IPv6 地址，走 IPv6 的 QUIC 仍然绕过代理，要么给 IPv6 集合加同样的规则，要么让局域网不启用 IPv6。</span><span lang="en"><code>forward</code> covers LAN devices and <code>output</code> the router itself; keep only the one you need. <code>reject</code> rather than <code>drop</code> is what makes the fallback fast — the client sees the port unreachable instead of waiting out the QUIC handshake. Only <code>@iplist</code> destinations are affected, so domestic HTTP/3 keeps working. <code>iplist</code> is IPv4-only: if the LAN also hands out public IPv6 addresses, QUIC over IPv6 still bypasses the proxy, so add the same rules for the IPv6 set or keep IPv6 off the LAN.</span></p>
+        </li>
       </ul>
       <p><span lang="zh"><strong>4. <code>sniff</code> 保持开启。</strong>透明代理只拿得到目标 IP，<code>sniff</code> 让它从首包解出 TLS SNI 或 HTTP <code>Host</code>，把目标换成域名。目标 IP 有可能命中 <code>rules</code> 时，zray 最多等 1 秒做这次嗅探——这是那 1 秒的来源，正常。</span>
       <span lang="en"><strong>4. Leave <code>sniff</code> on.</strong> A transparent inbound only sees the destination IP; <code>sniff</code> extracts the TLS SNI or HTTP <code>Host</code> from the first client bytes and swaps the IP for the name. When the target IP could match a <code>rules</code> entry, zray waits up to one second for that sniff — that second is expected.</span></p>
@@ -519,7 +534,7 @@ sysctl -p /etc/sysctl.d/99-zray.conf</code></pre>
       <ul>
         <li><span lang="zh"><strong>Vision 节点才是默认选择</strong>。<code>flow: "none"</code> 或 ws 节点整条连接都要软件加解密，MIPS 单核上限约 1–1.5 MB/s。</span><span lang="en"><strong>Prefer Vision nodes.</strong> A <code>flow: "none"</code> or ws node keeps the outer TLS for the whole connection, and a single MIPS core tops out around 1–1.5 MB/s.</span></li>
         <li><span lang="zh"><strong><code>default</code> 放在 Vision 节点上</strong>，只有需要干净 IP 的少数域名走 ws exit。</span><span lang="en"><strong>Keep <code>default</code> on a Vision node</strong>; send only the few domains that need a clean IP to a ws exit.</span></li>
-        <li><span lang="zh"><strong>别把 REALITY 服务端域名加进 gfwlist</strong>（见第 04 节的坑）。</span><span lang="en"><strong>Keep the REALITY server's domain out of gfwlist</strong> (section 04, trap 3).</span></li>
+        <li><span lang="zh"><strong>别把 REALITY 服务端域名加进 gfwlist</strong>（见 4.2 第 3 条）。</span><span lang="en"><strong>Keep the REALITY server's domain out of gfwlist</strong> (section 4.2, trap 3).</span></li>
       </ul>
     </div>
   </div>
@@ -564,6 +579,7 @@ sysctl -p /etc/sysctl.d/99-zray.conf</code></pre>
             <tr><th><code>WsEarlyData</code></th><td><span lang="zh">服务端在同一记录里发了 101 之后的早期数据</span><span lang="en">the server sent early data in the same record as the 101</span></td><td><span lang="zh">关掉服务端的 early data；别把 <code>ed=</code> 写进 <code>ws_path</code></span><span lang="en">turn early data off on the server; keep <code>ed=</code> out of <code>ws_path</code></span></td></tr>
             <tr><th><code>tls alert handshake_failure</code> / <code>CertificateRejected</code></th><td><span lang="zh"><code>sni</code> 与服务端证书或 REALITY 配置不符</span><span lang="en"><code>sni</code> does not match the server certificate or REALITY config</span></td><td><span lang="zh">核对 <code>sni</code></span><span lang="en">re-check <code>sni</code></span></td></tr>
             <tr><th><span lang="zh">UDP 不通、QUIC 打不开</span><span lang="en">no UDP, QUIC fails</span></th><td><span lang="zh">只有 Vision TCP 节点带 UDP，且载荷 &gt; ~600 字节可能被服务端丢</span><span lang="en">only Vision TCP outbounds carry UDP, and payloads &gt; ~600 bytes may be dropped by the server</span></td><td><span lang="zh">属于已知限制，浏览器自动回落 TCP</span><span lang="en">known limit; browsers fall back to TCP</span></td></tr>
+            <tr><th><span lang="zh">域名都在集合里，App 却报地区不支持</span><span lang="en">domains are in the set but the app still reports an unsupported region</span></th><td><span lang="zh">透明入口只收 TCP，HTTP/3（QUIC）从 WAN 地址直连出去</span><span lang="en">the transparent inbound is TCP-only, so HTTP/3 (QUIC) leaves via the WAN address</span></td><td><span lang="zh">把发往集合的 UDP 443 拒掉，逼客户端回退 TCP（见 4.2）</span><span lang="en">reject UDP 443 to the set so clients fall back to TCP (see 4.2)</span></td></tr>
             <tr><th><span lang="zh">手机上开着代理却推送延迟 / 断流</span><span lang="en">phone push stalls or drops</span></th><td><span lang="zh"><code>idle_timeout_s</code> 掐掉了长连接</span><span lang="en"><code>idle_timeout_s</code> closes long-lived connections</span></td><td><span lang="zh">调大 <code>idle_timeout_s</code></span><span lang="en">raise <code>idle_timeout_s</code></span></td></tr>
           </tbody>
         </table>

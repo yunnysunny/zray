@@ -643,14 +643,18 @@ ssh root@router '
 <pre><code>table inet gfw {
   set iplist { type ipv4_addr; flags interval; }
   chain prerouting { type nat hook prerouting priority 0;
-    ip daddr @iplist ip protocol tcp redirect to :1080 }
+    ip daddr @iplist ip protocol tcp redirect to :1080; }
   chain output { type nat hook output priority filter;
-    ip daddr @iplist ip protocol tcp redirect to :1080 }
+    ip daddr @iplist ip protocol tcp redirect to :1080; }
 }</code></pre>
         </div>
         <p class="note">
           <span lang="zh">服务端自己的 IP 绝不能进这个集合，否则 zray 连自己的流量会被 redirect 回来。</span>
           <span lang="en">The server's own IP must never enter that set, or zray's own outbound gets redirected back into itself.</span>
+        </p>
+        <p class="note">
+          <span lang="zh">HTTP/3 也不受这条规则约束：QUIC 跑在 UDP 443 上，而 <code>redirect</code> 只能把连接交给 TCP 监听端口，于是它从 WAN 地址直连出去——偏好 HTTP/3 的浏览器或 App（Chrome、ChatGPT App）就会报出类似 OpenAI <code>unsupported_country_region_territory</code> 的地区错误，而同一个 URL 走 TCP 是正常的。把发往集合的 UDP 443 拒掉，客户端就会立刻放弃 QUIC、回退到 TCP（写法见<a href="usage.html#s4">使用说明第 04 节</a>）。</span>
+          <span lang="en">HTTP/3 is not covered either: QUIC rides UDP 443 while <code>redirect</code> can only hand a connection to a TCP listener, so it leaves straight from the WAN address — a client that prefers HTTP/3 (Chrome, the ChatGPT app) then reports a region error such as OpenAI's <code>unsupported_country_region_territory</code>, while the same URL over TCP is fine. Reject UDP 443 to the set and it gives up on QUIC at once and falls back to TCP (see <a href="usage.html#s4">section 04 of the guide</a>).</span>
         </p>
       </div>
     </div>
