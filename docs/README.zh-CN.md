@@ -353,9 +353,9 @@ ssh root@router 'chmod 755 /etc/init.d/zray /mnt/zray/zray; chmod 600 /mnt/zray/
 table inet gfw {
     set iplist { type ipv4_addr; flags interval; }
     chain prerouting { type nat hook prerouting priority 0;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
     chain output     { type nat hook output priority filter;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
 }
 ```
 
@@ -363,6 +363,38 @@ table inet gfw {
 的解析器本身不依赖这条隧道。如果它确实依赖（比如 chinadns-ng 或 dnsmasq 的
 DoT 上游走 zray），把 `bootstrap_dns` 设成一个公共 DNS，启动时的解析就完全
 不经过本地解析器。
+
+### HTTP/3（QUIC）不会被代理
+
+上面的 `redirect` 规则只匹配 `ip protocol tcp`，因为 netfilter 的 `redirect`
+只能把连接交给 TCP 监听端口（zray 唯一收 UDP 的地方是 SOCKS5 入站）。HTTP/3
+跑在 UDP 443 的 QUIC 上，命中不了这些规则，于是直接从 WAN 地址出去。偏好
+HTTP/3 的浏览器或 App（Chrome、ChatGPT App）就会用错误的来源地址访问目标；
+对被封锁或有地区限制的服务，请求要么直接失败，要么收到类似 OpenAI
+`unsupported_country_region_territory` 的报错 —— 而同一个 URL 走 TCP 是正常
+的。把 QUIC 报文塞进 zray 也不可行：UDP 通道有下面提到的约 600 字节载荷上限。
+
+把发往代理集合的 UDP 443 拒绝掉，客户端就会立刻放弃 QUIC、回退到 TCP/HTTP2，
+而 TCP 能被 `redirect` 规则接住：
+
+```
+table inet gfw {
+    chain quic_block {
+        type filter hook forward priority filter - 10; policy accept;
+        ip daddr @iplist udp dport 443 reject with icmp type port-unreachable;
+    }
+    chain quic_block_out {
+        type filter hook output priority filter - 10; policy accept;
+        ip daddr @iplist udp dport 443 reject with icmp type port-unreachable;
+    }
+}
+```
+
+`forward` 管局域网设备，`output` 管路由器自己，按需要保留其中一条即可。
+用 `reject` 而不是 `drop` 才能快速回退：客户端立刻收到端口不可达，不用等
+QUIC 握手超时。只影响命中 `@iplist` 的目标，国内 HTTP/3 不受影响。`iplist`
+只有 IPv4：如果局域网同时下发公网 IPv6 地址，通过 IPv6 走 QUIC 仍然会绕过
+代理，所以要么让局域网不启用 IPv6，要么给解析器填充的 IPv6 集合加同样的规则。
 
 ## 文档
 
@@ -411,6 +443,8 @@ website/              官方网站（纯静态，无构建步骤）
 - `server` 只在启动时解析一次，IP 变了需要重启。还没有连接失败退避。
   见 [TODO.md](../TODO.md)。
 - UDP 载荷超过约 600 字节时可能被服务端出口丢弃；DNS 正常，QUIC 一般不通。
+  透明入站只收 TCP，HTTP/3 会整个绕过它，除非把客户端压回 TCP —— 见上面
+  「HTTP/3（QUIC）不会被代理」一节。
 - 没有日志级别控制，每条连接的生命周期都打到 stderr。
 
 ## 许可证

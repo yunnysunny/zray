@@ -210,18 +210,30 @@ Goal: LAN devices need no configuration, matching traffic enters the tunnel by i
 table inet gfw {
     set iplist { type ipv4_addr; flags interval; }
     chain prerouting { type nat hook prerouting priority 0;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
     chain output     { type nat hook output priority filter;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
 }
 ```
 
 `prerouting` covers other devices, `output` covers the router itself. `redirect` relies on `SO_ORIGINAL_DST`, so the port here is zray's `redirect` port (`1080` above), never `listen`.
 
-3. **Two traps that must be avoided:**
+3. **Three traps that must be avoided:**
 
 - **The server's own IP must never land in that set.** Otherwise zray's connection to its server is redirected back into zray — a loop whose symptom is a healthy start, then instant slot exhaustion and a log full of failures. Exclude it with `ip daddr != <server IP>`, or put the server hostname on the direct list in the DNS side.
 - **Whatever resolves `server` must not depend on the tunnel.** If dnsmasq / chinadns-ng forwards DoT through zray, both wait for each other at boot and neither starts. Set `bootstrap_dns` to a public resolver (e.g. `223.5.5.5`) so the startup lookup bypasses the local resolver entirely.
+- **HTTP/3 is not covered by these TCP rules.** A netfilter `redirect` can only hand a connection to a TCP listener, so QUIC on UDP 443 misses the table entirely and leaves the router straight from the WAN address. A browser or app that prefers HTTP/3 (Chrome, the ChatGPT app) then reaches the origin from the wrong source, and for a blocked or geo-restricted service the request either fails or answers with something like OpenAI's `unsupported_country_region_territory` — while the same URL over TCP is proxied correctly. Routing QUIC through zray instead is not an option either: the UDP path has the ~600-byte payload limit from 4.1. Reject UDP 443 to the set so clients give up on QUIC at once and fall back to TCP, which the rules above do catch:
+
+  ```
+  table inet gfw {
+      chain quic_block     { type filter hook forward priority filter - 10; policy accept;
+          ip daddr @iplist udp dport 443 reject with icmp type port-unreachable; }
+      chain quic_block_out { type filter hook output  priority filter - 10; policy accept;
+          ip daddr @iplist udp dport 443 reject with icmp type port-unreachable; }
+  }
+  ```
+
+  `forward` covers LAN devices and `output` the router itself; keep only the one you need. `reject` rather than `drop` is what makes the fallback fast — the client sees the port unreachable instead of waiting out the QUIC handshake. Only `@iplist` destinations are affected, so domestic HTTP/3 keeps working. `iplist` is IPv4-only: if the LAN also hands out public IPv6 addresses, QUIC over IPv6 still bypasses the proxy, so add the same rules for the IPv6 set or keep IPv6 off the LAN.
 
 4. **Leave `sniff` on.** A transparent inbound only sees the destination IP; `sniff` extracts the TLS SNI or HTTP `Host` from the first client bytes and swaps the IP for the name. When the target IP could match a `rules` entry, zray waits up to one second for that sniff — that second is expected.
 
@@ -368,6 +380,7 @@ Everything goes to stderr — `logread` on OpenWrt, `journalctl` on systemd. Fin
 | `WsEarlyData` | the server sent early data in the same record as the 101 | turn early data off on the server; keep `ed=` out of `ws_path` |
 | `tls alert handshake_failure` / intermittent `CertificateRejected` | `sni` does not match the server certificate or REALITY config | re-check `sni` |
 | no UDP, QUIC fails | only Vision TCP outbounds carry UDP, and payloads > ~600 bytes may be dropped by the server | known limit; browsers fall back to TCP |
+| domains are in the set but the app still reports an unsupported region | the transparent inbound is TCP-only, so HTTP/3 (QUIC) leaves via the WAN address | reject UDP 443 to the set so clients fall back to TCP (see 4.2) |
 | phone push stalls or drops | `idle_timeout_s` closes long-lived connections | raise `idle_timeout_s` |
 
 A general way to tell whose problem it is: run `probe` (section 9) straight at the server. `probe` works but zray does not → the problem is zray's config or inbound. Neither works → the problem is the server or the path.

@@ -406,9 +406,9 @@ resolved IPs into an nft set and a rule such as:
 table inet gfw {
     set iplist { type ipv4_addr; flags interval; }
     chain prerouting { type nat hook prerouting priority 0;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
     chain output     { type nat hook output priority filter;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
 }
 ```
 
@@ -417,6 +417,44 @@ resolver used to look up `server` does not itself depend on the tunnel. If it
 does (chinadns-ng or dnsmasq forwarding over DoT through zray), set
 `bootstrap_dns` to a public nameserver so startup resolution never touches the
 local resolver.
+
+### HTTP/3 (QUIC) is not proxied
+
+The `redirect` rules above match `ip protocol tcp` only, because a netfilter
+`redirect` can only hand a connection to a TCP listener (the SOCKS5 inbound is
+the only place zray takes UDP). HTTP/3 runs over QUIC on UDP 443, so it misses
+those rules and leaves the router straight from the WAN address. A browser or
+app that prefers HTTP/3 (Chrome, the ChatGPT app) then reaches the origin from
+the wrong source, and for a blocked or geo-restricted service the request
+either fails or comes back with an error such as OpenAI's
+`unsupported_country_region_territory` — even though the same URL over TCP is
+proxied correctly. Carrying the QUIC packets through zray is not an option
+either: the UDP path has the ~600-byte payload limit noted below.
+
+Rejecting UDP 443 to the proxied set makes the client give up on QUIC at once
+and fall back to TCP/HTTP2, which the `redirect` rules do catch:
+
+```
+table inet gfw {
+    chain quic_block {
+        type filter hook forward priority filter - 10; policy accept;
+        ip daddr @iplist udp dport 443 reject with icmp type port-unreachable;
+    }
+    chain quic_block_out {
+        type filter hook output priority filter - 10; policy accept;
+        ip daddr @iplist udp dport 443 reject with icmp type port-unreachable;
+    }
+}
+```
+
+`forward` covers LAN devices and `output` the router's own traffic; keep only
+the one you need. `reject` rather than `drop` is what makes the fallback fast —
+the client sees the connection refused immediately instead of waiting out the
+QUIC handshake timeout. Only destinations in `@iplist` are affected, so
+domestic HTTP/3 keeps working. `iplist` is IPv4-only: if the LAN also hands out
+public IPv6 addresses, a host reachable over QUIC on IPv6 still bypasses the
+proxy, so either keep IPv6 off the LAN or add the same rules for the IPv6 set
+your resolver fills.
 
 ## Layout
 
@@ -495,7 +533,9 @@ python3 tools/httptest.py zig-out/bin/zray
   member of a group is skipped for `fail_backoff_s`, but only in favour of
   another member of that same group.
 - UDP payloads above roughly 600 bytes may be dropped depending on the server's
-  outbound; DNS works, QUIC generally does not.
+  outbound; DNS works, QUIC generally does not. The transparent inbound is
+  TCP-only, so HTTP/3 bypasses it entirely unless the client is pushed back to
+  TCP — see [HTTP/3 (QUIC) is not proxied](#http3-quic-is-not-proxied).
 - No log level control; every connection logs its lifecycle to stderr.
 
 ## License

@@ -208,18 +208,30 @@ UDP 走 SOCKS5 `UDP ASSOCIATE`，用 XUDP（VLESS mux）封装，比 xray 的 Vi
 table inet gfw {
     set iplist { type ipv4_addr; flags interval; }
     chain prerouting { type nat hook prerouting priority 0;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
     chain output     { type nat hook output priority filter;
-        ip daddr @iplist ip protocol tcp redirect to :1080 }
+        ip daddr @iplist ip protocol tcp redirect to :1080; }
 }
 ```
 
 `prerouting` 管其他设备，`output` 管路由器自己。`redirect` 用的是 `SO_ORIGINAL_DST`，所以端口写的是 zray 的 `redirect` 端口（上例 `1080`），不是 `listen`。
 
-3. **两条必须避开的坑**：
+3. **三条必须避开的坑**：
 
 - **服务器自己的 IP 不能进那个集合**。否则 zray 连服务器的流量又被自己拦回来，变成死循环（症状：启动正常、一有流量就满槽位、日志里全是失败）。用 `ip daddr != <服务器 IP>` 排除，或者在 DNS 侧把服务器域名加进直连名单。
 - **解析 `server` 的解析器不能依赖这条隧道**。如果 dnsmasq / chinadns-ng 的 DoT 上游本身走 zray，开机时两边互相等，谁都起不来。这时把 `bootstrap_dns` 设成公共 DNS（如 `223.5.5.5`），启动时那次解析就完全不经过本地解析器。
+- **HTTP/3 不受上面那套 TCP 规则约束**。netfilter 的 `redirect` 只能把连接交给 TCP 监听端口，所以 UDP 443 上的 QUIC 完全命中不了这张表，直接从 WAN 地址出去。偏好 HTTP/3 的浏览器或 App（Chrome、ChatGPT App）就会用错误的来源地址访问目标；对被封锁或有地区限制的服务，请求要么直接失败，要么回一个类似 OpenAI `unsupported_country_region_territory` 的报错 —— 而同一个 URL 走 TCP 是正常的。想改成把 QUIC 塞进 zray 也不行：UDP 通路有 4.1 里那条约 600 字节的载荷上限。做法是把发往集合的 UDP 443 拒掉，逼客户端立刻放弃 QUIC、回退到上面能接住的 TCP：
+
+  ```
+  table inet gfw {
+      chain quic_block     { type filter hook forward priority filter - 10; policy accept;
+          ip daddr @iplist udp dport 443 reject with icmp type port-unreachable; }
+      chain quic_block_out { type filter hook output  priority filter - 10; policy accept;
+          ip daddr @iplist udp dport 443 reject with icmp type port-unreachable; }
+  }
+  ```
+
+  `forward` 管局域网设备，`output` 管路由器自己，按需要保留其中一条即可。用 `reject` 而不是 `drop` 才能快速回退：客户端立刻收到端口不可达，不用等 QUIC 握手超时。只影响命中 `@iplist` 的目标，国内 HTTP/3 不受影响。`iplist` 只有 IPv4，局域网若同时下发公网 IPv6 地址，走 IPv6 的 QUIC 仍然绕过代理，要么给 IPv6 集合加同样的规则，要么让局域网不启用 IPv6。
 
 4. **`sniff` 保持开启**。透明代理只拿得到目标 IP，`sniff` 让它从首包解出 TLS SNI 或 HTTP `Host`，把目标换成域名。目标 IP 有可能命中 `rules` 时，zray 最多等 1 秒做这次嗅探——这是那 1 秒的来源，正常。
 
@@ -366,6 +378,7 @@ sysctl -p /etc/sysctl.d/99-zray.conf
 | `WsEarlyData` | 服务端在同一记录里发了 101 之后的早期数据 | 关掉服务端的 early data；别把 `ed=` 写进 `ws_path` |
 | `tls alert handshake_failure` / `CertificateRejected` 交替出现 | `sni` 与服务端证书或 REALITY 配置不符 | 核对 `sni` |
 | UDP 不通、QUIC 打不开 | 只有 Vision TCP 节点带 UDP，且载荷 > ~600 字节可能被服务端丢 | 属于已知限制，浏览器自动回落 TCP |
+| 域名都在集合里，App 却报地区不支持 | 透明入口只收 TCP，HTTP/3（QUIC）从 WAN 地址直连出去 | 把发往集合的 UDP 443 拒掉，逼客户端回退 TCP（见 4.2） |
 | 手机上开着代理却推送延迟 / 断流 | `idle_timeout_s` 掐掉了长连接 | 调大 `idle_timeout_s` |
 
 判断「到底是谁的问题」的通用方法：先用第 9 节的 `probe` 直接对服务端做一次握手和请求。`probe` 通、`zray` 不通，问题在 zray 的配置或入口；`probe` 也不通，问题在服务端或线路上。
